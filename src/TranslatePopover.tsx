@@ -18,9 +18,18 @@ function clampToViewport(el: HTMLElement, a: Anchor) {
   el.style.top = `${y}px`;
 }
 
-// ---- selection mini-toolbar: «Перевести» + disabled «Спросить» -------------
+// ---- selection mini-toolbar: «Перевести» + «Спросить» ----------------------
 
-export function SelectionBar({ anchor, onTranslate }: { anchor: Anchor; onTranslate: () => void }) {
+export function SelectionBar({
+  anchor,
+  onTranslate,
+  onAsk,
+}: {
+  anchor: Anchor;
+  onTranslate: () => void;
+  // opens the Claude sidebar seeded with the quoted selection + page context
+  onAsk: () => void;
+}) {
   const ref = useRef<HTMLDivElement>(null);
   useEffect(() => {
     if (ref.current) clampToViewport(ref.current, anchor);
@@ -38,7 +47,7 @@ export function SelectionBar({ anchor, onTranslate }: { anchor: Anchor; onTransl
         Перевести
       </button>
       <span className="opacity-40">·</span>
-      <button className="px-1.5 opacity-30 cursor-default" disabled title="Скоро">
+      <button className="hover:opacity-60 px-1.5" onClick={onAsk} title="Спросить Claude об этом фрагменте">
         Спросить
       </button>
     </div>

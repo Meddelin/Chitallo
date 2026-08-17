@@ -10,6 +10,8 @@ import workerUrl from "pdfjs-dist/build/pdf.worker.min.mjs?url";
 import Library from "./Library";
 import { GlossaryModal, SelectionBar, TranslatePopover } from "./TranslatePopover";
 import type { Anchor } from "./TranslatePopover";
+import { AskSidebar } from "./AskSidebar";
+import type { AskSeed } from "./AskSidebar";
 import { FIG_CONTAIN, buildFrags, growParagraph, interArea, medianLineH, paraText } from "./paragraphs";
 import type { FigureRegion, Word } from "./paragraphs";
 import * as booktranslate from "./booktranslate";
@@ -22,6 +24,9 @@ pdfjs.GlobalWorkerOptions.workerSrc = workerUrl;
 
 const DEFAULT_SCALE = 1.25;
 const PAGE_GAP = 16;
+// «Спросить» sidebar width: the reading area shrinks by this (flex row, no
+// overlay), the fixed toolbar shifts left by half to stay centered over it
+const ASK_W = 400;
 
 // full-width action row of the «Перевод» dropdown menu
 const MENU_ROW =
@@ -89,6 +94,43 @@ function sentenceAround(range: Range, selText: string): string | undefined {
   const end = m2 ? m2.index + m2[0].length : txt.length;
   const sent = txt.slice(start, Math.min(end, start + 600)).trim();
   return sent.split(" ").length > selText.split(" ").length ? sent : undefined;
+}
+
+// «Спросить» context: page number + surrounding page text for the model. The
+// page element the selection starts in supplies its text layer (orig mode) or
+// reflowed translation blocks (tr mode); capped to ~2200 chars around the
+// selection so long pages don't bloat the prompt.
+const ASK_CTX_CAP = 2200;
+function extractAskContext(selText: string): { page?: number; pageText?: string } {
+  const s = document.getSelection();
+  if (!s || s.rangeCount === 0) return {};
+  const n = s.getRangeAt(0).startContainer;
+  const el = n instanceof Element ? n : n.parentElement;
+  const pageEl = el?.closest("[data-page]") as HTMLElement | null;
+  if (!pageEl) return {};
+  const page = Number(pageEl.dataset.page) || undefined;
+  let txt = "";
+  const tr = pageEl.querySelector(".trPage");
+  if (tr) {
+    txt = (tr.textContent ?? "").replace(/\s+/g, " ").trim();
+  } else {
+    txt = Array.from(pageEl.querySelectorAll<HTMLElement>(".textLayer span"))
+      .filter((sp) => (sp.textContent ?? "").trim() && sp.getAttribute("role") !== "img" && !sp.querySelector("span"))
+      .map((sp) => sp.textContent ?? "")
+      .join(" ")
+      .replace(/([A-Za-zА-Яа-яЁё])[-­]\s+([a-zа-яё])/g, "$1$2") // line-wrap hyphens
+      .replace(/\s+/g, " ")
+      .trim();
+  }
+  if (!txt) return { page };
+  if (txt.length > ASK_CTX_CAP) {
+    const pos = txt.toLowerCase().indexOf(selText.toLowerCase());
+    const mid = pos >= 0 ? pos + selText.length / 2 : txt.length / 2;
+    const start = Math.max(0, Math.min(Math.round(mid - ASK_CTX_CAP / 2), txt.length - ASK_CTX_CAP));
+    txt =
+      (start > 0 ? "…" : "") + txt.slice(start, start + ASK_CTX_CAP) + (start + ASK_CTX_CAP < txt.length ? "…" : "");
+  }
+  return { page, pageText: txt };
 }
 
 // Alt+click paragraph detection, DOM entry point: the clicked span's text
@@ -459,6 +501,12 @@ export default function App() {
   const [selBar, setSelBar] = useState<TrRequest | null>(null);
   const [pop, setPop] = useState<TrRequest | null>(null);
   const [glossOpen, setGlossOpen] = useState(false);
+  // ---- «Спросить» sidebar ----
+  // open state is per SESSION (sessionStorage), not per book; the thread
+  // itself is per book (AskSidebar persists it in localStorage)
+  const [askOpen, setAskOpen] = useState(() => sessionStorage.getItem("pdfer:ask:open") === "1");
+  const [askSeed, setAskSeed] = useState<AskSeed | null>(null);
+  const askSeedIdRef = useRef(0);
   // ---- «Перевод» dropdown menu ----
   const [menuOpen, setMenuOpen] = useState(false);
   // inline confirm for «Перезапустить перевод»; reset whenever the menu closes
@@ -490,6 +538,8 @@ export default function App() {
   glossRef.current = glossOpen;
   const menuRef = useRef(menuOpen);
   menuRef.current = menuOpen;
+  const askOpenRef = useRef(askOpen);
+  askOpenRef.current = askOpen;
   const scrollRef = useRef<HTMLDivElement>(null);
   const scaleRef = useRef(scale);
   scaleRef.current = scale;
@@ -633,6 +683,27 @@ export default function App() {
     [getTrPage],
   );
 
+  // «Спросить» sidebar open/close (session-persisted)
+  const setAsk = useCallback((v: boolean | ((o: boolean) => boolean)) => {
+    setAskOpen((o) => {
+      const next = typeof v === "function" ? v(o) : v;
+      sessionStorage.setItem("pdfer:ask:open", next ? "1" : "0");
+      return next;
+    });
+  }, []);
+  const toggleAsk = useCallback(() => setAsk((o) => !o), [setAsk]);
+
+  // SelectionBar «Спросить»: open the sidebar seeded with the quoted selection
+  // + auto-extracted page context; the selection bar goes away like on translate
+  const askFromSelection = useCallback(() => {
+    const bar = selBarRef.current;
+    if (!bar) return;
+    const ctx = extractAskContext(bar.text);
+    setSelBar(null);
+    setAskSeed({ id: ++askSeedIdRef.current, quote: bar.text, page: ctx.page, pageText: ctx.pageText });
+    setAsk(true);
+  }, [setAsk]);
+
   // per-book view mode, persisted; default = original
   const setView = useCallback((m: ViewMode) => {
     setViewMode(m);
@@ -750,6 +821,7 @@ export default function App() {
 
     // switching books: stop any running translation, load the new book's store
     trRunRef.current?.abort();
+    setAskSeed(null); // a stale seed must not leak into the next book's sidebar
     trStoreRef.current = null;
     setTrInfo(null);
     setTrEta(undefined);
@@ -851,6 +923,7 @@ export default function App() {
     setPop(null);
     setGlossOpen(false);
     setMenuOpen(false);
+    setAskSeed(null); // askOpen itself survives — it's a session preference
     try {
       getCurrentWindow().setTitle("pdfer").catch(() => {});
     } catch {
@@ -870,7 +943,8 @@ export default function App() {
     setCols(c);
   }, []);
 
-  // viewport width for "auto" columns (clientWidth excludes the scrollbar)
+  // viewport width for "auto" columns (clientWidth excludes the scrollbar);
+  // askOpen is a dep — the sidebar changes the reading width with no resize event
   useEffect(() => {
     const measure = () => setViewportW(scrollRef.current?.clientWidth ?? window.innerWidth);
     measure();
@@ -878,7 +952,7 @@ export default function App() {
     const onResize = () => { clearTimeout(t); t = window.setTimeout(measure, 150); };
     window.addEventListener("resize", onResize);
     return () => { clearTimeout(t); window.removeEventListener("resize", onResize); };
-  }, [doc]);
+  }, [doc, askOpen]);
 
   // keyboard: Ctrl+O open, Ctrl +/-/0 zoom, D dark (e.code = layout-independent)
   useEffect(() => {
@@ -893,17 +967,25 @@ export default function App() {
       else if (ctrl && e.code === "Digit1") { e.preventDefault(); setColsMode(1); }
       else if (ctrl && e.code === "Digit2") { e.preventDefault(); setColsMode(2); }
       else if (ctrl && e.code === "Digit3") { e.preventDefault(); setColsMode("auto"); }
+      else if (ctrl && e.code === "KeyJ") { e.preventDefault(); toggleAsk(); }
       // bare-letter hotkeys stay live while the «Перевод» menu is open — it has
       // no text inputs, and T visibly flips the menu's own Ориг/Перевод row
       else if (!ctrl && !e.altKey && !typing && e.code === "KeyD") toggleDark();
       else if (!ctrl && !e.altKey && !typing && e.code === "KeyT") toggleView();
       else if (e.key === "Escape") {
         // Esc peels UI layers before closing the book:
-        // меню → глоссарий → перевод → выделение
+        // меню → глоссарий → перевод → сайдбар (только при фокусе в нём) → выделение
+        const ae = document.activeElement as HTMLElement | null;
         if (menuRef.current) setMenuOpen(false);
         else if (glossRef.current) setGlossOpen(false);
         else if (popRef.current) setPop(null);
-        else if (selBarRef.current) {
+        else if (askOpenRef.current && ae?.closest("[data-asksb]")) {
+          // focus inside the sidebar: leave the input first; a focused
+          // non-input control closes the panel. An unfocused sidebar is
+          // NEVER closed by Esc — the chain falls through to the book.
+          if (ae.tagName === "TEXTAREA") ae.blur();
+          else setAsk(false);
+        } else if (selBarRef.current) {
           setSelBar(null);
           document.getSelection()?.removeAllRanges();
         } else closeBook();
@@ -911,7 +993,7 @@ export default function App() {
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [openDialog, zoomTo, toggleDark, closeBook, setColsMode, toggleView]);
+  }, [openDialog, zoomTo, toggleDark, closeBook, setColsMode, toggleView, toggleAsk, setAsk]);
 
   // Ctrl+wheel zoom (non-passive, to suppress webview page zoom)
   useEffect(() => {
@@ -956,7 +1038,11 @@ export default function App() {
 
   return (
     <div className={`${dark ? "dark" : ""} h-screen w-screen overflow-hidden bg-neutral-200 dark:bg-neutral-900 transition-colors`}>
-      <div className="toolbar fixed top-3 left-1/2 -translate-x-1/2 z-10 flex items-center gap-1 rounded-full bg-white/85 dark:bg-neutral-800/85 backdrop-blur px-3 py-1.5 shadow-lg text-sm text-neutral-700 dark:text-neutral-200 select-none">
+      <div
+        className="toolbar fixed top-3 -translate-x-1/2 z-10 flex items-center gap-1 rounded-full bg-white/85 dark:bg-neutral-800/85 backdrop-blur px-3 py-1.5 shadow-lg text-sm text-neutral-700 dark:text-neutral-200 select-none transition-[left] duration-200"
+        // stay centered over the READING area: shift by half the sidebar width
+        style={{ left: doc && askOpen ? `calc(50% - ${ASK_W / 2}px)` : "50%" }}
+      >
         {/* left: library */}
         <button className="hover:opacity-60 px-1" onClick={doc ? closeBook : openDialog} title={doc ? "Библиотека (Esc)" : "Открыть файл (Ctrl+O)"}>
           {doc ? "Библиотека" : "Открыть файл"}
@@ -1093,6 +1179,11 @@ export default function App() {
                 </div>
               )}
             </span>
+            <span className="mx-2 opacity-40">·</span>
+            {/* «Спросить»: chat sidebar over Claude, empty thread from here */}
+            <button className="hover:opacity-60 px-1" onClick={toggleAsk} title="Вопросы по книге (Ctrl+J)">
+              Спросить
+            </button>
           </>
         )}
         <span className="mx-2 opacity-40">·</span>
@@ -1101,31 +1192,47 @@ export default function App() {
         </button>
       </div>
 
-      {doc && baseSize ? (
-        <div ref={scrollRef} className="h-full overflow-y-auto" onScroll={onScroll} onClick={onAltClick}>
-          <div
-            className="grid w-fit mx-auto py-14"
-            style={{ gridTemplateColumns: `repeat(${nColsEff}, max-content)`, gap: PAGE_GAP }}
-          >
-            {Array.from({ length: doc.numPages }, (_, i) => (
-              <Page
-                key={i + 1}
-                doc={doc}
-                num={i + 1}
-                scale={scale}
-                baseSize={baseSize}
-                viewMode={viewMode}
-                trVersion={trVersion}
-                getTrPage={getTrPage}
-                getTrFigs={getTrFigs}
-                getBodyFh={getBodyFh}
-              />
-            ))}
+      {/* flex row: reading area shrinks when the «Спросить» sidebar is open — never an overlay */}
+      <div className="flex h-full">
+        {doc && baseSize ? (
+          <div ref={scrollRef} className="h-full flex-1 min-w-0 overflow-y-auto" onScroll={onScroll} onClick={onAltClick}>
+            <div
+              className="grid w-fit mx-auto py-14"
+              style={{ gridTemplateColumns: `repeat(${nColsEff}, max-content)`, gap: PAGE_GAP }}
+            >
+              {Array.from({ length: doc.numPages }, (_, i) => (
+                <Page
+                  key={i + 1}
+                  doc={doc}
+                  num={i + 1}
+                  scale={scale}
+                  baseSize={baseSize}
+                  viewMode={viewMode}
+                  trVersion={trVersion}
+                  getTrPage={getTrPage}
+                  getTrFigs={getTrFigs}
+                  getBodyFh={getBodyFh}
+                />
+              ))}
+            </div>
           </div>
-        </div>
-      ) : (
-        <Library onOpen={(p) => loadFile(p).catch((e) => console.error("open failed", e))} />
-      )}
+        ) : (
+          <div className="flex-1 min-w-0 h-full">
+            <Library onOpen={(p) => loadFile(p).catch((e) => console.error("open failed", e))} />
+          </div>
+        )}
+        {/* mounted (hidden) while a book is open so an in-flight ask streams on across toggles */}
+        {doc && path && (
+          <AskSidebar
+            open={askOpen}
+            bookPath={path}
+            bookTitle={path.split(/[\\/]/).pop()?.replace(/\.pdf$/i, "") ?? "книга"}
+            page={curPage}
+            seed={askSeed}
+            onClose={() => setAsk(false)}
+          />
+        )}
+      </div>
 
       {selBar && !pop && (
         <SelectionBar
@@ -1134,6 +1241,7 @@ export default function App() {
             setPop(selBar);
             setSelBar(null);
           }}
+          onAsk={askFromSelection}
         />
       )}
       {pop && path && (

@@ -1,5 +1,6 @@
+use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{SocketAddr, TcpStream};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::Mutex;
 use std::time::Duration;
@@ -340,6 +341,257 @@ fn aux_model_status(state: tauri::State<'_, AuxState>) -> String {
     refresh_aux_status(&state)
 }
 
+// ---------------------------------------------------------------------------
+// «Спросить»: headless Claude Code CLI (claude.exe -p, stream-json over stdin)
+// ---------------------------------------------------------------------------
+
+#[derive(Default)]
+struct AskInner {
+    /// The running claude.exe child, if an ask is in flight.
+    child: Option<Child>,
+    /// Generation counter: lets a finishing ask detect that its child was
+    /// cancelled and a NEWER ask has already stored its own child, so the old
+    /// reap never steals the new one.
+    generation: u64,
+}
+
+#[derive(Default)]
+struct AskState {
+    inner: Mutex<AskInner>,
+}
+
+/// Resolve the Claude Code CLI binary: %USERPROFILE%\.local\bin\claude.exe
+/// if present, else bare "claude.exe" (PATH lookup at spawn time).
+fn claude_exe_path() -> PathBuf {
+    if let Ok(profile) = std::env::var("USERPROFILE") {
+        let p = Path::new(&profile).join(".local").join("bin").join("claude.exe");
+        if p.exists() {
+            return p;
+        }
+    }
+    PathBuf::from("claude.exe")
+}
+
+/// Stable working directory for every claude.exe invocation. Claude Code
+/// 2.1.220 stores sessions per working directory, so --resume must run from
+/// the SAME cwd as the call that created the session: pin all calls to the
+/// app data dir (stable across app restarts), falling back to the home dir.
+fn ask_cwd(app: &tauri::AppHandle) -> Option<PathBuf> {
+    if let Ok(d) = app.path().app_data_dir() {
+        if d.exists() {
+            return Some(d);
+        }
+    }
+    app.path().home_dir().ok()
+}
+
+/// Blocking body of ask_claude: spawn claude.exe, pipe the prompt via stdin,
+/// forward every stdout NDJSON line raw to the channel, then reap. If the
+/// process dies without emitting a result line, a synthetic result line is
+/// appended so the frontend always sees a terminal event.
+fn run_ask(
+    app: tauri::AppHandle,
+    prompt: String,
+    session_id: Option<String>,
+    system_prompt: Option<String>,
+    on_event: tauri::ipc::Channel<String>,
+) -> Result<(), String> {
+    let state = app.state::<AskState>();
+
+    // Spawn under the lock: busy-check + store are atomic w.r.t. cancel.
+    let (my_gen, stdin, stdout, stderr) = {
+        let mut inner = state.inner.lock().unwrap();
+        if let Some(c) = inner.child.as_mut() {
+            match c.try_wait() {
+                Ok(Some(_)) => {
+                    // Stale dead child (should not normally happen): reap it.
+                    if let Some(mut old) = inner.child.take() {
+                        let _ = old.wait();
+                    }
+                }
+                _ => return Err("busy: an ask is already running".into()),
+            }
+        }
+
+        let exe = claude_exe_path();
+        let mut cmd = Command::new(&exe);
+        cmd.arg("-p")
+            .arg("--output-format")
+            .arg("stream-json")
+            .arg("--verbose")
+            .arg("--include-partial-messages")
+            .arg("--allowedTools")
+            .arg("");
+        if let Some(sp) = system_prompt.as_deref() {
+            if !sp.is_empty() {
+                cmd.arg("--append-system-prompt").arg(sp);
+            }
+        }
+        if let Some(sid) = session_id.as_deref() {
+            if !sid.is_empty() {
+                cmd.arg("--resume").arg(sid);
+            }
+        }
+        if let Some(dir) = ask_cwd(&app) {
+            cmd.current_dir(dir);
+        }
+        cmd.stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        #[cfg(windows)]
+        cmd.creation_flags(CREATE_NO_WINDOW);
+
+        let mut child = cmd.spawn().map_err(|e| {
+            if e.kind() == std::io::ErrorKind::NotFound {
+                format!("claude_not_found: {}", exe.display())
+            } else {
+                format!("spawn_failed: {e}")
+            }
+        })?;
+        eprintln!("[ask] spawned claude.exe pid {}", child.id());
+        let stdin = child.stdin.take();
+        let stdout = child.stdout.take();
+        let stderr = child.stderr.take();
+        inner.generation += 1;
+        let my_gen = inner.generation;
+        inner.child = Some(child);
+        (my_gen, stdin, stdout, stderr)
+    };
+
+    // Write the prompt on its own thread (avoids pipe deadlock on large
+    // prompts), then close stdin so claude.exe starts the turn.
+    if let Some(mut si) = stdin {
+        std::thread::spawn(move || {
+            let _ = si.write_all(prompt.as_bytes());
+            // drop closes the pipe
+        });
+    }
+
+    // Drain stderr concurrently so a chatty stderr can never block the child.
+    let stderr_thread = stderr.map(|mut se| {
+        std::thread::spawn(move || {
+            let mut buf = String::new();
+            let _ = se.read_to_string(&mut buf);
+            buf
+        })
+    });
+
+    // Forward stdout NDJSON lines raw; remember whether a result line passed.
+    let mut saw_result = false;
+    if let Some(so) = stdout {
+        for line in BufReader::new(so).lines() {
+            let Ok(line) = line else { break };
+            if line.trim().is_empty() {
+                continue;
+            }
+            if !saw_result {
+                if let Ok(v) = serde_json::from_str::<serde_json::Value>(&line) {
+                    if v.get("type").and_then(|t| t.as_str()) == Some("result") {
+                        saw_result = true;
+                    }
+                }
+            }
+            let _ = on_event.send(line);
+        }
+    }
+
+    // Reap: only take the child if it is still OURS (same generation).
+    let taken = {
+        let mut inner = state.inner.lock().unwrap();
+        if inner.generation == my_gen {
+            inner.child.take()
+        } else {
+            None
+        }
+    };
+    let (cancelled, exit_desc) = match taken {
+        Some(mut child) => match child.wait() {
+            Ok(st) if st.success() => (false, String::new()),
+            Ok(st) => (false, format!("{st}")),
+            Err(e) => (false, format!("wait failed: {e}")),
+        },
+        None => (true, "cancelled".into()),
+    };
+    let stderr_text = stderr_thread
+        .and_then(|t| t.join().ok())
+        .unwrap_or_default();
+
+    if !saw_result {
+        // Synthesize a terminal result line so the frontend always settles.
+        let (subtype, msg) = if cancelled {
+            ("cancelled".to_string(), "Запрос отменён".to_string())
+        } else {
+            let tail: String = {
+                let t = stderr_text.trim();
+                let chars: Vec<char> = t.chars().collect();
+                if chars.len() > 600 {
+                    chars[chars.len() - 600..].iter().collect()
+                } else {
+                    t.to_string()
+                }
+            };
+            let msg = if tail.is_empty() {
+                format!("claude.exe завершился без ответа ({exit_desc})")
+            } else {
+                format!("claude.exe завершился без ответа ({exit_desc}): {tail}")
+            };
+            ("error_process".to_string(), msg)
+        };
+        let synth = serde_json::json!({
+            "type": "result",
+            "subtype": subtype,
+            "is_error": true,
+            "result": msg,
+            "synthetic": true,
+        });
+        let _ = on_event.send(synth.to_string());
+    } else if !exit_desc.is_empty() && !cancelled {
+        eprintln!("[ask] claude.exe non-zero exit after result line: {exit_desc}");
+    }
+    Ok(())
+}
+
+/// Ask Claude (headless CLI) with streaming NDJSON forwarded over `on_event`.
+/// Resolves when the process exits (every stream already got a terminal
+/// result line by then). Errors: "busy: ...", "claude_not_found: <path>",
+/// "spawn_failed: <err>".
+#[tauri::command]
+async fn ask_claude(
+    app: tauri::AppHandle,
+    prompt: String,
+    session_id: Option<String>,
+    system_prompt: Option<String>,
+    on_event: tauri::ipc::Channel<String>,
+) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        run_ask(app, prompt, session_id, system_prompt, on_event)
+    })
+    .await
+    .map_err(|e| format!("ask task failed: {e}"))?
+}
+
+/// Kill the in-flight claude.exe, if any. The streaming ask_claude call then
+/// finishes with a synthetic {"type":"result","subtype":"cancelled"} line.
+#[tauri::command]
+fn ask_claude_cancel(state: tauri::State<'_, AskState>) {
+    let taken = state.inner.lock().unwrap().child.take();
+    if let Some(mut child) = taken {
+        eprintln!("[ask] cancel -> killing claude.exe pid {}", child.id());
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+}
+
+fn kill_ask_child(app: &tauri::AppHandle) {
+    let state = app.state::<AskState>();
+    let taken = state.inner.lock().unwrap().child.take();
+    if let Some(mut child) = taken {
+        eprintln!("[ask] app exit -> killing claude.exe pid {}", child.id());
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+}
+
 fn kill_spawned<S: LlamaSrv>(app: &tauri::AppHandle) {
     let state = app.state::<S>();
     let taken = state.child().lock().unwrap().take();
@@ -363,11 +615,14 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         .manage(TranslationState::default())
         .manage(AuxState::default())
+        .manage(AskState::default())
         .invoke_handler(tauri::generate_handler![
             translation_status,
             aux_model_start,
             aux_model_stop,
-            aux_model_status
+            aux_model_status,
+            ask_claude,
+            ask_claude_cancel
         ])
         .setup(|app| {
             let handle = app.handle().clone();
@@ -380,6 +635,7 @@ pub fn run() {
             if let tauri::RunEvent::Exit = event {
                 kill_spawned::<TranslationState>(app_handle);
                 kill_spawned::<AuxState>(app_handle);
+                kill_ask_child(app_handle);
             }
         });
 }
