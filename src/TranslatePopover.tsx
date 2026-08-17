@@ -42,15 +42,22 @@ function clampToViewport(el: HTMLElement, a: Anchor) {
   el.style.top = `${y}px`;
 }
 
-// ---- selection mini-toolbar: «Перевести» + «Спросить» ----------------------
+// ---- selection mini-toolbar: «Перевести»/«Оригинал» + «Спросить» -----------
 
 export function SelectionBar({
   anchor,
   onTranslate,
+  onOriginal,
   onAsk,
 }: {
   anchor: Anchor;
-  onTranslate: () => void;
+  // original-text selections: translate them (absent on translated pages)
+  onTranslate?: () => void;
+  // selections inside the reflowed translation: peek at the stored original
+  // (label «Оригинал», key O). «Перевести» is deliberately dropped there —
+  // translating already-translated Russian back to Russian is nonsense, and
+  // an EN target would be a different feature; one honest primary per surface.
+  onOriginal?: () => void;
   // opens the Claude sidebar seeded with the quoted selection + page context
   onAsk: () => void;
 }) {
@@ -67,9 +74,15 @@ export function SelectionBar({
       onMouseDown={(e) => e.preventDefault()}
       onPointerDown={(e) => e.stopPropagation()}
     >
-      <button className={`${PILL_BTN} px-1.5`} onClick={onTranslate} title="Перевести выделенное (Enter)">
-        Перевести <span className="text-xs text-neutral-500 dark:text-neutral-400">⏎</span>
-      </button>
+      {onOriginal ? (
+        <button className={`${PILL_BTN} px-1.5`} onClick={onOriginal} title="Оригинал выделенного (O)">
+          Оригинал <span className="text-xs text-neutral-500 dark:text-neutral-400">O</span>
+        </button>
+      ) : onTranslate ? (
+        <button className={`${PILL_BTN} px-1.5`} onClick={onTranslate} title="Перевести выделенное (Enter)">
+          Перевести <span className="text-xs text-neutral-500 dark:text-neutral-400">⏎</span>
+        </button>
+      ) : null}
       <span className="text-neutral-300 dark:text-neutral-600">·</span>
       <button className={`${PILL_BTN} px-1.5`} onClick={onAsk} title="Спросить Claude об этом фрагменте">
         Спросить

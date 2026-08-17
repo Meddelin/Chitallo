@@ -29,8 +29,30 @@ export const hash = (s: string): string => {
   return h.toString(16);
 };
 
+// Giant glyphs: Springer-style section headings draw a huge section number
+// (~3x body size) whose BASELINE lands on the NEXT text line — the first body
+// line for one-line titles, the title's own second line for wrapped ones.
+// Y-banding welds number+neighbor into one frag (the number's glyph box
+// swallows that line's center); the welded frag's inflated top then (a)
+// absorbs an adjacent line as a trailing "next line" and (b) detaches the
+// welded text line from its own paragraph (seen: "2.4 <first body sentence>
+// <title text>" translated as one block, next block starting mid-thought).
+// The cure is a post-pass over built frags: split a frag at word boundaries
+// where the glyph-height ratio between neighbors reaches GIANT and the big
+// side is also GIANT x the page's median line height. BOTH conditions matter:
+// the page-relative one keeps figure-label pairs (a 15px Venn label beside 8px
+// text) and small outliers (4px nested-list bullets beside 10px text, the
+// small side of the cliff) welded as before; the local one keeps mixed-height
+// formula lines intact. Sub/superscripts (~0.7x), heading titles (1.2x), and
+// LaTeX display operators (body matrix scale) never split. The split-off
+// giant becomes its own frag; clusterParagraphs re-attaches it to the right
+// PARAGRAPH afterwards (see the adoption pass there).
+export const GIANT = 1.8;
+
 // 1) Y-lines: words whose vertical center falls inside the running band;
-// 2) split each Y-line at wide horizontal gaps (column gutters, >2.5x line height)
+// 2) split each Y-line at wide horizontal gaps (column gutters, >2.5x line
+//    height);
+// 3) split giant-glyph runs off mixed frags (GIANT, see above).
 export function buildFrags(words: Word[]): Frag[] {
   const sorted = words.slice().sort((a, b) => a.rect.top + a.rect.bottom - (b.rect.top + b.rect.bottom));
   const yLines: Word[][] = [];
@@ -69,6 +91,25 @@ export function buildFrags(words: Word[]): Frag[] {
     }
     if (cur.length) frags.push(mkFrag(cur));
   }
+
+  // giant-glyph split (step 3 above); lineH as in medianLineH, over pre-split frags
+  const hs = frags.map((f) => f.bottom - f.top).sort((a, b) => a - b);
+  const lineH = hs[hs.length >> 1] || 12;
+  for (let i = frags.length - 1; i >= 0; i--) {
+    const ws = frags[i].words; // already left-sorted
+    const parts: Word[][] = [[]];
+    for (const w of ws) {
+      const part = parts[parts.length - 1];
+      const prev = part[part.length - 1];
+      if (prev) {
+        const a = prev.rect.bottom - prev.rect.top;
+        const b = w.rect.bottom - w.rect.top;
+        if (Math.max(a, b) >= GIANT * Math.min(a, b) && Math.max(a, b) >= GIANT * lineH) parts.push([]);
+      }
+      parts[parts.length - 1].push(w);
+    }
+    if (parts.length > 1) frags.splice(i, 1, ...parts.map(mkFrag));
+  }
   return frags;
 }
 
@@ -88,8 +129,30 @@ const overlaps = (a: Frag, b: Frag) => a.left < b.right && b.left < a.right;
 // (>0.9*lineH) AND the paragraph's last line ends short of the column's right
 // edge (>0.5*lineH; modal right, not max: relative left + ends-short keeps
 // hanging-indent lists and margin-poking captions/headings from producing
-// false stops). `claimed` (whole-page clustering) halts growth at frags
-// already assigned to another paragraph.
+// false stops). A glyph-size cliff between adjacent lines (>=1.15x either
+// way, on the lines' MEDIAN word heights — robust to sub/superscripts) whose
+// BIGGER side is also heading-sized for the page (>=1.15x lineH) is a
+// boundary regardless of indent: a heading line (1.2x body) never absorbs the
+// body line under it even when the leading is tight and both start at the
+// column edge, and a tightly-leaded paragraph above a heading never absorbs
+// the heading (seen: "3.2 <title>" flowing straight into the body when the
+// title-to-body gap is under 1.6x). The page-relative guard is what keeps the
+// cliff out of display math: ∑-limit lines, fraction numerators and inline
+// "1−p" stacks sit at ~0.7x BELOW body size, so their bigger neighbor is
+// plain body text and never qualifies; subsection titles at 1.075x and
+// running headers at 1.05x stay under the pairwise cliff. `claimed`
+// (whole-page clustering) halts growth at frags already assigned to another
+// paragraph.
+const fhOf = (f: Frag): number => {
+  const hs = f.words.map((w) => w.rect.bottom - w.rect.top).sort((a, b) => a - b);
+  return hs[hs.length >> 1] || 0;
+};
+const fhCliff = (a: Frag, b: Frag, lineH: number): boolean => {
+  const x = fhOf(a);
+  const y = fhOf(b);
+  return x > 0 && y > 0 && Math.max(x, y) >= 1.15 * Math.min(x, y) && Math.max(x, y) >= 1.15 * lineH;
+};
+
 export function growParagraph(frags: Frag[], home: Frag, lineH: number, claimed?: ReadonlySet<Frag>): Frag[] {
   const col = frags.filter((f) => overlaps(f, home));
   const q = Math.max(2, lineH / 3);
@@ -110,6 +173,7 @@ export function growParagraph(frags: Frag[], home: Frag, lineH: number, claimed?
     for (const f of frags)
       if (f.top < cur.top - 1 && overlaps(f, cur) && (!best || f.top > best.top)) best = f;
     if (!best || claimed?.has(best) || cur.top - best.top >= 1.6 * lineH) break;
+    if (fhCliff(cur, best, lineH)) break; // heading/body size cliff
     if (indent(cur, best) && endsShort(best)) break; // cur is a paragraph's indented first line
     para.unshift(best);
     cur = best;
@@ -119,6 +183,7 @@ export function growParagraph(frags: Frag[], home: Frag, lineH: number, claimed?
     for (const f of frags)
       if (f.top > cur.top + 1 && overlaps(f, cur) && (!best || f.top < best.top)) best = f;
     if (!best || claimed?.has(best) || best.top - cur.top >= 1.6 * lineH) break;
+    if (fhCliff(cur, best, lineH)) break; // heading/body size cliff
     if (indent(best, cur) && endsShort(cur)) break; // next line starts a new paragraph
     para.push(best);
     cur = best;
@@ -275,6 +340,7 @@ export function clusterParagraphs(items: readonly unknown[], viewport: { transfo
 
   const claimed = new Set<Frag>();
   const out: Paragraph[] = [];
+  const giant: boolean[] = []; // out[i] is a lone giant-glyph frag (split off by buildFrags)
   for (const seed of seeds) {
     if (claimed.has(seed)) continue;
     const para = growParagraph(frags, seed, lineH, claimed);
@@ -295,6 +361,48 @@ export function clusterParagraphs(items: readonly unknown[], viewport: { transfo
       fh,
       kind: classifyMetrics(paraMetrics(text, ws, fh)),
     });
+    giant.push(para.length === 1 && ws.every((w) => w.rect.bottom - w.rect.top >= GIANT * lineH));
+  }
+
+  // Giant adoption: re-attach each lone giant-glyph paragraph (the split-off
+  // section number) to the y-overlapping, x-adjacent paragraph whose vertical
+  // CENTER lies nearest its own — the heading TITLE beside the number (a
+  // one-line title, or a wrapped one already assembled by growParagraph),
+  // never the body line that merely shares the number's baseline. Working on
+  // whole paragraphs sidesteps growParagraph's indent/gap heuristics, which a
+  // frag-level merge would derail (a widened first title line makes the
+  // wrapped second line look like an indented new paragraph). The merged
+  // paragraph keeps the adopter's fh — the number is decoration, not the
+  // heading's type size. An unpaired giant (chapter number over its own
+  // title line, figure-innard label) stays standalone, as before this pass.
+  for (let i = out.length - 1; i >= 0; i--) {
+    if (!giant[i]) continue;
+    const g = out[i];
+    const gc = g.y + g.h / 2;
+    let best = -1;
+    let bd = Infinity;
+    for (let j = 0; j < out.length; j++) {
+      if (j === i || giant[j]) continue;
+      const p = out[j];
+      if (p.y >= g.y + g.h || g.y >= p.y + p.h) continue; // need y-overlap
+      if (Math.max(p.x - (g.x + g.w), g.x - (p.x + p.w)) > 2.5 * p.fh) continue; // adjacency, gutter-safe
+      const d = Math.abs(p.y + p.h / 2 - gc);
+      if (d < bd) {
+        bd = d;
+        best = j;
+      }
+    }
+    if (best < 0) continue;
+    const p = out[best];
+    p.text = g.x <= p.x ? `${g.text} ${p.text}` : `${p.text} ${g.text}`;
+    const x = Math.min(p.x, g.x);
+    const y = Math.min(p.y, g.y);
+    p.w = Math.max(p.x + p.w, g.x + g.w) - x;
+    p.h = Math.max(p.y + p.h, g.y + g.h) - y;
+    p.x = x;
+    p.y = y;
+    out.splice(i, 1);
+    giant.splice(i, 1);
   }
   return out;
 }

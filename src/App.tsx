@@ -56,6 +56,10 @@ type Size = { w: number; h: number };
 type Cols = 1 | 2 | "auto";
 type ViewMode = "orig" | "tr";
 type TrRequest = { anchor: Anchor; text: string; context?: string; label?: string; noTranslate?: boolean };
+// selection-bar state: a selection inside the reflowed translation ALSO
+// carries the mapped store originals (orig), captured while the selection is
+// alive — the bar button / O / Enter / palette merely replay it
+type SelBarState = TrRequest & { orig?: string };
 
 // Minimal pdf.js link-service surface — exactly what AnnotationLayer's link
 // elements call. The full web/PDFLinkService binds the pdf_viewer EventBus
@@ -192,6 +196,33 @@ function paragraphAround(clicked: HTMLElement): { text: string; left: number; bo
   };
 }
 
+// «Оригинал» peek for a selection inside a reflowed translated page (.trPage):
+// every store paragraph the selection touches, matched by data-tridx — the
+// same link Alt+click uses. Scope choices, on purpose:
+//  - a selection covering PART of one block still yields that block's FULL
+//    original: sentence boundaries of the translation and the original don't
+//    line up, the store has no sub-paragraph mapping — whole blocks are the
+//    simplest honest unit;
+//  - blocks are visited in DOM (= reading) order, multi-block selections join
+//    with paragraph breaks; crop blocks (kind "other"/failed) that fall inside
+//    the range contribute their stored text too, matching Alt+click on a crop;
+//  - a mixed selection (trPage + a plain text layer of an untranslated page)
+//    yields only the translated blocks' originals — the text-layer part IS
+//    original already.
+function trOriginalsFromSelection(getTrPage: (n: number) => TrParagraph[] | undefined): string | null {
+  const s = document.getSelection();
+  if (!s || s.isCollapsed || s.rangeCount === 0) return null;
+  const range = s.getRangeAt(0);
+  const parts: string[] = [];
+  for (const block of document.querySelectorAll<HTMLElement>(".trPage [data-tridx]")) {
+    if (!range.intersectsNode(block)) continue;
+    const pageEl = block.closest<HTMLElement>("[data-page]");
+    const text = getTrPage(Number(pageEl?.dataset.page))?.[Number(block.dataset.tridx)]?.text;
+    if (text) parts.push(text);
+  }
+  return parts.length ? parts.join("\n\n") : null;
+}
+
 // ---- reflowed translated page (v2) -----------------------------------------
 
 // list-item openers for hanging indents: "(1) ", "1. ", "1) ", "• ", "a) ", "а) ", "— "
@@ -207,7 +238,7 @@ type Crop = { canvas: HTMLCanvasElement; x: number; y: number; w: number; h: num
 // Clean re-typeset page replacing the original render in translation mode.
 // Prose paragraphs flow as <p> at ONE uniform body size for the whole book
 // (15.5px × scale, via --scale-factor in App.css); headings are recognised by
-// the stored glyph height relative to the book's body median (fh/bodyFh ≥ 1.25,
+// the stored glyph height relative to the book's body median (fh/bodyFh ≥ 1.15,
 // size capped at 1.8×), list items get a hanging indent. kind:"other" regions
 // (display math / tables) and failed paragraphs (tr:"") are never dropped:
 // they become placeholder canvases, later filled by drawCrops with image crops
@@ -284,7 +315,7 @@ function buildTrPage(
     if (p.kind === "prose" && p.tr) {
       const d = document.createElement("p");
       const ratio = bodyFh > 0 && p.fh > 0 ? p.fh / bodyFh : 1;
-      if (ratio >= 1.25) {
+      if (ratio >= 1.15) {
         d.className = "trHead";
         d.style.fontSize = `${Math.min(1.8, ratio).toFixed(3)}em`;
       } else {
@@ -611,7 +642,7 @@ export default function App() {
     return c === "2" ? 2 : c === "auto" ? "auto" : 1;
   });
   const [viewportW, setViewportW] = useState(() => window.innerWidth);
-  const [selBar, setSelBar] = useState<TrRequest | null>(null);
+  const [selBar, setSelBar] = useState<SelBarState | null>(null);
   const [pop, setPop] = useState<TrRequest | null>(null);
   const [glossOpen, setGlossOpen] = useState(false);
   // ---- «Спросить» sidebar ----
@@ -629,6 +660,10 @@ export default function App() {
   const findSeedRef = useRef(0);
   // ---- Ctrl+K command palette + «?» shortcut overlay ----
   const [paletteOpen, setPaletteOpen] = useState(false);
+  // selection-bar snapshot taken the moment Ctrl+K opens the palette: the
+  // palette input's autofocus collapses the document selection, which clears
+  // selBar — the «Оригинал выделенного» command runs off this snapshot
+  const [paletteSel, setPaletteSel] = useState<SelBarState | null>(null);
   const [shortcutsOpen, setShortcutsOpen] = useState(false);
   // ---- «О pdfer» (WP-F): версия, приватность, лицензии ----
   const [aboutOpen, setAboutOpen] = useState(false);
@@ -793,8 +828,15 @@ export default function App() {
     };
   }, []);
 
+  // stable store getters for Page renders (read the ref, never re-created);
+  // declared ahead of the selection effect below, which lists getTrPage as a dep
+  const getTrPage = useCallback((n: number) => trStoreRef.current?.pages[n], []);
+  const getTrFigs = useCallback((n: number) => trStoreRef.current?.figures[n] ?? [], []);
+  const getBodyFh = useCallback(() => trStoreRef.current?.bodyFh ?? 0, []);
+
   // selection mini-toolbar: after a pointerup that leaves a non-empty selection
-  // inside a text layer, show «Перевести» near the selection end
+  // inside a text layer, show «Перевести» near the selection end — or, when the
+  // selection lies in a reflowed translation, «Оригинал» (see SelBarState)
   useEffect(() => {
     const evaluate = () => {
       const s = document.getSelection();
@@ -811,7 +853,8 @@ export default function App() {
       const rects = range.getClientRects();
       const last = rects[rects.length - 1] ?? range.getBoundingClientRect();
       const context = text.split(" ").length <= 2 ? sentenceAround(range, text) : undefined;
-      setSelBar({ anchor: { x: last.right + 4, y: last.bottom + 6 }, text, context });
+      const orig = trOriginalsFromSelection(getTrPage) ?? undefined;
+      setSelBar({ anchor: { x: last.right + 4, y: last.bottom + 6 }, text, context, orig });
     };
     const onUp = (e: PointerEvent) => {
       if ((e.target as Element | null)?.closest?.("[data-selbar],[data-popover]")) return;
@@ -827,12 +870,7 @@ export default function App() {
       document.removeEventListener("pointerup", onUp);
       document.removeEventListener("selectionchange", onSelChange);
     };
-  }, []);
-
-  // stable store getters for Page renders (read the ref, never re-created)
-  const getTrPage = useCallback((n: number) => trStoreRef.current?.pages[n], []);
-  const getTrFigs = useCallback((n: number) => trStoreRef.current?.figures[n] ?? [], []);
-  const getBodyFh = useCallback(() => trStoreRef.current?.bodyFh ?? 0, []);
+  }, [getTrPage]);
 
   // Mirror the path-keyed run manager (Р-6). The open book's run feeds the
   // toolbar; every progress step of THAT run re-reads the freshly written
@@ -944,6 +982,18 @@ export default function App() {
     setAskSeed({ id: ++askSeedIdRef.current, quote: bar.text, page: ctx.page, pageText: ctx.pageText });
     setAsk(true);
   }, [setAsk]);
+
+  // SelectionBar «Оригинал» (tr-selections; also O / Enter / palette): replay
+  // the originals captured at selection time in the popover — noTranslate, the
+  // text IS the answer; same look as Alt+click's «Оригинал» on a trPage block.
+  // The palette passes its own snapshot (its input collapses the selection and
+  // clears selBar before its commands run); every other caller uses the live bar.
+  const peekOriginal = useCallback((bar?: SelBarState | null) => {
+    const b = bar ?? selBarRef.current;
+    if (!b?.orig) return;
+    setSelBar(null);
+    setPop({ anchor: b.anchor, text: b.orig, label: "Оригинал", noTranslate: true });
+  }, []);
 
   // Ctrl+F: open (or refocus) the find bar — books only
   const openFind = useCallback(() => {
@@ -1437,6 +1487,7 @@ export default function App() {
         setMenuOpen(false);
         setNavOpen(false);
         setShortcutsOpen(false);
+        setPaletteSel(selBarRef.current); // before the input focus kills the bar
         setPaletteOpen((o) => !o);
       }
       // «?» / Ctrl+/ — все клавиши одним экраном
@@ -1448,6 +1499,12 @@ export default function App() {
       // no text inputs, and T visibly flips the pill's Ориг|Перевод segment
       else if (!ctrl && !e.altKey && !typing && e.code === "KeyD") toggleDark();
       else if (!ctrl && !e.altKey && !typing && e.code === "KeyT") toggleView();
+      // O — «Оригинал» peek for an active tr-selection (bare letter, like D/T;
+      // does nothing without a selection bar carrying originals)
+      else if (!ctrl && !e.altKey && !typing && e.code === "KeyO" && selBarRef.current?.orig && !popRef.current) {
+        e.preventDefault();
+        peekOriginal();
+      }
       // Alt+←/→ — jump history (link/outline/go-to-page jumps record positions)
       else if (!ctrl && e.altKey && e.code === "ArrowLeft") { e.preventDefault(); histNav(-1); }
       else if (!ctrl && e.altKey && e.code === "ArrowRight") { e.preventDefault(); histNav(1); }
@@ -1476,15 +1533,20 @@ export default function App() {
           el.scrollTop = e.code === "Home" ? 0 : el.scrollHeight;
         }
       }
-      // Enter confirms a visible selection bar — same as clicking «Перевести ⏎»
+      // Enter confirms a visible selection bar — same as clicking its first
+      // button: «Перевести ⏎», or «Оригинал» on a tr-selection (no translate
+      // is offered there, so Enter must never re-translate the translation)
       else if (
         !ctrl && !e.altKey && !typing && e.key === "Enter" &&
         selBarRef.current && !popRef.current && !t?.closest?.("button, a, select")
       ) {
         e.preventDefault();
         const bar = selBarRef.current;
-        setSelBar(null);
-        setPop(bar);
+        if (bar.orig) peekOriginal();
+        else {
+          setSelBar(null);
+          setPop(bar);
+        }
       }
       else if (e.key === "Escape") {
         // Esc peels UI layers before closing the book:
@@ -1515,7 +1577,7 @@ export default function App() {
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [openDialog, openFind, zoomTo, toggleDark, closeBook, setColsMode, toggleView, toggleAsk, setAsk, histNav]);
+  }, [openDialog, openFind, zoomTo, toggleDark, closeBook, setColsMode, toggleView, toggleAsk, setAsk, histNav, peekOriginal]);
 
   // Ctrl+wheel zoom (non-passive, to suppress webview page zoom)
   useEffect(() => {
@@ -1577,6 +1639,17 @@ export default function App() {
           hint: "T",
           keywords: "перевод оригинал translation original",
           run: toggleView,
+        });
+      // tr-selection at palette-open time: the «Оригинал» peek is reachable
+      // from the palette too (WP-E: the palette doubles as the cheat-sheet);
+      // runs off the snapshot — the live bar died with the input's autofocus
+      if (paletteSel?.orig)
+        paletteCommands.push({
+          id: "selorig",
+          label: "Оригинал выделенного",
+          hint: "O",
+          keywords: "оригинал выделение original selection",
+          run: () => peekOriginal(paletteSel),
         });
       if (trRun)
         paletteCommands.push({
@@ -2013,10 +2086,19 @@ export default function App() {
       {selBar && !pop && (
         <SelectionBar
           anchor={selBar.anchor}
-          onTranslate={() => {
-            setPop(selBar);
-            setSelBar(null);
-          }}
+          // tr-selections swap «Перевести» for «Оригинал» — translating the
+          // translation back is nonsense (choice documented in SelectionBar)
+          onTranslate={
+            selBar.orig
+              ? undefined
+              : () => {
+                  setPop(selBar);
+                  setSelBar(null);
+                }
+          }
+          // wrapped: the button's onClick MouseEvent must not land in the
+          // optional bar-snapshot parameter
+          onOriginal={selBar.orig ? () => peekOriginal() : undefined}
           onAsk={askFromSelection}
         />
       )}
