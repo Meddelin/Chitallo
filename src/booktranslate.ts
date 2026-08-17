@@ -12,7 +12,7 @@ import { OPS } from "pdfjs-dist";
 import type { PDFDocumentProxy, PDFPageProxy } from "pdfjs-dist";
 import { FIG_CONTAIN, clusterParagraphs, detectFigures, hash, interArea, mul } from "./paragraphs";
 import type { FigureRegion, Paragraph, ParaKind } from "./paragraphs";
-import { loadGlossaryText, parseGlossary, translate } from "./translate";
+import { ModelUnavailableError, isServerUp, loadGlossaryText, parseGlossary, translate } from "./translate";
 import type { GlossaryEntry } from "./translate";
 
 // dev-console handle: __pdferDev spreads this module, so classification and
@@ -181,15 +181,78 @@ function medianBodyFh(pages: Record<number, TrParagraph[]>): number {
   return fhs.length ? fhs[fhs.length >> 1] : 0;
 }
 
-// one paragraph: retry a failed request once, then give up with "" (the page
-// still completes); aborts always propagate so the page is NOT marked done
-async function translateRetry(text: string, glossary: GlossaryEntry[], signal?: AbortSignal): Promise<string> {
-  for (let attempt = 0; ; attempt++) {
+// abortable delay; rejects with AbortError so worker loops unwind like a fetch abort
+function sleep(ms: number, signal?: AbortSignal): Promise<void> {
+  return new Promise((res, rej) => {
+    const abortErr = () => new DOMException("translate aborted", "AbortError");
+    if (signal?.aborted) return rej(abortErr());
+    const t = setTimeout(() => {
+      signal?.removeEventListener("abort", onAbort);
+      res();
+    }, ms);
+    const onAbort = () => {
+      clearTimeout(t);
+      rej(abortErr());
+    };
+    signal?.addEventListener("abort", onAbort, { once: true });
+  });
+}
+
+// Shared per-run outage gate. On a network-level failure every worker funnels
+// through here: a single health probe decides "transient blip" (return at
+// once, redo the request) vs "server down" (report the stall once, poll
+// /health every 3s until it answers, report recovery). Concurrent callers
+// join the same in-flight wait, so one outage produces one stall
+// notification and one polling loop, not CONCURRENCY of them.
+function makeHealthGate(onStall?: (stalled: boolean) => void): (signal?: AbortSignal) => Promise<void> {
+  let waiting: Promise<void> | null = null;
+  return (signal?: AbortSignal) => {
+    waiting ??= (async () => {
+      if (await isServerUp()) return; // single-request blip — server is fine
+      onStall?.(true);
+      try {
+        do {
+          await sleep(3000, signal); // abort rejects here → run unwinds
+        } while (!(await isServerUp()));
+      } finally {
+        onStall?.(false); // recovered (or aborted — the run's teardown resets state anyway)
+      }
+    })().finally(() => {
+      waiting = null;
+    });
+    return waiting;
+  };
+}
+
+// One paragraph. Failure handling is asymmetric on purpose:
+//  - network failure (ModelUnavailableError): NEVER resolves to "" — the
+//    paragraph waits out the outage via the shared gate and is re-requested,
+//    so an unreachable server can no longer mint fake "translated" pages;
+//  - bad output (HTTP 4xx/500, parse-level errors): one retry, then give up
+//    with "" — the page still completes and the typesetter shows the original
+//    as an image crop;
+//  - aborts always propagate so the page is NOT marked done.
+async function translateRetry(
+  text: string,
+  glossary: GlossaryEntry[],
+  waitHealthy: (signal?: AbortSignal) => Promise<void>,
+  signal?: AbortSignal,
+): Promise<string> {
+  let soft = 0;
+  for (let net = 0; ; ) {
     try {
       return await translate(text, glossary, { signal });
     } catch (e) {
       if (signal?.aborted) throw e;
-      if (attempt >= 1) return "";
+      if (e instanceof ModelUnavailableError) {
+        net++;
+        // backoff bounds the loop rate if /health answers but completions
+        // keep dying (misconfig, proxy) — stalled honestly, never ""
+        await sleep(Math.min(500 * net, 5000), signal);
+        await waitHealthy(signal);
+        continue;
+      }
+      if (++soft >= 2) return "";
     }
   }
 }
@@ -198,12 +261,20 @@ async function translateRetry(text: string, glossary: GlossaryEntry[], signal?: 
 // Pages already in donePages are skipped (resume). Empty-text pages (covers,
 // figures-only) count as done immediately. After every completed page the
 // store is rewritten on disk, so cancel (AbortSignal) never loses a page.
+// A model outage never completes pages: the run stalls in place (onStall
+// reports it) and resumes by itself when /health answers again.
 export async function startBookTranslation(
   doc: PDFDocumentProxy,
   bookPath: string,
-  opts: { onProgress?: (p: BookProgress) => void; signal?: AbortSignal; pageLimit?: number } = {},
+  opts: {
+    onProgress?: (p: BookProgress) => void;
+    onStall?: (stalled: boolean) => void;
+    signal?: AbortSignal;
+    pageLimit?: number;
+  } = {},
 ): Promise<BookTranslation> {
-  const { onProgress, signal, pageLimit } = opts;
+  const { onProgress, onStall, signal, pageLimit } = opts;
+  const waitHealthy = makeHealthGate(onStall);
   const total = doc.numPages;
   const store: BookTranslation = (await loadBookTranslation(bookPath)) ?? {
     version: 2,
@@ -217,6 +288,10 @@ export async function startBookTranslation(
     bodyFh: 0,
   };
   store.total = total;
+  // never mint pages against a dead server: one probe up front — an outage
+  // stalls the run right here, before even a text-less page can complete and
+  // write the first store byte (auto-resumes when /health answers)
+  await waitHealthy(signal);
   const done = new Set(store.donePages);
   const glossary = parseGlossary(store.glossaryText);
   const durations: number[] = [];
@@ -251,14 +326,17 @@ export async function startBookTranslation(
         for (;;) {
           const k = i++;
           if (k >= todo.length || signal?.aborted) return;
-          todo[k].tr = await translateRetry(todo[k].text, glossary, signal);
+          todo[k].tr = await translateRetry(todo[k].text, glossary, waitHealthy, signal);
         }
       };
       let aborted = false;
       try {
         await Promise.all(Array.from({ length: CONCURRENCY }, worker));
       } catch {
-        aborted = true; // only aborts reject (translateRetry swallows other errors)
+        // only aborts reject: translateRetry waits out network outages and
+        // swallows bad-output errors — anything else unwinding here must not
+        // mark the page done either, so "treat as aborted" is the safe read
+        aborted = true;
       }
       if (aborted || signal?.aborted) break; // page incomplete — resume redoes it
     }

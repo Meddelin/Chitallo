@@ -1,0 +1,19 @@
+<svg width="1024" height="1024" viewBox="0 0 1024 1024" xmlns="http://www.w3.org/2000/svg">
+  <!-- pdfer glyph: страница в момент перевода — абзац-оригинал (тёплый графит)
+       и под ним абзац-перевод (акцент). Источник для `tauri icon`. -->
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#2B2723"/>
+      <stop offset="1" stop-color="#1B1815"/>
+    </linearGradient>
+  </defs>
+  <rect x="32" y="32" width="960" height="960" rx="212" fill="url(#bg)"/>
+  <rect x="252" y="172" width="520" height="680" rx="44" fill="#F6F1E7"/>
+  <!-- оригинал -->
+  <rect x="328" y="288" width="368" height="42" rx="21" fill="#6E675F"/>
+  <rect x="328" y="376" width="368" height="42" rx="21" fill="#6E675F"/>
+  <rect x="328" y="464" width="236" height="42" rx="21" fill="#6E675F"/>
+  <!-- перевод -->
+  <rect x="328" y="596" width="368" height="42" rx="21" fill="#3B82F6"/>
+  <rect x="328" y="684" width="296" height="42" rx="21" fill="#3B82F6"/>
+</svg>

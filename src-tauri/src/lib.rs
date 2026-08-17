@@ -1,10 +1,15 @@
+use std::collections::HashMap;
+use std::fs::{File, OpenOptions};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::sync::Mutex;
-use std::time::Duration;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
+use sha2::{Digest, Sha256};
+use tauri::ipc::Channel;
 use tauri::Manager;
 
 #[cfg(windows)]
@@ -291,7 +296,50 @@ fn translation_status(state: tauri::State<'_, TranslationState>) -> String {
             }
         }
     }
-    state.status.lock().unwrap().clone()
+    // An external instance whose port stopped answering is dead too (mirrors
+    // refresh_aux_status) — otherwise the status row would say «готова» forever.
+    let mut status = state.status.lock().unwrap();
+    if status.as_str() == "external" && !port_open(LLAMA_PORT) {
+        *status = "dead".into();
+    }
+    status.clone()
+}
+
+/// Restart (or first-start) the main translation llama-server. Serves the
+/// model-status surfaces: "dead" → «Перезапустить», and the moment right after
+/// the weights download completes ("none" → first spawn). Idempotent: while
+/// starting or already up nothing is spawned and the current status returns.
+#[tauri::command]
+fn restart_translation(app: tauri::AppHandle, state: tauri::State<'_, TranslationState>) -> String {
+    {
+        let mut guard = state.child.lock().unwrap();
+        if let Some(child) = guard.as_mut() {
+            if let Ok(Some(_)) = child.try_wait() {
+                *state.status.lock().unwrap() = "dead".into();
+            }
+        }
+    }
+    {
+        let mut status = state.status.lock().unwrap();
+        if status.as_str() == "external" && !port_open(LLAMA_PORT) {
+            *status = "dead".into();
+        }
+    }
+    let current = state.status.lock().unwrap().clone();
+    match current.as_str() {
+        "starting" | "spawned" | "external" => current,
+        _ => {
+            // Reap a dead child if one is still stored, then respawn.
+            if let Some(mut old) = state.child.lock().unwrap().take() {
+                let _ = old.kill();
+                let _ = old.wait();
+            }
+            *state.status.lock().unwrap() = "starting".into();
+            let handle = app.clone();
+            std::thread::spawn(move || init_llama_server::<TranslationState>(handle));
+            "starting".into()
+        }
+    }
 }
 
 /// Start the aux (terminologist) llama-server on port 11545. Returns
@@ -607,6 +655,417 @@ fn kill_spawned<S: LlamaSrv>(app: &tauri::AppHandle) {
     // external instance: nothing in state.child, nothing to kill
 }
 
+// ---------------------------------------------------------------------------
+// Model weights download: HF resolve URLs, HTTP Range resume, sha256 verify.
+// One slot per model key ("main" | "aux"). The <file>.part next to the final
+// path survives cancel, app restart and network loss — the next call continues
+// from the byte where the previous one stopped, then the finished file is
+// hash-checked and renamed into place atomically.
+// ---------------------------------------------------------------------------
+
+#[derive(Clone, Copy)]
+struct ModelSpec {
+    file: &'static str,
+    url: &'static str,
+    size: u64,
+    sha256: &'static str,
+}
+
+/// size + sha256 pinned from the HF API (lfs.oid), cross-checked against the
+/// known-good local weights on 2026-08-17.
+fn model_spec(key: &str) -> Option<ModelSpec> {
+    match key {
+        "main" => Some(ModelSpec {
+            file: TranslationState::MODEL_FILE,
+            url: "https://huggingface.co/tencent/HY-MT1.5-7B-GGUF/resolve/main/HY-MT1.5-7B-Q4_K_M.gguf",
+            size: 4_624_649_312,
+            sha256: "fc87637e4dd29547811a28170770c2ac17725fb7690b7c4aafa4f463c3e77568",
+        }),
+        "aux" => Some(ModelSpec {
+            file: AuxState::MODEL_FILE,
+            url: "https://huggingface.co/unsloth/Qwen3.5-4B-GGUF/resolve/main/Qwen3.5-4B-Q4_K_M.gguf",
+            size: 2_740_937_888,
+            sha256: "00fe7986ff5f6b463e62455821146049db6f9313603938a70800d1fb69ef11a4",
+        }),
+        _ => None,
+    }
+}
+
+#[derive(Clone, serde::Serialize)]
+struct DlEvent {
+    /// "idle" | "running" | "verifying" | "done" | "cancelled" | "error"
+    status: String,
+    received: u64,
+    total: u64,
+    bps: u64,
+    /// machine-readable: "no_space:<missing bytes>" | "http:<status>" | "io:<detail>" | "checksum"
+    error: Option<String>,
+}
+
+struct DlSlot {
+    running: bool,
+    cancel: Arc<AtomicBool>,
+    /// latest subscriber wins — a reloaded webview re-attaches by calling
+    /// download_model again, which replaces this channel
+    chan: Option<Channel<DlEvent>>,
+    last: DlEvent,
+}
+
+#[derive(Default)]
+struct DownloadsState {
+    slots: Mutex<HashMap<String, DlSlot>>,
+}
+
+fn dl_emit(app: &tauri::AppHandle, key: &str, ev: DlEvent) {
+    let state = app.state::<DownloadsState>();
+    let ch = {
+        let mut slots = state.slots.lock().unwrap();
+        match slots.get_mut(key) {
+            Some(slot) => {
+                slot.last = ev.clone();
+                slot.chan.clone()
+            }
+            None => None,
+        }
+    };
+    if let Some(ch) = ch {
+        let _ = ch.send(ev);
+    }
+}
+
+/// Free bytes available on the volume holding `dir` (which must exist).
+/// None = unknown (non-Windows or API failure) — the space check is skipped.
+#[cfg(windows)]
+fn free_disk_space(dir: &Path) -> Option<u64> {
+    use std::os::windows::ffi::OsStrExt;
+    let mut wide: Vec<u16> = dir.as_os_str().encode_wide().collect();
+    wide.push(0);
+    let mut avail: u64 = 0;
+    let ok = unsafe {
+        windows_sys::Win32::Storage::FileSystem::GetDiskFreeSpaceExW(
+            wide.as_ptr(),
+            &mut avail,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+        )
+    };
+    (ok != 0).then_some(avail)
+}
+
+#[cfg(not(windows))]
+fn free_disk_space(_dir: &Path) -> Option<u64> {
+    None
+}
+
+fn resolve_location(base: &str, loc: &str) -> String {
+    if loc.starts_with("http://") || loc.starts_with("https://") {
+        return loc.to_string();
+    }
+    let origin_end = base
+        .find("://")
+        .map(|i| i + 3)
+        .and_then(|i| base[i..].find('/').map(|j| i + j))
+        .unwrap_or(base.len());
+    if loc.starts_with('/') {
+        format!("{}{}", &base[..origin_end], loc)
+    } else {
+        match base.rfind('/') {
+            Some(i) if i > origin_end => format!("{}/{}", &base[..i], loc),
+            _ => format!("{}/{}", &base[..origin_end], loc),
+        }
+    }
+}
+
+/// GET with an explicit Range header, following redirects MANUALLY so the
+/// Range is guaranteed to reach the final CDN host (HF resolve → 302 → CDN;
+/// automatic redirect handling is allowed to drop request headers).
+fn http_get_ranged(agent: &ureq::Agent, url: &str, offset: u64) -> Result<ureq::Response, String> {
+    let mut cur = url.to_string();
+    for _ in 0..8 {
+        let mut req = agent.get(&cur);
+        if offset > 0 {
+            req = req.set("Range", &format!("bytes={offset}-"));
+        }
+        let resp = match req.call() {
+            Ok(r) => r,
+            Err(ureq::Error::Status(_, r)) => r, // caller inspects the status
+            Err(e) => return Err(format!("io:{e}")),
+        };
+        match resp.status() {
+            301 | 302 | 303 | 307 | 308 => match resp.header("Location") {
+                Some(loc) => cur = resolve_location(&cur, loc),
+                None => return Err(format!("http:{}", resp.status())),
+            },
+            _ => return Ok(resp),
+        }
+    }
+    Err("http:too_many_redirects".into())
+}
+
+enum DlOutcome {
+    Done,
+    Cancelled,
+}
+
+/// headroom beyond the missing bytes for the free-space check
+const DL_MARGIN: u64 = 300 * 1024 * 1024;
+
+fn do_download(
+    app: &tauri::AppHandle,
+    key: &str,
+    dir: &Path,
+    spec: &ModelSpec,
+    cancel: &AtomicBool,
+) -> Result<DlOutcome, String> {
+    std::fs::create_dir_all(dir).map_err(|e| format!("io:{e}"))?;
+    let final_path = dir.join(spec.file);
+    if final_path.exists() {
+        return Ok(DlOutcome::Done); // already installed — nothing to do
+    }
+    let part_path = dir.join(format!("{}.part", spec.file));
+    let mut offset = std::fs::metadata(&part_path).map(|m| m.len()).unwrap_or(0);
+    if offset > spec.size {
+        // partial of some other upstream file — start over
+        std::fs::remove_file(&part_path).map_err(|e| format!("io:{e}"))?;
+        offset = 0;
+    }
+
+    if offset < spec.size {
+        if let Some(free) = free_disk_space(dir) {
+            let need = spec.size - offset + DL_MARGIN;
+            if free < need {
+                return Err(format!("no_space:{}", need - free));
+            }
+        }
+        let agent = ureq::AgentBuilder::new()
+            .redirects(0)
+            .timeout_connect(Duration::from_secs(20))
+            .timeout_read(Duration::from_secs(40))
+            .build();
+        if offset > 0 {
+            eprintln!("[dl:{key}] resuming from byte {offset}");
+        }
+        let mut resp = http_get_ranged(&agent, spec.url, offset)?;
+        match resp.status() {
+            206 => {}
+            200 => offset = 0, // server ignored the Range — full body follows
+            416 => {
+                // server refuses our offset (upstream changed?) — restart clean
+                std::fs::remove_file(&part_path).map_err(|e| format!("io:{e}"))?;
+                offset = 0;
+                resp = http_get_ranged(&agent, spec.url, 0)?;
+                if resp.status() != 200 {
+                    return Err(format!("http:{}", resp.status()));
+                }
+            }
+            s => return Err(format!("http:{s}")),
+        }
+        let mut file = if offset > 0 {
+            OpenOptions::new().append(true).open(&part_path)
+        } else {
+            OpenOptions::new().write(true).create(true).truncate(true).open(&part_path)
+        }
+        .map_err(|e| format!("io:{e}"))?;
+        let mut reader = resp.into_reader();
+        let mut received = offset;
+        let mut buf = vec![0u8; 256 * 1024];
+        let mut last_emit = Instant::now();
+        let mut last_bytes = received;
+        dl_emit(app, key, DlEvent { status: "running".into(), received, total: spec.size, bps: 0, error: None });
+        loop {
+            if cancel.load(Ordering::Relaxed) {
+                return Ok(DlOutcome::Cancelled); // .part stays for resume
+            }
+            let n = reader.read(&mut buf).map_err(|e| format!("io:{e}"))?;
+            if n == 0 {
+                break;
+            }
+            file.write_all(&buf[..n]).map_err(|e| format!("io:{e}"))?;
+            received += n as u64;
+            if received > spec.size {
+                return Err("io:body longer than expected".into());
+            }
+            let dt = last_emit.elapsed();
+            if dt >= Duration::from_millis(300) {
+                let bps = ((received - last_bytes) as f64 / dt.as_secs_f64()) as u64;
+                dl_emit(app, key, DlEvent { status: "running".into(), received, total: spec.size, bps, error: None });
+                last_emit = Instant::now();
+                last_bytes = received;
+            }
+        }
+        file.flush().map_err(|e| format!("io:{e}"))?;
+        drop(file);
+        if received != spec.size {
+            return Err(format!("io:connection closed at {received} of {}", spec.size));
+        }
+    }
+
+    // integrity: full sha256 of the .part against the HF-published oid
+    dl_emit(app, key, DlEvent { status: "verifying".into(), received: spec.size, total: spec.size, bps: 0, error: None });
+    let mut f = File::open(&part_path).map_err(|e| format!("io:{e}"))?;
+    let mut hasher = Sha256::new();
+    let mut buf = vec![0u8; 4 * 1024 * 1024];
+    loop {
+        if cancel.load(Ordering::Relaxed) {
+            return Ok(DlOutcome::Cancelled);
+        }
+        let n = f.read(&mut buf).map_err(|e| format!("io:{e}"))?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+    }
+    let hex: String = hasher.finalize().iter().map(|b| format!("{b:02x}")).collect();
+    if hex != spec.sha256 {
+        std::fs::remove_file(&part_path).ok(); // poisoned bytes — never resume from them
+        return Err("checksum".into());
+    }
+    std::fs::rename(&part_path, &final_path).map_err(|e| format!("io:{e}"))?;
+    Ok(DlOutcome::Done)
+}
+
+fn run_model_download(app: tauri::AppHandle, key: String, dir: PathBuf, spec: ModelSpec, cancel: Arc<AtomicBool>) {
+    eprintln!("[dl:{key}] starting into {}", dir.display());
+    let res = do_download(&app, &key, &dir, &spec, &cancel);
+    let part_len = || {
+        std::fs::metadata(dir.join(format!("{}.part", spec.file)))
+            .map(|m| m.len())
+            .unwrap_or(0)
+    };
+    let ev = match &res {
+        Ok(DlOutcome::Done) => {
+            eprintln!("[dl:{key}] done -> {}", dir.join(spec.file).display());
+            DlEvent { status: "done".into(), received: spec.size, total: spec.size, bps: 0, error: None }
+        }
+        Ok(DlOutcome::Cancelled) => {
+            let received = part_len();
+            eprintln!("[dl:{key}] cancelled at {received} of {}", spec.size);
+            DlEvent { status: "cancelled".into(), received, total: spec.size, bps: 0, error: None }
+        }
+        Err(e) => {
+            let received = part_len();
+            eprintln!("[dl:{key}] error at {received}: {e}");
+            DlEvent { status: "error".into(), received, total: spec.size, bps: 0, error: Some(e.clone()) }
+        }
+    };
+    let state = app.state::<DownloadsState>();
+    let ch = {
+        let mut slots = state.slots.lock().unwrap();
+        match slots.get_mut(&key) {
+            Some(slot) => {
+                slot.running = false;
+                slot.last = ev.clone();
+                slot.chan.clone()
+            }
+            None => None,
+        }
+    };
+    if let Some(ch) = ch {
+        let _ = ch.send(ev);
+    }
+}
+
+fn resolve_models_dir(app: &tauri::AppHandle, dest_dir: Option<String>) -> Result<PathBuf, String> {
+    // dev-build-only escape hatch: tests download into a TEMP dir and can
+    // never touch the real models directory; release builds ignore the param
+    if cfg!(debug_assertions) {
+        if let Some(d) = dest_dir {
+            if !d.is_empty() {
+                return Ok(PathBuf::from(d));
+            }
+        }
+    }
+    app.path()
+        .app_data_dir()
+        .map(|d| d.join("models"))
+        .map_err(|e| format!("no app data dir: {e}"))
+}
+
+/// Start (or attach to) the resumable download of a model's weights. The
+/// channel immediately receives the current snapshot, then live progress.
+/// Calling while a download is in flight only re-subscribes the channel
+/// (that's how a reloaded webview picks a running download back up).
+#[tauri::command]
+fn download_model(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, DownloadsState>,
+    model: String,
+    dest_dir: Option<String>,
+    on_event: Channel<DlEvent>,
+) -> Result<(), String> {
+    let spec = model_spec(&model).ok_or_else(|| format!("unknown model: {model}"))?;
+    let dir = resolve_models_dir(&app, dest_dir)?;
+    let mut slots = state.slots.lock().unwrap();
+    let slot = slots.entry(model.clone()).or_insert_with(|| DlSlot {
+        running: false,
+        cancel: Arc::new(AtomicBool::new(false)),
+        chan: None,
+        last: DlEvent { status: "idle".into(), received: 0, total: spec.size, bps: 0, error: None },
+    });
+    let _ = on_event.send(slot.last.clone());
+    slot.chan = Some(on_event);
+    if slot.running {
+        return Ok(());
+    }
+    let cancel = Arc::new(AtomicBool::new(false));
+    slot.cancel = cancel.clone();
+    slot.running = true;
+    drop(slots);
+    std::thread::spawn({
+        let app = app.clone();
+        move || run_model_download(app, model, dir, spec, cancel)
+    });
+    Ok(())
+}
+
+/// Ask a running download to stop after the current chunk. The .part file is
+/// kept — the next download_model call resumes from it.
+#[tauri::command]
+fn cancel_model_download(state: tauri::State<'_, DownloadsState>, model: String) {
+    if let Some(slot) = state.slots.lock().unwrap().get_mut(&model) {
+        slot.cancel.store(true, Ordering::Relaxed);
+    }
+}
+
+#[derive(serde::Serialize)]
+struct DlStatus {
+    running: bool,
+    file_ready: bool,
+    received: u64,
+    total: u64,
+}
+
+/// Snapshot for surfaces that (re)open without a live channel: is the final
+/// file on disk, is a download in flight, how many bytes are already local.
+#[tauri::command]
+fn model_download_status(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, DownloadsState>,
+    model: String,
+    dest_dir: Option<String>,
+) -> Result<DlStatus, String> {
+    let spec = model_spec(&model).ok_or_else(|| format!("unknown model: {model}"))?;
+    let dir = resolve_models_dir(&app, dest_dir)?;
+    let file_ready = dir.join(spec.file).exists();
+    let (running, live) = state
+        .slots
+        .lock()
+        .unwrap()
+        .get(&model)
+        .map(|s| (s.running, s.last.received))
+        .unwrap_or((false, 0));
+    let received = if running {
+        live
+    } else if file_ready {
+        spec.size
+    } else {
+        std::fs::metadata(dir.join(format!("{}.part", spec.file)))
+            .map(|m| m.len())
+            .unwrap_or(0)
+    };
+    Ok(DlStatus { running, file_ready, received, total: spec.size })
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -616,11 +1075,16 @@ pub fn run() {
         .manage(TranslationState::default())
         .manage(AuxState::default())
         .manage(AskState::default())
+        .manage(DownloadsState::default())
         .invoke_handler(tauri::generate_handler![
             translation_status,
+            restart_translation,
             aux_model_start,
             aux_model_stop,
             aux_model_status,
+            download_model,
+            cancel_model_download,
+            model_download_status,
             ask_claude,
             ask_claude_cancel
         ])

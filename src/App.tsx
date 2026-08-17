@@ -1,14 +1,18 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { open } from "@tauri-apps/plugin-dialog";
 import { readFile } from "@tauri-apps/plugin-fs";
+import { openUrl } from "@tauri-apps/plugin-opener";
 import { appDataDir } from "@tauri-apps/api/path";
 import { getCurrentWindow } from "@tauri-apps/api/window";
-import { invoke } from "@tauri-apps/api/core";
 import * as pdfjs from "pdfjs-dist";
-import { TextLayer } from "pdfjs-dist";
+import { AnnotationLayer, TextLayer } from "pdfjs-dist";
 import type { PDFDocumentProxy, PDFPageProxy, RenderTask } from "pdfjs-dist";
 import workerUrl from "pdfjs-dist/build/pdf.worker.min.mjs?url";
 import Library from "./Library";
+import FindBar from "./FindBar";
+import Outline, { resolveDest } from "./Outline";
+import { Palette, ShortcutsOverlay } from "./Palette";
+import type { PaletteCommand } from "./Palette";
 import { GlossaryModal, SelectionBar, TranslatePopover } from "./TranslatePopover";
 import type { Anchor } from "./TranslatePopover";
 import { AskSidebar } from "./AskSidebar";
@@ -18,7 +22,8 @@ import type { FigureRegion, Word } from "./paragraphs";
 import * as booktranslate from "./booktranslate";
 import type { TrParagraph } from "./booktranslate";
 import * as glossarygen from "./glossarygen";
-import { isServerUp } from "./translate";
+import { ModelSetupModal, Spinner, dlBusy, dlPct, fetchModelStatus, restartModel, statusUp, useDownload } from "./ModelSetup";
+import { AboutModal } from "./About";
 import "./App.css";
 
 pdfjs.GlobalWorkerOptions.workerSrc = workerUrl;
@@ -37,6 +42,19 @@ type Size = { w: number; h: number };
 type Cols = 1 | 2 | "auto";
 type ViewMode = "orig" | "tr";
 type TrRequest = { anchor: Anchor; text: string; context?: string; label?: string; noTranslate?: boolean };
+
+// Minimal pdf.js link-service surface — exactly what AnnotationLayer's link
+// elements call. The full web/PDFLinkService binds the pdf_viewer EventBus
+// stack this app doesn't use (same call as FindBar vs PDFFindController).
+type LinkService = {
+  addLinkAttributes: (link: HTMLAnchorElement, url: string, newWindow?: boolean) => void;
+  getDestinationHash: (dest: unknown) => string;
+  getAnchorUrl: (hash: string) => string;
+  goToDestination: (dest: unknown) => Promise<void>;
+  goToPage: (n: number) => void;
+  executeNamedAction: (action: string) => void;
+  executeSetOCGState: (state: unknown) => void;
+};
 
 // ---- selection → translation helpers ---------------------------------------
 
@@ -345,6 +363,7 @@ function Page({
   getTrPage,
   getTrFigs,
   getBodyFh,
+  linkService,
 }: {
   doc: PDFDocumentProxy;
   num: number;
@@ -355,6 +374,7 @@ function Page({
   getTrPage: (n: number) => TrParagraph[] | undefined;
   getTrFigs: (n: number) => FigureRegion[];
   getBodyFh: () => number;
+  linkService: LinkService;
 }) {
   const ref = useRef<HTMLDivElement>(null);
   // Placeholder: page-1 size until this page renders once, then its own base
@@ -445,6 +465,40 @@ function Page({
             end.className = "endOfContent";
             textDiv.append(end);
           }
+
+          // annotation layer, LINKS ONLY: internal dests jump via the app's
+          // link service, external URLs open in the system browser. Forms,
+          // popups and other annotation kinds are deliberately not rendered
+          // (their CSS/JS never ships). Original-render mode only — the
+          // reflowed translation has no matching geometry.
+          const anns = (await page.getAnnotations().catch(() => [])).filter((a) => a.subtype === "Link");
+          if (anns.length && !cancelled && el.dataset.rendered === run) {
+            const annDiv = document.createElement("div");
+            annDiv.className = "annotationLayer";
+            el.appendChild(annDiv);
+            const vpAnn = vp.clone({ dontFlip: true }); // annotation coords are unflipped
+            await new AnnotationLayer({
+              div: annDiv,
+              page,
+              viewport: vpAnn,
+              accessibilityManager: null,
+              annotationCanvasMap: null,
+              annotationEditorUIManager: null,
+              structTreeLayer: null,
+              commentManager: null,
+              linkService,
+              annotationStorage: null,
+            })
+              .render({
+                annotations: anns,
+                div: annDiv,
+                viewport: vpAnn,
+                page,
+                linkService,
+                renderForms: false,
+              } as unknown as Parameters<AnnotationLayer["render"]>[0])
+              .catch(() => {});
+          }
         } else if (el.dataset.rendered) {
           // page scrolled far away — free canvas, text layer and pdf.js page resources
           delete el.dataset.rendered;
@@ -468,7 +522,7 @@ function Page({
       // NOTE: `rendered` (the page's true base size) is deliberately NOT reset —
       // see the placeholder comment above.
     };
-  }, [doc, num, scale, viewMode, trDep, getTrPage, getTrFigs, getBodyFh]);
+  }, [doc, num, scale, viewMode, trDep, getTrPage, getTrFigs, getBodyFh, linkService]);
 
   return (
     <div
@@ -508,20 +562,54 @@ export default function App() {
   const [askOpen, setAskOpen] = useState(() => sessionStorage.getItem("pdfer:ask:open") === "1");
   const [askSeed, setAskSeed] = useState<AskSeed | null>(null);
   const askSeedIdRef = useRef(0);
+  // ---- Ctrl+F find bar ----
+  const [findOpen, setFindOpen] = useState(false);
+  // bumped on every Ctrl+F: an already-open bar refocuses + selects its input
+  const [findNonce, setFindNonce] = useState(0);
+  // palette's «Найти: …» seeds the bar's query; null on every plain Ctrl+F
+  const [findSeed, setFindSeed] = useState<{ q: string; n: number } | null>(null);
+  const findSeedRef = useRef(0);
+  // ---- Ctrl+K command palette + «?» shortcut overlay ----
+  const [paletteOpen, setPaletteOpen] = useState(false);
+  const [shortcutsOpen, setShortcutsOpen] = useState(false);
+  // ---- «О pdfer» (WP-F): версия, приватность, лицензии ----
+  const [aboutOpen, setAboutOpen] = useState(false);
+  // ---- page-navigation flyout (indicator click: go-to-page + оглавление) ----
+  const [navOpen, setNavOpen] = useState(false);
   // ---- «Перевод» dropdown menu ----
   const [menuOpen, setMenuOpen] = useState(false);
   // inline confirm for «Перезапустить перевод»; reset whenever the menu closes
   const [confirmRestart, setConfirmRestart] = useState(false);
-  // llama-server state for the menu's status row: Tauri translation_status
-  // ("none"|"external"|"starting"|"spawned"|"dead"), plain-browser dev falls
-  // back to an HTTP /health probe; null until the first fetch resolves
+  // llama-server state, single vocabulary via ModelSetup.fetchModelStatus:
+  // "none"|"external"|"starting"|"spawned"|"dead"; null until the first fetch.
+  // Feeds the trigger dot, the menu status row and the startTr gate.
   const [modelStatus, setModelStatus] = useState<string | null>(null);
+  // model setup modal (license + user-initiated download) — where none/dead route
+  const [setupOpen, setSetupOpen] = useState(false);
+  // main model download, surfaced in the menu row while it runs
+  const dlMain = useDownload("main");
   // ---- whole-book translation state ----
   const [viewMode, setViewMode] = useState<ViewMode>("orig");
   // store meta for the toolbar: null = no stored translation for this book
   const [trInfo, setTrInfo] = useState<{ done: number; total: number } | null>(null);
   const [trRun, setTrRun] = useState(false);
   const [trEta, setTrEta] = useState<number | undefined>(undefined);
+  // engine is waiting out a model outage (auto-resumes on health recovery)
+  const [trStall, setTrStall] = useState(false);
+  // startTr is waiting for a "starting" model to come up (auto-starts then)
+  const [trWait, setTrWait] = useState(false);
+  const trWaitRef = useRef(false);
+  // text-layer probe of the open book: null = probing, false = scan (no text)
+  const [hasText, setHasText] = useState<boolean | null>(null);
+  const hasTextProbeRef = useRef<Promise<boolean> | null>(null);
+  // transient bottom toast (auto-hides); sticky engine states override it in render
+  const [notice, setNotice] = useState<string | null>(null);
+  const noticeTimer = useRef<number>(undefined);
+  const showNotice = useCallback((msg: string) => {
+    setNotice(msg);
+    clearTimeout(noticeTimer.current);
+    noticeTimer.current = window.setTimeout(() => setNotice(null), 6000);
+  }, []);
   // bumped whenever trStoreRef content changes — tr-mode Pages re-read overlays
   const [trVersion, setTrVersion] = useState(0);
   const trStoreRef = useRef<booktranslate.BookTranslation | null>(null);
@@ -539,6 +627,28 @@ export default function App() {
   glossRef.current = glossOpen;
   const menuRef = useRef(menuOpen);
   menuRef.current = menuOpen;
+  const findRef = useRef(findOpen);
+  findRef.current = findOpen;
+  const paletteRef = useRef(paletteOpen);
+  paletteRef.current = paletteOpen;
+  const shortcutsRef = useRef(shortcutsOpen);
+  shortcutsRef.current = shortcutsOpen;
+  const aboutRef = useRef(aboutOpen);
+  aboutRef.current = aboutOpen;
+  const navOpenRef = useRef(navOpen);
+  navOpenRef.current = navOpen;
+  const docRef = useRef<PDFDocumentProxy | null>(null);
+  docRef.current = doc;
+  const curPageRef = useRef(curPage);
+  curPageRef.current = curPage;
+  // Alt+←/→ jump history: scroll positions, scale-tagged so a zoom change
+  // between push and pop still restores the right spot
+  const histRef = useRef<{ back: { top: number; scale: number }[]; fwd: { top: number; scale: number }[] }>({
+    back: [],
+    fwd: [],
+  });
+  const setupRef = useRef(setupOpen);
+  setupRef.current = setupOpen;
   const askOpenRef = useRef(askOpen);
   askOpenRef.current = askOpen;
   const scrollRef = useRef<HTMLDivElement>(null);
@@ -671,28 +781,22 @@ export default function App() {
     return () => document.removeEventListener("pointerdown", onDown, true);
   }, [menuOpen]);
 
-  // menu status row: poll translation_status while the menu is open (3s — the
-  // "starting" state resolves on its own). Outside Tauri the invoke throws;
-  // an HTTP health probe of the same server stands in.
+  // model status poll: background while a book is open (feeds the trigger
+  // dot), faster while the menu is open — "starting" resolves on its own
   useEffect(() => {
-    if (!menuOpen) return;
+    if (!doc) return;
     let cancelled = false;
     const poll = async () => {
-      let s: string;
-      try {
-        s = await invoke<string>("translation_status");
-      } catch {
-        s = (await isServerUp()) ? "external" : "none";
-      }
+      const s = await fetchModelStatus();
       if (!cancelled) setModelStatus(s);
     };
     poll();
-    const t = window.setInterval(poll, 3000);
+    const t = window.setInterval(poll, menuOpen ? 3000 : 12000);
     return () => {
       cancelled = true;
       window.clearInterval(t);
     };
-  }, [menuOpen]);
+  }, [doc, menuOpen]);
 
   // Alt+click on text → translate the whole visual paragraph; on a reflowed
   // translated block the translation is already on screen, so show the stored
@@ -744,6 +848,92 @@ export default function App() {
     setAsk(true);
   }, [setAsk]);
 
+  // Ctrl+F: open (or refocus) the find bar — books only
+  const openFind = useCallback(() => {
+    if (!pathRef.current) return;
+    setFindSeed(null); // plain open never re-applies a stale palette seed
+    setFindOpen(true);
+    setFindNonce((n) => n + 1);
+  }, []);
+
+  // ---- navigation: go-to-page, jump history, pdf.js link service ----
+
+  // jump to a page (1-based); frac = vertical position within it, 0 = top.
+  // Every programmatic jump records the previous position for Alt+←.
+  const goToPage = useCallback((n: number, frac = 0) => {
+    const el = scrollRef.current;
+    const total = docRef.current?.numPages ?? 0;
+    if (!el || !total) return;
+    const p = Math.min(total, Math.max(1, Math.round(n) || 1));
+    const pageEl = el.querySelector<HTMLElement>(`[data-page="${p}"]`);
+    if (!pageEl) return;
+    const h = histRef.current;
+    h.back.push({ top: el.scrollTop, scale: scaleRef.current });
+    if (h.back.length > 100) h.back.shift();
+    h.fwd = [];
+    // 10px of air at a page top; dest fractions sit 70px down so the target
+    // line clears the floating toolbar
+    el.scrollTop = Math.max(0, pageEl.offsetTop + frac * pageEl.offsetHeight - (frac > 0 ? 70 : 10));
+  }, []);
+
+  // Alt+←/→ — walk the jump history (positions rescale if zoom changed since)
+  const histNav = useCallback((dir: -1 | 1) => {
+    const el = scrollRef.current;
+    const h = histRef.current;
+    const from = dir === -1 ? h.back : h.fwd;
+    const to = dir === -1 ? h.fwd : h.back;
+    const entry = from.pop();
+    if (!el || !entry) return;
+    to.push({ top: el.scrollTop, scale: scaleRef.current });
+    el.scrollTop = (entry.top * scaleRef.current) / entry.scale;
+  }, []);
+
+  // Stable identity (reads refs only) — Page effects never re-run because of
+  // it. External URLs go to the system browser via the opener plugin; the
+  // window.open fallback covers the plain-browser dev mode.
+  const linkService = useMemo<LinkService>(
+    () => ({
+      addLinkAttributes(link, url) {
+        link.href = url;
+        link.title = url;
+        link.rel = "noopener noreferrer";
+        link.onclick = () => {
+          openUrl(url).catch(() => window.open(url, "_blank", "noopener"));
+          return false;
+        };
+      },
+      getDestinationHash: () => "#",
+      getAnchorUrl: () => "#",
+      async goToDestination(dest) {
+        const d = docRef.current;
+        if (!d) return;
+        const t = await resolveDest(d, dest);
+        if (t && docRef.current === d) goToPage(t.page, t.frac);
+      },
+      goToPage: (n) => goToPage(n),
+      executeNamedAction(action) {
+        if (action === "NextPage") goToPage(curPageRef.current + 1);
+        else if (action === "PrevPage") goToPage(curPageRef.current - 1);
+        else if (action === "FirstPage") goToPage(1);
+        else if (action === "LastPage") goToPage(docRef.current?.numPages ?? 1);
+        else if (action === "GoBack") histNav(-1);
+        else if (action === "GoForward") histNav(1);
+      },
+      executeSetOCGState: () => {},
+    }),
+    [goToPage, histNav],
+  );
+
+  // page-nav flyout: click outside closes (same pattern as the «Перевод» menu)
+  useEffect(() => {
+    if (!navOpen) return;
+    const onDown = (e: PointerEvent) => {
+      if (!(e.target as Element | null)?.closest?.("[data-pagenav]")) setNavOpen(false);
+    };
+    document.addEventListener("pointerdown", onDown, true);
+    return () => document.removeEventListener("pointerdown", onDown, true);
+  }, [navOpen]);
+
   // per-book view mode, persisted; default = original
   const setView = useCallback((m: ViewMode) => {
     setViewMode(m);
@@ -751,22 +941,62 @@ export default function App() {
   }, []);
 
   const toggleView = useCallback(() => {
-    if (!trAvailRef.current) return; // no stored translation — T is a no-op
+    if (!docRef.current) return;
+    if (!trAvailRef.current) {
+      // T with nothing to toggle: point at the entry instead of silence (Н5)
+      showNotice("Сначала переведите книгу — Перевод ▾");
+      return;
+    }
     setView(viewModeRef.current === "tr" ? "orig" : "tr");
-  }, [setView]);
+  }, [setView, showNotice]);
 
-  // one-button whole-book translation. Pause = abort: progress is persisted per
+  // One-button whole-book translation. Pause = abort: progress is persisted per
   // page by the engine, so pressing the button again later resumes for free
   // (donePages are skipped). Runs with concurrency 3 of the server's 4 slots —
   // selection translate stays responsive on the free slot.
-  const startTr = useCallback(() => {
-    if (!doc || !path || trRunRef.current) return;
+  // Gated: a run only ever starts against a live model. "starting" is waited
+  // out (auto-start on ready), "none"/"dead" surface the reason instead of
+  // fake-succeeding (WP-B routes these into the model-setup flow), and a book
+  // with no text layer never starts a run at all.
+  const startTr = useCallback(async () => {
+    if (!doc || !path || trRunRef.current || trWaitRef.current) return;
+    if ((await hasTextProbeRef.current) === false) {
+      if (pathRef.current === path) showNotice("В книге нет текстового слоя — нужен OCR");
+      return;
+    }
+    if (pathRef.current !== path || trRunRef.current) return; // book changed during the probe
+    let status = await fetchModelStatus();
+    if (status === "starting") {
+      trWaitRef.current = true;
+      setTrWait(true);
+      try {
+        while (status === "starting") {
+          await new Promise((r) => setTimeout(r, 2000));
+          if (pathRef.current !== path || trRunRef.current) return;
+          status = await fetchModelStatus();
+        }
+      } finally {
+        trWaitRef.current = false;
+        setTrWait(false);
+      }
+    }
+    if (pathRef.current !== path || trRunRef.current) return;
+    if (status !== "spawned" && status !== "external") {
+      // none/dead: no honest run possible — route into the model setup flow
+      // (license + download / «Перезапустить») instead of a dead-end toast
+      setMenuOpen(false);
+      setSetupOpen(true);
+      return;
+    }
     const ctrl = new AbortController();
     trRunRef.current = ctrl;
     setTrRun(true);
     trPromiseRef.current = booktranslate
       .startBookTranslation(doc, path, {
         signal: ctrl.signal,
+        onStall: (stalled) => {
+          if (trRunRef.current === ctrl) setTrStall(stalled);
+        },
         onProgress: (p) => {
           if (trRunRef.current !== ctrl) return;
           setTrInfo({ done: p.donePages, total: p.total });
@@ -795,9 +1025,10 @@ export default function App() {
           trRunRef.current = null;
           setTrRun(false);
           setTrEta(undefined);
+          setTrStall(false);
         }
       });
-  }, [doc, path]);
+  }, [doc, path, showNotice]);
 
   // «Перевести заново» (glossary modal): drop the store, restart from page 1
   const retranslate = useCallback(async () => {
@@ -861,6 +1092,10 @@ export default function App() {
 
     // switching books: stop any running translation, load the new book's store
     trRunRef.current?.abort();
+    setFindOpen(false); // find state is per book
+    setFindSeed(null);
+    setNavOpen(false);
+    histRef.current = { back: [], fwd: [] }; // jump history is per book
     setAskSeed(null); // a stale seed must not leak into the next book's sidebar
     trStoreRef.current = null;
     setTrInfo(null);
@@ -873,6 +1108,32 @@ export default function App() {
         setTrInfo({ done: st.donePages.length, total: st.total });
         setTrVersion((v) => v + 1);
       }
+    });
+
+    // Text-layer probe: sample a few pages spread through the book. A book
+    // where none of them yields text is a scan — translation is refused with
+    // an honest message (Н8) instead of instantly "completing" with 100%
+    // empty pages. startTr awaits the promise; state feeds the menu row.
+    const probe = (async () => {
+      const picks = [...new Set([1, 2, Math.ceil(d.numPages / 2), d.numPages - 1, d.numPages])].filter(
+        (n) => n >= 1 && n <= d.numPages,
+      );
+      for (const n of picks) {
+        try {
+          const content = await (await d.getPage(n)).getTextContent();
+          let chars = 0;
+          for (const it of content.items) if ("str" in it) chars += it.str.trim().length;
+          if (chars >= 20) return true;
+        } catch {
+          // damaged page — keep probing the rest
+        }
+      }
+      return false;
+    })();
+    hasTextProbeRef.current = probe;
+    setHasText(null);
+    probe.then((v) => {
+      if (pathRef.current === key) setHasText(v);
     });
 
     setBaseSize({ w: vp.width, h: vp.height });
@@ -955,6 +1216,8 @@ export default function App() {
     trStoreRef.current = null;
     setTrInfo(null);
     setTrEta(undefined);
+    setHasText(null);
+    hasTextProbeRef.current = null;
     pathRef.current = null;
     setDoc(null);
     setPath(null);
@@ -963,6 +1226,12 @@ export default function App() {
     setPop(null);
     setGlossOpen(false);
     setMenuOpen(false);
+    setFindOpen(false);
+    setFindSeed(null);
+    setNavOpen(false);
+    setPaletteOpen(false);
+    setShortcutsOpen(false);
+    histRef.current = { back: [], fwd: [] };
     setAskSeed(null); // askOpen itself survives — it's a session preference
     try {
       getCurrentWindow().setTitle("pdfer").catch(() => {});
@@ -1001,6 +1270,7 @@ export default function App() {
       const t = e.target as HTMLElement | null;
       const typing = !!t && (t.tagName === "TEXTAREA" || t.tagName === "INPUT" || t.isContentEditable);
       if (ctrl && e.code === "KeyO") { e.preventDefault(); openDialog(); }
+      else if (ctrl && e.code === "KeyF") { e.preventDefault(); openFind(); }
       else if (ctrl && (e.key === "=" || e.key === "+")) { e.preventDefault(); zoomTo(scaleRef.current + 0.125); }
       else if (ctrl && e.key === "-") { e.preventDefault(); zoomTo(scaleRef.current - 0.125); }
       else if (ctrl && e.key === "0") { e.preventDefault(); zoomTo(DEFAULT_SCALE); }
@@ -1008,17 +1278,73 @@ export default function App() {
       else if (ctrl && e.code === "Digit2") { e.preventDefault(); setColsMode(2); }
       else if (ctrl && e.code === "Digit3") { e.preventDefault(); setColsMode("auto"); }
       else if (ctrl && e.code === "KeyJ") { e.preventDefault(); toggleAsk(); }
+      // Ctrl+K — command palette (flyouts close: one floating layer at a time)
+      else if (ctrl && e.code === "KeyK") {
+        e.preventDefault();
+        setMenuOpen(false);
+        setNavOpen(false);
+        setShortcutsOpen(false);
+        setPaletteOpen((o) => !o);
+      }
+      // «?» / Ctrl+/ — все клавиши одним экраном
+      else if (ctrl && e.code === "Slash") { e.preventDefault(); setPaletteOpen(false); setShortcutsOpen((o) => !o); }
+      else if (!ctrl && !e.altKey && !typing && e.key === "?") { e.preventDefault(); setPaletteOpen(false); setShortcutsOpen((o) => !o); }
       // bare-letter hotkeys stay live while the «Перевод» menu is open — it has
       // no text inputs, and T visibly flips the menu's own Ориг/Перевод row
       else if (!ctrl && !e.altKey && !typing && e.code === "KeyD") toggleDark();
       else if (!ctrl && !e.altKey && !typing && e.code === "KeyT") toggleView();
+      // Alt+←/→ — jump history (link/outline/go-to-page jumps record positions)
+      else if (!ctrl && e.altKey && e.code === "ArrowLeft") { e.preventDefault(); histNav(-1); }
+      else if (!ctrl && e.altKey && e.code === "ArrowRight") { e.preventDefault(); histNav(1); }
+      // reading keys — explicit scroll on the container: works with no prior
+      // click (a window handler needs no focus), and preventDefault kills the
+      // double-scroll when the container happens to be focused
+      else if (
+        !ctrl && !e.altKey && scrollRef.current &&
+        ["Space", "PageDown", "PageUp", "Home", "End", "ArrowDown", "ArrowUp"].includes(e.code)
+      ) {
+        const el = scrollRef.current;
+        const pageStep = Math.max(80, el.clientHeight * 0.85);
+        // Space must keep activating focused buttons and typing spaces;
+        // arrows/Home/End must keep moving the caret in text inputs
+        const onControl = typing || !!t?.closest?.("button, a, select");
+        const dy =
+          e.code === "PageDown" ? pageStep
+          : e.code === "PageUp" ? -pageStep
+          : e.code === "Space" && !onControl ? (e.shiftKey ? -pageStep : pageStep)
+          : e.code === "ArrowDown" && !typing ? 80
+          : e.code === "ArrowUp" && !typing ? -80
+          : null;
+        if (dy !== null) { e.preventDefault(); el.scrollTop += dy; }
+        else if ((e.code === "Home" || e.code === "End") && !typing) {
+          e.preventDefault();
+          el.scrollTop = e.code === "Home" ? 0 : el.scrollHeight;
+        }
+      }
+      // Enter confirms a visible selection bar — same as clicking «Перевести ⏎»
+      else if (
+        !ctrl && !e.altKey && !typing && e.key === "Enter" &&
+        selBarRef.current && !popRef.current && !t?.closest?.("button, a, select")
+      ) {
+        e.preventDefault();
+        const bar = selBarRef.current;
+        setSelBar(null);
+        setPop(bar);
+      }
       else if (e.key === "Escape") {
         // Esc peels UI layers before closing the book:
-        // меню → глоссарий → перевод → сайдбар (только при фокусе в нём) → выделение
+        // палитра → шорткаты → «О pdfer» → оглавление → меню → модель → глоссарий → перевод → поиск → сайдбар (только при фокусе в нём) → выделение
+        // (Esc typed INSIDE the find/page/palette inputs is handled there and never reaches this chain)
         const ae = document.activeElement as HTMLElement | null;
-        if (menuRef.current) setMenuOpen(false);
+        if (paletteRef.current) setPaletteOpen(false);
+        else if (shortcutsRef.current) setShortcutsOpen(false);
+        else if (aboutRef.current) setAboutOpen(false);
+        else if (navOpenRef.current) setNavOpen(false);
+        else if (menuRef.current) setMenuOpen(false);
+        else if (setupRef.current) setSetupOpen(false);
         else if (glossRef.current) setGlossOpen(false);
         else if (popRef.current) setPop(null);
+        else if (findRef.current) setFindOpen(false);
         else if (askOpenRef.current && ae?.closest("[data-asksb]")) {
           // focus inside the sidebar: leave the input first; a focused
           // non-input control closes the panel. An unfocused sidebar is
@@ -1033,7 +1359,7 @@ export default function App() {
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [openDialog, zoomTo, toggleDark, closeBook, setColsMode, toggleView, toggleAsk, setAsk]);
+  }, [openDialog, openFind, zoomTo, toggleDark, closeBook, setColsMode, toggleView, toggleAsk, setAsk, histNav]);
 
   // Ctrl+wheel zoom (non-passive, to suppress webview page zoom)
   useEffect(() => {
@@ -1076,6 +1402,67 @@ export default function App() {
 
   const trPct = trInfo ? Math.floor((100 * trInfo.done) / Math.max(1, trInfo.total)) : 0;
 
+  // Ctrl+K commands — every action already in the UI, one name each, with its
+  // key as the hint (the palette doubles as the cheat-sheet). Built only while
+  // the palette is open; a ~20-element array per render is free.
+  const paletteCommands: PaletteCommand[] = [];
+  if (paletteOpen) {
+    if (doc) {
+      paletteCommands.push(
+        { id: "toc", label: "Оглавление", keywords: "toc contents содержание страница", run: () => setNavOpen(true) },
+        { id: "find", label: "Найти в книге", hint: "Ctrl+F", keywords: "поиск search find", run: openFind },
+      );
+      if (trInfo !== null)
+        paletteCommands.push({
+          id: "view",
+          label: viewMode === "tr" ? "Показать оригинал" : "Показать перевод",
+          hint: "T",
+          keywords: "перевод оригинал translation original",
+          run: toggleView,
+        });
+      if (trRun)
+        paletteCommands.push({
+          id: "trpause",
+          label: "Приостановить перевод",
+          keywords: "пауза pause стоп",
+          run: () => trRunRef.current?.abort(),
+        });
+      else if (trInfo === null ? hasText !== false : trInfo.done < trInfo.total)
+        paletteCommands.push({
+          id: "trstart",
+          label: trInfo === null ? "Перевести книгу" : `Продолжить перевод · ${trPct}%`,
+          keywords: "translate перевод книга",
+          run: startTr,
+        });
+      paletteCommands.push(
+        { id: "gloss", label: "Глоссарий…", keywords: "термины glossary", run: () => setGlossOpen(true) },
+        { id: "ask", label: "Спросить", hint: "Ctrl+J", keywords: "вопрос чат claude ask", run: toggleAsk },
+        { id: "zin", label: "Крупнее", hint: "Ctrl +", keywords: "масштаб zoom", run: () => zoomTo(scaleRef.current + 0.125) },
+        { id: "zout", label: "Мельче", hint: "Ctrl −", keywords: "масштаб zoom", run: () => zoomTo(scaleRef.current - 0.125) },
+        { id: "zreset", label: "Сбросить масштаб", hint: "Ctrl+0", keywords: "масштаб zoom", run: () => zoomTo(DEFAULT_SCALE) },
+        { id: "c1", label: "Одна страница в ряд", hint: "Ctrl+1", keywords: "колонки columns", run: () => setColsMode(1) },
+        { id: "c2", label: "Две страницы в ряд", hint: "Ctrl+2", keywords: "колонки columns", run: () => setColsMode(2) },
+        { id: "cauto", label: "Автоподбор по ширине", hint: "Ctrl+3", keywords: "колонки columns авто", run: () => setColsMode("auto") },
+        { id: "back", label: "Назад по переходам", hint: "Alt+←", keywords: "история back", run: () => histNav(-1) },
+        { id: "fwd", label: "Вперёд по переходам", hint: "Alt+→", keywords: "история forward", run: () => histNav(1) },
+        { id: "lib", label: "Библиотека", hint: "Esc", keywords: "закрыть library close", run: closeBook },
+      );
+    }
+    paletteCommands.push(
+      { id: "open", label: "Открыть файл…", hint: "Ctrl+O", keywords: "open file pdf", run: openDialog },
+      { id: "dark", label: dark ? "Светлая тема" : "Тёмная тема", hint: "D", keywords: "тема theme dark light", run: toggleDark },
+      { id: "keys", label: "Клавиши", hint: "?", keywords: "шорткаты клавиатура shortcuts помощь help", run: () => setShortcutsOpen(true) },
+      { id: "about", label: "О pdfer", keywords: "версия лицензии приватность about version license", run: () => setAboutOpen(true) },
+    );
+  }
+
+  // sticky engine states outrank the transient notice; stall clears itself on recovery
+  const toastMsg = trStall
+    ? "Модель недоступна — перевод приостановлен, готовые страницы сохранены"
+    : trWait
+      ? "Модель запускается… Перевод начнётся автоматически"
+      : notice;
+
   return (
     <div className={`${dark ? "dark" : ""} h-screen w-screen overflow-hidden bg-neutral-200 dark:bg-neutral-900 transition-colors`}>
       <div
@@ -1090,8 +1477,27 @@ export default function App() {
         {doc && (
           <>
             <span className="mx-2 h-4 w-px bg-neutral-900/15 dark:bg-neutral-100/20" />
-            {/* center: view controls — pages · zoom · columns */}
-            <span className="tabular-nums opacity-70">{curPage} / {doc.numPages}</span>
+            {/* center: view controls — pages · zoom · columns; the indicator
+                opens the go-to-page + оглавление flyout */}
+            <span className="relative" data-pagenav>
+              <button
+                className="tabular-nums opacity-70 hover:opacity-100 px-1 whitespace-nowrap"
+                onClick={() => setNavOpen((o) => !o)}
+                title="Страница и оглавление"
+              >
+                {curPage} / {doc.numPages}
+              </button>
+              {navOpen && (
+                <Outline
+                  doc={doc}
+                  onJump={(p, frac) => {
+                    setNavOpen(false);
+                    goToPage(p, frac);
+                  }}
+                  onClose={() => setNavOpen(false)}
+                />
+              )}
+            </span>
             <span className="mx-2 opacity-40">·</span>
             <button className="hover:opacity-60 px-1.5" onClick={() => zoomTo(scale - 0.125)} title="Мельче (Ctrl −)">−</button>
             <span className="tabular-nums opacity-70 w-11 text-center">{Math.round(scale * 100)}%</span>
@@ -1115,6 +1521,14 @@ export default function App() {
                 onClick={() => setMenuOpen((o) => !o)}
                 title="Перевод книги"
               >
+                {modelStatus !== null && !statusUp(modelStatus) && (
+                  // model not ready — the single «загляни сюда» signal
+                  <span
+                    className={`mr-1.5 inline-block h-1.5 w-1.5 rounded-full bg-amber-500 align-middle ${
+                      modelStatus === "starting" || dlBusy(dlMain) ? "animate-pulse" : ""
+                    }`}
+                  />
+                )}
                 {trRun ? `Перевод · ${trPct}%` : "Перевод"} <span className="text-[9px] opacity-60">▾</span>
               </button>
               {menuOpen && (
@@ -1149,13 +1563,21 @@ export default function App() {
                         Пауза · {trPct}%{fmtEta(trEta)}
                       </button>
                     ) : trInfo === null ? (
-                      <button
-                        className={MENU_ROW}
-                        onClick={startTr}
-                        title="Перевести всю книгу локальной моделью (можно прервать в любой момент)"
-                      >
-                        Перевести книгу
-                      </button>
+                      hasText === false ? (
+                        // scan: nothing to feed the model — honest refusal
+                        // instead of an instantly-«done» empty translation
+                        <div className="px-2.5 py-1.5 opacity-50 cursor-default">
+                          В книге нет текстового слоя — нужен OCR
+                        </div>
+                      ) : (
+                        <button
+                          className={MENU_ROW}
+                          onClick={startTr}
+                          title="Перевести всю книгу локальной моделью (можно прервать в любой момент)"
+                        >
+                          Перевести книгу
+                        </button>
+                      )
                     ) : trInfo.done < trInfo.total ? (
                       <button
                         className={`${MENU_ROW} tabular-nums`}
@@ -1167,11 +1589,13 @@ export default function App() {
                     ) : (
                       <div className="px-2.5 py-1.5 opacity-50">Переведено · 100%</div>
                     )}
+                    {/* деструктивное подтверждение (#11): следствие + кнопка,
+                        называющая действие; «Перевести заново» (#13) */}
                     {trInfo !== null &&
                       (confirmRestart ? (
                         <div className="px-2.5 py-1.5">
-                          <div className="opacity-70">Точно? Прогресс будет удалён</div>
-                          <div className="mt-0.5 flex gap-4">
+                          <div className="opacity-70">Готовый перевод будет удалён</div>
+                          <div className="mt-1 flex flex-col items-start gap-1">
                             <button
                               className="hover:opacity-60 text-red-600 dark:text-red-400"
                               onClick={() => {
@@ -1179,10 +1603,10 @@ export default function App() {
                                 retranslate();
                               }}
                             >
-                              да
+                              Удалить и перевести заново
                             </button>
                             <button className="hover:opacity-60" onClick={() => setConfirmRestart(false)}>
-                              нет
+                              Отмена
                             </button>
                           </div>
                         </div>
@@ -1190,9 +1614,9 @@ export default function App() {
                         <button
                           className={MENU_ROW}
                           onClick={() => setConfirmRestart(true)}
-                          title="Удалить сохранённый перевод книги и начать заново"
+                          title="Удалить готовый перевод и перевести книгу заново"
                         >
-                          Перезапустить перевод
+                          Перевести заново
                         </button>
                       ))}
                     <button
@@ -1206,16 +1630,58 @@ export default function App() {
                       Глоссарий…
                     </button>
                   </div>
+                  {/* model status row — единый словарь статусов (копирайт #1–4) */}
                   {modelStatus && (
-                    <div className="mt-1 border-t border-neutral-200 dark:border-neutral-700 px-2.5 pt-1.5 pb-1 text-xs opacity-50">
-                      Модель:{" "}
-                      {modelStatus === "spawned" || modelStatus === "external"
-                        ? "работает"
-                        : modelStatus === "starting"
-                          ? "запускается"
-                          : "не найдена"}
+                    <div className="mt-1 border-t border-neutral-200 dark:border-neutral-700 px-2.5 pt-1.5 pb-1 text-xs">
+                      {dlBusy(dlMain) ? (
+                        <button
+                          className="w-full text-left tabular-nums text-neutral-500 hover:opacity-70 dark:text-neutral-400"
+                          onClick={() => {
+                            setMenuOpen(false);
+                            setSetupOpen(true);
+                          }}
+                          title="Скачивается в фоне — подробности и отмена"
+                        >
+                          Модель скачивается · {dlPct(dlMain)}%
+                        </button>
+                      ) : modelStatus === "starting" || (dlMain.status === "done" && !statusUp(modelStatus)) ? (
+                        <span className="flex items-center gap-1.5 opacity-50">
+                          <Spinner /> Модель перевода: запускается…
+                        </span>
+                      ) : statusUp(modelStatus) ? (
+                        <span className="opacity-50">Модель перевода: готова</span>
+                      ) : modelStatus === "dead" ? (
+                        <button
+                          className="w-full text-left text-neutral-500 hover:opacity-70 dark:text-neutral-400"
+                          onClick={() => restartModel().then((s) => setModelStatus(s))}
+                        >
+                          Модель не отвечает · Перезапустить
+                        </button>
+                      ) : (
+                        <button
+                          className="w-full text-left text-neutral-500 hover:opacity-70 dark:text-neutral-400"
+                          onClick={() => {
+                            setMenuOpen(false);
+                            setSetupOpen(true);
+                          }}
+                        >
+                          Модель не установлена · Скачать (4,6 ГБ)
+                        </button>
+                      )}
                     </div>
                   )}
+                  {/* «О pdfer» (WP-F): версия, приватность, лицензии */}
+                  <div className="mt-1 border-t border-neutral-200 dark:border-neutral-700 px-2.5 pt-1.5 pb-1 text-xs">
+                    <button
+                      className="w-full text-left text-neutral-500 hover:opacity-70 dark:text-neutral-400"
+                      onClick={() => {
+                        setMenuOpen(false);
+                        setAboutOpen(true);
+                      }}
+                    >
+                      О pdfer
+                    </button>
+                  </div>
                 </div>
               )}
             </span>
@@ -1231,6 +1697,22 @@ export default function App() {
           {dark ? "☀" : "☾"}
         </button>
       </div>
+
+      {/* Ctrl+F — sibling pill under the toolbar, same centering shift */}
+      {doc && findOpen && (
+        <FindBar
+          doc={doc}
+          viewMode={viewMode}
+          trVersion={trVersion}
+          getTrPage={getTrPage}
+          getTrFigs={getTrFigs}
+          curPage={curPage}
+          focusNonce={findNonce}
+          seed={findSeed}
+          leftShift={askOpen ? ASK_W / 2 : 0}
+          onClose={() => setFindOpen(false)}
+        />
+      )}
 
       {/* flex row: reading area shrinks when the «Спросить» sidebar is open — never an overlay */}
       <div className="flex h-full">
@@ -1252,13 +1734,14 @@ export default function App() {
                   getTrPage={getTrPage}
                   getTrFigs={getTrFigs}
                   getBodyFh={getBodyFh}
+                  linkService={linkService}
                 />
               ))}
             </div>
           </div>
         ) : (
           <div className="flex-1 min-w-0 h-full">
-            <Library onOpen={(p) => loadFile(p).catch((e) => console.error("open failed", e))} />
+            <Library onOpen={(p) => loadFile(p).catch((e) => console.error("open failed", e))} onAbout={() => setAboutOpen(true)} />
           </div>
         )}
         {/* mounted (hidden) while a book is open so an in-flight ask streams on across toggles */}
@@ -1293,6 +1776,10 @@ export default function App() {
           label={pop.label}
           noTranslate={pop.noTranslate}
           onClose={() => setPop(null)}
+          onSetup={() => {
+            setPop(null);
+            setSetupOpen(true);
+          }}
         />
       )}
       {glossOpen && path && (
@@ -1300,8 +1787,39 @@ export default function App() {
           bookPath={path}
           doc={doc}
           onClose={() => setGlossOpen(false)}
+          onSetup={() => {
+            setGlossOpen(false);
+            setSetupOpen(true);
+          }}
           onRetranslate={trInfo !== null ? retranslate : undefined}
         />
+      )}
+      {setupOpen && <ModelSetupModal onClose={() => setSetupOpen(false)} />}
+      {aboutOpen && <AboutModal onClose={() => setAboutOpen(false)} />}
+      {paletteOpen && (
+        <Palette
+          commands={paletteCommands}
+          numPages={doc?.numPages}
+          currentPath={path}
+          onOpenBook={(p) => loadFile(p).catch((e) => console.error("open failed", e))}
+          onGoToPage={goToPage}
+          onFind={
+            doc
+              ? (q) => {
+                  setFindSeed({ q, n: ++findSeedRef.current });
+                  setFindOpen(true);
+                  setFindNonce((n) => n + 1);
+                }
+              : undefined
+          }
+          onClose={() => setPaletteOpen(false)}
+        />
+      )}
+      {shortcutsOpen && <ShortcutsOverlay onClose={() => setShortcutsOpen(false)} />}
+      {toastMsg && (
+        <div className="fixed bottom-6 left-1/2 -translate-x-1/2 z-30 rounded-full bg-white/95 dark:bg-neutral-800/95 backdrop-blur px-4 py-2 shadow-xl text-sm text-neutral-700 dark:text-neutral-200 select-none pointer-events-none whitespace-nowrap">
+          {toastMsg}
+        </div>
       )}
     </div>
   );

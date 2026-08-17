@@ -5,12 +5,32 @@
 //   contextual:     "{context}\n参考上面的信息，把下面的文本翻译成{lang}，注意不需要翻译上文，也不要额外解释：\n{text}"
 // The chat template lives in the GGUF, so plain messages:[{role:"user",...}] is correct transport.
 
-const BASE = "http://127.0.0.1:11544";
+// Dev/test hook: lets a plain-browser engine run point at a controlled port
+// (e.g. a dead one, to exercise the outage path) without touching the real
+// server. Read once at module load; dead code in production builds.
+const DEV_BASE = import.meta.env.DEV ? localStorage.getItem("pdfer:dev:llamabase") : null;
+const BASE = DEV_BASE || "http://127.0.0.1:11544";
 const AUX_BASE = "http://127.0.0.1:11545"; // aux terminologist (Qwen3.5-4B), on-demand
 const TARGET_EN = "Russian"; // English-worded template
 const TARGET_ZH = "俄语"; // Chinese-worded templates (terminology/contextual are documented only in Chinese)
 
 export type GlossaryEntry = { src: string; dst: string };
+
+// A server that cannot be reached is NOT a model answer. Connection-level
+// fetch failures and gateway-ish statuses (502/504, and 503 — llama-server's
+// "model still loading") become ModelUnavailableError so callers can wait out
+// the outage and retry instead of accepting "" as a translation. Genuine HTTP
+// errors (4xx, 500 — malformed request, prompt too long) stay plain Errors:
+// retrying those forever would wedge a run on one paragraph.
+export class ModelUnavailableError extends Error {
+  constructor(detail: string) {
+    super(`llama-server unavailable: ${detail}`);
+    this.name = "ModelUnavailableError";
+  }
+}
+
+const UNAVAILABLE_STATUS = new Set([502, 503, 504]);
+const isAbortErr = (e: unknown) => e instanceof DOMException && e.name === "AbortError";
 
 async function healthOk(base: string, timeoutMs: number): Promise<boolean> {
   try {
@@ -128,18 +148,34 @@ function releaseSlot(): void {
 }
 
 // single non-streaming completion for an already-built prompt, drawing from
-// the shared budget (glossarygen's retry framing needs this raw entry point)
+// the shared budget (glossarygen's retry framing needs this raw entry point).
+// Failure taxonomy: aborts pass through untouched; anything network-shaped
+// (fetch rejection, 502/503/504, connection dropped mid-body) becomes
+// ModelUnavailableError; other non-ok statuses stay plain Errors.
 export async function completeRaw(prompt: string, signal?: AbortSignal): Promise<string> {
   await acquireSlot(signal);
   try {
-    const resp = await fetch(`${BASE}/v1/chat/completions`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ messages: [{ role: "user", content: prompt }], ...SAMPLING }),
-      signal,
-    });
+    let resp: Response;
+    try {
+      resp = await fetch(`${BASE}/v1/chat/completions`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ messages: [{ role: "user", content: prompt }], ...SAMPLING }),
+        signal,
+      });
+    } catch (e) {
+      if (isAbortErr(e) || signal?.aborted) throw e;
+      throw new ModelUnavailableError(String(e)); // refused / reset / unreachable
+    }
+    if (UNAVAILABLE_STATUS.has(resp.status)) throw new ModelUnavailableError(`HTTP ${resp.status}`);
     if (!resp.ok) throw new Error(`llama-server HTTP ${resp.status}`);
-    const data = (await resp.json()) as { choices?: { message?: { content?: string } }[] };
+    let data: { choices?: { message?: { content?: string } }[] };
+    try {
+      data = (await resp.json()) as typeof data;
+    } catch (e) {
+      if (isAbortErr(e) || signal?.aborted) throw e;
+      throw new ModelUnavailableError(`response body lost: ${String(e)}`); // connection died mid-response
+    }
     return (data.choices?.[0]?.message?.content ?? "").trim();
   } finally {
     releaseSlot();

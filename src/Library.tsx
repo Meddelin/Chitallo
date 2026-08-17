@@ -3,6 +3,7 @@ import { open } from "@tauri-apps/plugin-dialog";
 import { mkdir, readDir, readFile, stat, watchImmediate, writeFile } from "@tauri-apps/plugin-fs";
 import { appDataDir } from "@tauri-apps/api/path";
 import * as pdfjs from "pdfjs-dist";
+import { ModelSetupCard } from "./ModelSetup";
 
 type Book = {
   path: string;
@@ -54,9 +55,11 @@ async function makeCover(path: string, coversDir: string, mtime: number): Promis
   }
 }
 
-export default function Library({ onOpen }: { onOpen: (path: string) => void }) {
+export default function Library({ onOpen, onAbout }: { onOpen: (path: string) => void; onAbout?: () => void }) {
   const [dir, setDir] = useState<string | null>(() => localStorage.getItem("pdfer:libdir"));
   const [books, setBooks] = useState<Book[] | null>(null);
+  // one-time gesture hint (WP-E): lives above the grid until dismissed, never returns
+  const [hintDismissed, setHintDismissed] = useState(() => localStorage.getItem("pdfer:hint:strip") === "1");
   const urlsRef = useRef<string[]>([]);
   const coverUrlsRef = useRef<Map<string, string>>(new Map());
   const genRef = useRef(0);
@@ -185,6 +188,16 @@ export default function Library({ onOpen }: { onOpen: (path: string) => void }) 
           Выбрать папку с книгами
         </button>
         <span className="text-sm opacity-60">Сканируются папка и подпапки</span>
+        {/* тихий онбординг (Р-2): модель перевода предлагается прямо в пустом
+            состоянии — скачивание по явному действию, с лицензией на виду */}
+        <div className="mt-5">
+          <ModelSetupCard />
+        </div>
+        {onAbout && (
+          <button className="mt-2 text-xs opacity-40 hover:opacity-70 transition-opacity" onClick={onAbout}>
+            О pdfer
+          </button>
+        )}
       </div>
     );
   }
@@ -194,10 +207,35 @@ export default function Library({ onOpen }: { onOpen: (path: string) => void }) 
       <div className="max-w-6xl mx-auto px-6 pt-16 pb-10">
         <div className="flex items-baseline justify-between mb-6 text-neutral-800 dark:text-neutral-200">
           <h1 className="text-xl font-medium">Библиотека</h1>
-          <button className="text-sm opacity-50 hover:opacity-100 transition-opacity" onClick={pickDir} title={dir}>
-            Сменить папку
-          </button>
+          <span className="flex items-baseline gap-4">
+            {onAbout && (
+              <button className="text-sm opacity-50 hover:opacity-100 transition-opacity" onClick={onAbout}>
+                О pdfer
+              </button>
+            )}
+            <button className="text-sm opacity-50 hover:opacity-100 transition-opacity" onClick={pickDir} title={dir}>
+              Сменить папку
+            </button>
+          </span>
         </div>
+        {!hintDismissed && books !== null && books.length > 0 && (
+          <div className="mb-6 flex items-center gap-3 rounded-xl bg-white dark:bg-neutral-800 shadow-sm px-4 py-2.5 text-sm text-neutral-500 dark:text-neutral-400 select-none">
+            <span className="flex-1">
+              Выделите текст — <span className="text-neutral-700 dark:text-neutral-200">Перевести</span> · Alt+клик —
+              абзац · <span className="text-neutral-700 dark:text-neutral-200">T</span> — перевод/оригинал
+            </span>
+            <button
+              className="opacity-50 hover:opacity-100 px-0.5"
+              onClick={() => {
+                localStorage.setItem("pdfer:hint:strip", "1");
+                setHintDismissed(true);
+              }}
+              title="Скрыть подсказку"
+            >
+              ×
+            </button>
+          </div>
+        )}
         {books === null ? (
           <div className="opacity-50 text-neutral-800 dark:text-neutral-200">Сканирую…</div>
         ) : books.length === 0 ? (

@@ -76,6 +76,70 @@
   top: 0;
 }
 
+/* Ctrl+F matches (CSS Custom Highlight API): amber — the app's existing
+   accent family; the current match saturated (both highlights stack on it).
+   Backgrounds paint behind the text layer's transparent glyphs exactly like
+   ::selection; the dark-mode canvas invert never touches them, hence the
+   slightly stronger dark alphas. */
+::highlight(pdfer-find) {
+  background-color: rgb(245 158 11 / 0.28);
+}
+::highlight(pdfer-find-cur) {
+  background-color: rgb(245 158 11 / 0.55);
+}
+.dark ::highlight(pdfer-find) {
+  background-color: rgb(245 158 11 / 0.35);
+}
+.dark ::highlight(pdfer-find-cur) {
+  background-color: rgb(245 158 11 / 0.6);
+}
+
+/* pdf.js v6 annotation layer, LINKS ONLY — same minimal-official-rules
+   approach as .textLayer above (mirrors pdf_viewer.css .annotationLayer link
+   rules; forms/popups are never rendered, so their rules are omitted).
+   Deviations from official: z-index 3 (must stack above our z-index-2 text
+   layer or links are unclickable), the scale custom properties re-declared
+   here (official defines them on .page), and the hover tint uses the app's
+   amber accent instead of official yellow. The dark-mode invert is a canvas
+   filter and never touches this layer. */
+.annotationLayer {
+  position: absolute;
+  top: 0;
+  left: 0;
+  pointer-events: none;
+  transform-origin: 0 0;
+  z-index: 3;
+  --total-scale-factor: calc(var(--scale-factor) * var(--user-unit, 1));
+  --scale-round-x: 1px;
+  --scale-round-y: 1px;
+}
+.annotationLayer section {
+  position: absolute;
+  text-align: initial;
+  pointer-events: auto;
+  box-sizing: border-box;
+  transform-origin: 0 0;
+  user-select: none;
+}
+/* official: while a text-selection drag is in progress, links stop stealing it */
+.textLayer.selecting ~ .annotationLayer section {
+  pointer-events: none;
+}
+.annotationLayer .linkAnnotation > a {
+  position: absolute;
+  font-size: 1em;
+  top: 0;
+  left: 0;
+  width: 100%;
+  height: 100%;
+}
+.annotationLayer .linkAnnotation > a:hover {
+  background-color: rgb(245 158 11 / 0.18);
+}
+.annotationLayer .hasBorder {
+  background-size: 100% 100%;
+}
+
 .page {
   /* spacing comes from the pages grid's gap */
   position: relative;

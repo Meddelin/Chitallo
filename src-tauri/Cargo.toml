@@ -24,4 +24,12 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tauri-plugin-dialog = "2.7.2"
 tauri-plugin-fs = { version = "2.5.1", features = ["watch"] }
+# model weights download: blocking HTTP with manual redirects (Range must reach the CDN)
+ureq = "2"
+# integrity check of downloaded weights against the HF-published sha256
+sha2 = "0.10"
+
+[target.'cfg(windows)'.dependencies]
+# free-disk-space check before a multi-GB download
+windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_Storage_FileSystem"] }
 
