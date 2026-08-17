@@ -10,8 +10,8 @@ import workerUrl from "pdfjs-dist/build/pdf.worker.min.mjs?url";
 import Library from "./Library";
 import { GlossaryModal, SelectionBar, TranslatePopover } from "./TranslatePopover";
 import type { Anchor } from "./TranslatePopover";
-import { buildFrags, growParagraph, medianLineH, paraText } from "./paragraphs";
-import type { Word } from "./paragraphs";
+import { FIG_CONTAIN, buildFrags, growParagraph, interArea, medianLineH, paraText } from "./paragraphs";
+import type { FigureRegion, Word } from "./paragraphs";
 import * as booktranslate from "./booktranslate";
 import type { TrParagraph } from "./booktranslate";
 import * as glossarygen from "./glossarygen";
@@ -124,24 +124,85 @@ const LIST_RE = /^\s*(?:\(\d{1,3}\)|\d{1,3}[.)]|\(?[a-zа-яё]\)|[•◦▪‣�
 const CROP_PAD = 3; // scale-1 px of original context kept around a cropped region
 const PAGE_PAD_X = 0.085; // trPage horizontal padding as a fraction of page width — mirrors App.css
 
-type Crop = { canvas: HTMLCanvasElement; x: number; y: number; w: number; h: number }; // scale-1 rect
+// fig: candidate figure region (geometric detection) — subject to the
+// blank-margin pixel check in drawCrops; para crops are always drawn
+type Crop = { canvas: HTMLCanvasElement; x: number; y: number; w: number; h: number; fig?: boolean }; // scale-1 rect
 
 // Clean re-typeset page replacing the original render in translation mode.
 // Prose paragraphs flow as <p> at ONE uniform body size for the whole book
 // (15.5px × scale, via --scale-factor in App.css); headings are recognised by
 // the stored glyph height relative to the book's body median (fh/bodyFh ≥ 1.25,
 // size capped at 1.8×), list items get a hanging indent. kind:"other" regions
-// (display math / figures / tables) and failed paragraphs (tr:"") are never
-// dropped: they become placeholder canvases, later filled by drawCrops with
-// image crops of the original page render. data-tridx on every block links back
-// to the store paragraph (Alt+click «Оригинал», sentence context).
-function buildTrPage(paras: TrParagraph[], bodyFh: number, scale: number, baseW: number, baseH: number) {
+// (display math / tables) and failed paragraphs (tr:"") are never dropped:
+// they become placeholder canvases, later filled by drawCrops with image crops
+// of the original page render. data-tridx on every block links back to the
+// store paragraph (Alt+click «Оригинал», sentence context).
+// `figures` (candidate figure regions, caption bboxes already merged in by the
+// engine) interleave with the text strictly by reading order (y, then x): each
+// region becomes a crop canvas like the others, but flagged fig:true so
+// drawCrops can discard blank-margin candidates by pixel inspection.
+// kind:"caption" paras are skipped entirely — never flowed as text, never
+// cropped on their own: their pixels live inside the merged figure region.
+function buildTrPage(
+  paras: TrParagraph[],
+  figures: readonly FigureRegion[],
+  bodyFh: number,
+  scale: number,
+  baseW: number,
+  baseH: number,
+) {
   const root = document.createElement("div");
   root.className = "trPage";
   root.lang = "ru"; // enables hyphens:auto for the justified Russian text
   const crops: Crop[] = [];
   const maxW = baseW * scale * (1 - 2 * PAGE_PAD_X); // text column width — crop display cap
+
+  const addCrop = (x0: number, y0: number, w0: number, h0: number, tridx: number | null, fig: boolean) => {
+    const x = Math.max(0, x0);
+    const y = Math.max(0, y0);
+    const w = Math.min(baseW, x0 + w0) - x;
+    const h = Math.min(baseH, y0 + h0) - y;
+    if (w <= 0 || h <= 0) return;
+    const c = document.createElement("canvas");
+    c.className = "trCrop";
+    c.width = 0; // transparent until drawCrops fills it
+    c.height = 0;
+    // natural display size at the current zoom, fixed up front so the flow
+    // never jumps when the async original render lands
+    let cssW = w * scale;
+    let cssH = h * scale;
+    if (cssW > maxW) {
+      cssH *= maxW / cssW;
+      cssW = maxW;
+    }
+    c.style.width = `${cssW}px`;
+    c.style.height = `${cssH}px`;
+    if (tridx !== null) c.dataset.tridx = String(tridx);
+    c.dataset.crop = `${Math.round(x)},${Math.round(y)},${Math.round(w)},${Math.round(h)}`; // dev/test introspection
+    root.append(c);
+    crops.push({ canvas: c, x, y, w, h, fig });
+  };
+
+  // figure regions in reading order; a monotonic cursor interleaves them into
+  // the paragraph flow (paras arrive band-ordered from clusterParagraphs)
+  const figs = figures.slice().sort((a, b) => a.y - b.y || a.x - b.x);
+  let fi = 0;
+  const flushFigsAbove = (y: number, x: number) => {
+    for (; fi < figs.length && (figs[fi].y < y || (figs[fi].y === y && figs[fi].x <= x)); fi++)
+      addCrop(figs[fi].x, figs[fi].y, figs[fi].w, figs[fi].h, null, true);
+  };
+
   paras.forEach((p, i) => {
+    if (p.kind === "caption") return; // shown inside its figure region's crop
+    // Containment dedup for EVERY kind, prose included: a paragraph mostly
+    // inside a figure region (diagram label, table cell, raster-overlapped
+    // band) already shows its pixels in the region's crop — flowing it as a
+    // translated <p> or as its own crop would duplicate content. Safe: region
+    // crops containing glyphs are never blank-dropped. Skipping before
+    // flushFigsAbove keeps ordering right — the enclosing region is emitted
+    // when the first paragraph BELOW it arrives (or at the end).
+    if (figures.some((r) => interArea(p, r) >= FIG_CONTAIN * p.w * p.h)) return;
+    flushFigsAbove(p.y, p.x);
     if (p.kind === "prose" && p.tr) {
       const d = document.createElement("p");
       const ratio = bodyFh > 0 && p.fh > 0 ? p.fh / bodyFh : 1;
@@ -155,43 +216,76 @@ function buildTrPage(paras: TrParagraph[], bodyFh: number, scale: number, baseW:
       d.dataset.tridx = String(i);
       root.append(d);
     } else {
-      const x = Math.max(0, p.x - CROP_PAD);
-      const y = Math.max(0, p.y - CROP_PAD);
-      const w = Math.min(baseW, p.x + p.w + CROP_PAD) - x;
-      const h = Math.min(baseH, p.y + p.h + CROP_PAD) - y;
-      if (w <= 0 || h <= 0) return;
-      const c = document.createElement("canvas");
-      c.className = "trCrop";
-      c.width = 0; // transparent until drawCrops fills it
-      c.height = 0;
-      // natural display size at the current zoom, fixed up front so the flow
-      // never jumps when the async original render lands
-      let cssW = w * scale;
-      let cssH = h * scale;
-      if (cssW > maxW) {
-        cssH *= maxW / cssW;
-        cssW = maxW;
-      }
-      c.style.width = `${cssW}px`;
-      c.style.height = `${cssH}px`;
-      c.dataset.tridx = String(i);
-      root.append(c);
-      crops.push({ canvas: c, x, y, w, h });
+      addCrop(p.x - CROP_PAD, p.y - CROP_PAD, p.w + 2 * CROP_PAD, p.h + 2 * CROP_PAD, i, false);
     }
   });
+  flushFigsAbove(Infinity, Infinity);
   return { root, crops };
 }
 
+// Blank-candidate detection: geometric figure candidates are often just tall
+// whitespace (TOC leading, chapter-opener margins). The offscreen page render
+// already exists for cropping, so sample the candidate's area downsampled to
+// ≤32×32 (canvas drawImage area-averages) and measure the luminance spread.
+// Blank = variance < BLANK_VAR AND min-max range < BLANK_RANGE. Tuning math
+// (255-luminance scale, 32×32 = 1024 samples): a pure margin is a constant
+// fill → variance ~0, range 0. One hairline dark rule across the region
+// averages to ≈1 row at ~214 → variance ≈ 48; a single small dark mark ≈ 1
+// sample at 100 → variance ≈ 22, range ≈ 155; a light-gray diagram (strokes
+// ≈ 240 post-averaging, 5% cover) → variance ≈ 10, range ≈ 15+... all pass.
+// False-positive side: only marks fainter than ~8 luminance levels off the
+// background (invisible in practice) or covering <0.1% of the region can be
+// skipped. The check runs on the ORIGINAL render — the dark-mode invert is a
+// CSS filter and never reaches these pixels.
+const BLANK_VAR = 4;
+const BLANK_RANGE = 24;
+const SAMPLE = 32;
+
 // copy each crop's region out of the full-page offscreen render (scale × dpr);
-// the offscreen canvas is discarded by the caller right after
+// the offscreen canvas is discarded by the caller right after. fig-flagged
+// crops (candidate figure regions) that sample as blank are REMOVED from the
+// flow instead of drawn.
 function drawCrops(off: HTMLCanvasElement, crops: Crop[], scale: number, dpr: number) {
   const k = scale * dpr;
+  let probe: CanvasRenderingContext2D | null = null;
   for (const cr of crops) {
     const sx = Math.min(off.width, Math.round(cr.x * k));
     const sy = Math.min(off.height, Math.round(cr.y * k));
     const sw = Math.min(off.width - sx, Math.round(cr.w * k));
     const sh = Math.min(off.height - sy, Math.round(cr.h * k));
-    if (sw <= 0 || sh <= 0) continue;
+    if (sw <= 0 || sh <= 0) {
+      if (cr.fig) cr.canvas.remove();
+      continue;
+    }
+    if (cr.fig) {
+      if (!probe) {
+        const c = document.createElement("canvas");
+        c.width = SAMPLE;
+        c.height = SAMPLE;
+        probe = c.getContext("2d", { willReadFrequently: true })!;
+      }
+      const pw = Math.min(SAMPLE, sw);
+      const ph = Math.min(SAMPLE, sh);
+      probe.drawImage(off, sx, sy, sw, sh, 0, 0, pw, ph);
+      const d = probe.getImageData(0, 0, pw, ph).data;
+      let s = 0;
+      let s2 = 0;
+      let lo = 255;
+      let hi = 0;
+      const n = pw * ph;
+      for (let i = 0; i < d.length; i += 4) {
+        const y = 0.2126 * d[i] + 0.7152 * d[i + 1] + 0.0722 * d[i + 2];
+        s += y;
+        s2 += y * y;
+        if (y < lo) lo = y;
+        if (y > hi) hi = y;
+      }
+      const mean = s / n;
+      if (s2 / n - mean * mean < BLANK_VAR && hi - lo < BLANK_RANGE) {
+        cr.canvas.remove(); // blank margin, not a figure
+        continue;
+      }
+    }
     cr.canvas.width = sw;
     cr.canvas.height = sh;
     cr.canvas.getContext("2d")!.drawImage(off, sx, sy, sw, sh, 0, 0, sw, sh);
@@ -206,6 +300,7 @@ function Page({
   viewMode,
   trVersion,
   getTrPage,
+  getTrFigs,
   getBodyFh,
 }: {
   doc: PDFDocumentProxy;
@@ -215,6 +310,7 @@ function Page({
   viewMode: ViewMode;
   trVersion: number;
   getTrPage: (n: number) => TrParagraph[] | undefined;
+  getTrFigs: (n: number) => FigureRegion[];
   getBodyFh: () => number;
 }) {
   const ref = useRef<HTMLDivElement>(null);
@@ -273,7 +369,7 @@ function Page({
             // reflowed translated page: NO canvas and NO text layer — the
             // original is rasterized only offscreen (once, if any non-prose
             // region needs an image crop) and discarded after cropping
-            const { root, crops } = buildTrPage(paras, getBodyFh(), scale, vp1.width, vp1.height);
+            const { root, crops } = buildTrPage(paras, getTrFigs(num), getBodyFh(), scale, vp1.width, vp1.height);
             el.appendChild(root);
             if (crops.length) {
               const off = document.createElement("canvas");
@@ -329,7 +425,7 @@ function Page({
       // NOTE: `rendered` (the page's true base size) is deliberately NOT reset —
       // see the placeholder comment above.
     };
-  }, [doc, num, scale, viewMode, trDep, getTrPage, getBodyFh]);
+  }, [doc, num, scale, viewMode, trDep, getTrPage, getTrFigs, getBodyFh]);
 
   return (
     <div
@@ -468,6 +564,7 @@ export default function App() {
 
   // stable store getters for Page renders (read the ref, never re-created)
   const getTrPage = useCallback((n: number) => trStoreRef.current?.pages[n], []);
+  const getTrFigs = useCallback((n: number) => trStoreRef.current?.figures[n] ?? [], []);
   const getBodyFh = useCallback(() => trStoreRef.current?.bodyFh ?? 0, []);
 
   // «Перевод» menu: click outside closes (capture, same pattern as the
@@ -1020,6 +1117,7 @@ export default function App() {
                 viewMode={viewMode}
                 trVersion={trVersion}
                 getTrPage={getTrPage}
+                getTrFigs={getTrFigs}
                 getBodyFh={getBodyFh}
               />
             ))}

@@ -12,8 +12,11 @@ export type Word = { rect: Rect; text: string; key?: unknown };
 export type Frag = { words: Word[]; top: number; bottom: number; left: number; right: number };
 // prose = translatable text (body, headings, list items, real-sentence captions);
 // other = display formulas / figure innards / tables / garbled glyph runs —
-// the v2 typesetter shows an image crop of the region instead of a translation
-export type ParaKind = "prose" | "other";
+// the v2 typesetter shows an image crop of the region instead of a translation;
+// caption = "Figure N:"-style paragraph adjacent to a detected figure region —
+// never translated, never flowed as text: its bbox is merged into the region,
+// so the region's image crop shows figure + caption exactly as the original
+export type ParaKind = "prose" | "other" | "caption";
 // fh: median glyph (font) height of the paragraph's items, in the units of the
 // viewport passed to clusterParagraphs (the book engine passes scale 1)
 export type Paragraph = { x: number; y: number; w: number; h: number; text: string; fh: number; kind: ParaKind };
@@ -230,8 +233,9 @@ export function classifyMetrics(m: ParaMetrics): ParaKind {
   return "prose";
 }
 
-// 2x3 affine matrix product (pdfjs Util.transform, inlined to keep this module pure)
-const mul = (m: readonly number[], n: readonly number[]): number[] => [
+// 2x3 affine matrix product (pdfjs Util.transform, inlined to keep this module
+// pure; exported for booktranslate's operator-list CTM walk)
+export const mul = (m: readonly number[], n: readonly number[]): number[] => [
   m[0] * n[0] + m[2] * n[1],
   m[1] * n[0] + m[3] * n[1],
   m[0] * n[2] + m[2] * n[3],
@@ -293,4 +297,354 @@ export function clusterParagraphs(items: readonly unknown[], viewport: { transfo
     });
   }
   return out;
+}
+
+// ---- v2 figure regions ------------------------------------------------------
+// Figures/diagrams often contain no text items, so they are invisible to
+// clusterParagraphs and would be dropped by the reflow. Detection is GEOMETRIC:
+// tall vertical whitespace gaps between paragraph bands (per text column), plus
+// raster-image bboxes the caller reads off page.getOperatorList(). Candidates
+// may be blank margins — the RENDERER discards blanks by pixel inspection of
+// the offscreen page render it already makes for crops; the engine never
+// renders and stores every candidate.
+
+export type FigureRegion = { x: number; y: number; w: number; h: number };
+
+// rect intersection area (scale-1) — shared by the reflow (App.tsx) and the
+// engine (booktranslate.ts) for the figure-containment dedup below
+export const interArea = (
+  a: { x: number; y: number; w: number; h: number },
+  b: { x: number; y: number; w: number; h: number },
+): number =>
+  Math.max(0, Math.min(a.x + a.w, b.x + b.w) - Math.max(a.x, b.x)) *
+  Math.max(0, Math.min(a.y + a.h, b.y + b.h) - Math.max(a.y, b.y));
+
+// a paragraph with ≥ this share of its area inside a figure region is excluded
+// from the text flow AND from translation: its pixels already live in the
+// region's image crop (a crop containing glyphs is never blank-dropped), so
+// flowing/translating it would duplicate content as stray label lines
+export const FIG_CONTAIN = 0.6;
+
+// caption openers: "Figure 3:", "Fig. 2.1", "Table 4 —", "Algorithm 1", …
+export const CAPTION_RE = /^(?:figure|fig\.|table|chart|diagram|listing|algorithm|scheme)\s*\d/i;
+
+// "Table 1.1 provides a high-level overview…" is a SENTENCE about the table,
+// not its caption (seen on the test book, adjacent to the real table): real
+// captions follow the number with punctuation or a capitalized phrase, while a
+// sentence continues with a lowercase verb. Bias toward rejecting — a missed
+// caption merely stays prose (translated), a swallowed sentence would vanish
+// untranslated into the figure crop.
+export function isCaptionText(t: string): boolean {
+  const m = CAPTION_RE.exec(t);
+  if (!m) return false;
+  const rest = t.slice(m.index + m[0].length).replace(/^[\d.]*/, ""); // swallow the rest of "…1.1"
+  return /^\s*[:.—–-]/.test(rest) || !/^\s*[a-zа-яё]/.test(rest);
+}
+
+// Candidate gap threshold, × median PROSE GLYPH height (the module's lineH
+// unit is glyph height, not leading — real leading ≈ 1.2×fh, so 2.8×fh ≈
+// 2.3× leading). Tuned on the test book: running-header and pre-heading gaps
+// reach 2.5–2.7×fh and must NOT become candidates; real figure gaps are ≫.
+const GAP_K = 2.8;
+const MIN_GAP_PX = 18; // absolute floor — no hair-thin regions on sparse pages with a degenerate lineH
+const EDGE_INSET = 0.3; // region inset from adjacent text rows (descender safety), × lineH
+const CAPTION_ADJ = 2; // caption-to-region max vertical distance, × lineH
+// minimum figure-material height (caption-to-body-paragraph span) for an
+// envelope claim, × lineH — a caption amid normally-leaded prose has ≈1×
+// on both sides and never claims; a real figure/table body is far taller
+const ENV_MIN = 2;
+const MIN_IMG = 24; // raster boxes under this (scale-1 px) are bullets/rules/logos
+
+type Band = { top: number; bottom: number };
+
+function mergeBands(bands: Band[]): Band[] {
+  bands.sort((a, b) => a.top - b.top);
+  const out: Band[] = [];
+  for (const b of bands) {
+    const last = out[out.length - 1];
+    if (last && b.top <= last.bottom) last.bottom = Math.max(last.bottom, b.bottom);
+    else out.push({ ...b });
+  }
+  return out;
+}
+
+const xOverlap = (a: { x: number; w: number }, b: { x: number; w: number }) =>
+  Math.min(a.x + a.w, b.x + b.w) - Math.max(a.x, b.x);
+
+// vertical distance between two rects' y-intervals (negative = they overlap)
+const yDist = (a: FigureRegion, b: FigureRegion) => Math.max(a.y - (b.y + b.h), b.y - (a.y + a.h));
+
+// union overlapping / near-touching candidates until stable (n is tiny)
+function mergeRegions(rs: FigureRegion[], slack: number): FigureRegion[] {
+  for (let changed = true; changed; ) {
+    changed = false;
+    outer: for (let i = 0; i < rs.length; i++)
+      for (let j = i + 1; j < rs.length; j++) {
+        if (xOverlap(rs[i], rs[j]) <= 0 || yDist(rs[i], rs[j]) >= slack) continue;
+        const a = rs[i];
+        const b = rs[j];
+        const x = Math.min(a.x, b.x);
+        const y = Math.min(a.y, b.y);
+        rs[i] = { x, y, w: Math.max(a.x + a.w, b.x + b.w) - x, h: Math.max(a.y + a.h, b.y + b.h) - y };
+        rs.splice(j, 1);
+        changed = true;
+        break outer;
+      }
+  }
+  return rs;
+}
+
+// Detect candidate figure regions on one page and reclassify captions.
+// `paras` comes straight from clusterParagraphs (same scale-1 units as
+// pageW/pageH). A prose paragraph opening like "Figure N" that sits within
+// ~2 line heights of a candidate region becomes kind:"caption" (MUTATED in
+// place) and its bbox is merged into that region; a caption-like paragraph
+// with no adjacent region keeps prose behavior (safety). Column-aware: on
+// multi-column pages gaps are measured per column and a region spans only its
+// column; column top/bottom edge gaps are measured against the page content
+// bounds, so a column starting late (figure at its top) still yields a region.
+export function detectFigures(
+  paras: Paragraph[],
+  pageW: number,
+  pageH: number,
+  imageBoxes: readonly FigureRegion[] = [],
+): FigureRegion[] {
+  // median glyph height of prose ≈ the module's line-height unit (medianLineH)
+  const pool = (paras.some((p) => p.kind === "prose" && p.fh > 0) ? paras.filter((p) => p.kind === "prose") : paras)
+    .map((p) => p.fh)
+    .filter((fh) => fh > 0)
+    .sort((a, b) => a - b);
+  const lineH = Math.max(6, pool[pool.length >> 1] || 12);
+
+  const cands: FigureRegion[] = [];
+  for (const b of imageBoxes) {
+    const x = Math.max(0, b.x);
+    const y = Math.max(0, b.y);
+    const w = Math.min(pageW, b.x + b.w) - x;
+    const h = Math.min(pageH, b.y + b.h) - y;
+    if (w < MIN_IMG || h < MIN_IMG) continue; // decorative marks
+    if (w * h > 0.9 * pageW * pageH) continue; // full-page background/scan
+    cands.push({ x, y, w, h });
+  }
+
+  // column geometry + content y-bounds, hoisted for the caption pass below
+  let cols: { l: number; r: number }[] = [];
+  let cT = 0;
+  let cB = 0;
+  if (paras.length) {
+    const cL = Math.min(...paras.map((p) => p.x));
+    const cR = Math.max(...paras.map((p) => p.x + p.w));
+    const contentW = cR - cL;
+
+    // Column formation: narrow paragraphs cluster by x-interval overlap (sorted
+    // sweep). Spanning (wide) and noise (page numbers, stray glyphs) paragraphs
+    // band into every column they overlap but do not define column geometry.
+    // Multi-column only when narrow paragraphs dominate the page AND every
+    // cluster carries a real share of the page's text height — a figure's
+    // internal text labels also x-cluster, but sum to little height, and must
+    // not fake a column split on a single-column page (seen on the test book).
+    const cT0 = Math.min(...paras.map((p) => p.y));
+    const cB0 = Math.max(...paras.map((p) => p.y + p.h));
+    const formers = paras.filter((p) => p.w <= 0.6 * contentW && p.text.length >= 8).sort((a, b) => a.x - b.x);
+    let clusters: { l: number; r: number; hsum: number }[] = [];
+    for (const p of formers) {
+      const last = clusters[clusters.length - 1];
+      if (last && p.x <= last.r) {
+        last.r = Math.max(last.r, p.x + p.w);
+        last.hsum += p.h;
+      } else clusters.push({ l: p.x, r: p.x + p.w, hsum: p.h });
+    }
+    clusters = clusters.filter((c) => c.r - c.l >= 0.12 * contentW); // margin-note slivers
+    cols =
+      clusters.length >= 2 &&
+      clusters.length <= 3 &&
+      formers.length * 2 >= paras.length &&
+      clusters.every((c) => c.hsum >= 0.3 * (cB0 - cT0))
+        ? clusters
+        : [{ l: cL, r: cR }];
+
+    // page content y-bounds over paragraphs that band into some column (a
+    // gutter-stranded stray must not stretch every column's edge gaps)
+    const banded = paras.filter((p) => cols.some((c) => Math.min(p.x + p.w, c.r) - Math.max(p.x, c.l) > 0));
+    cT = Math.min(...(banded.length ? banded : paras).map((p) => p.y));
+    cB = Math.max(...(banded.length ? banded : paras).map((p) => p.y + p.h));
+
+    const thr = Math.max(GAP_K * lineH, MIN_GAP_PX);
+    for (const col of cols) {
+      const bands = mergeBands(
+        paras
+          .filter((p) => Math.min(p.x + p.w, col.r) - Math.max(p.x, col.l) > 0)
+          .map((p) => ({ top: p.y, bottom: p.y + p.h })),
+      );
+      const push = (gapTop: number, gapBottom: number) => {
+        if (gapBottom - gapTop < thr) return;
+        const y = gapTop + EDGE_INSET * lineH;
+        const h = gapBottom - EDGE_INSET * lineH - y;
+        if (h > 0 && col.r - col.l >= 3 * lineH) cands.push({ x: col.l, y, w: col.r - col.l, h });
+      };
+      let prev = cT;
+      for (const b of bands) {
+        push(prev, b.top);
+        prev = Math.max(prev, b.bottom);
+      }
+      push(prev, cB);
+    }
+  }
+
+  const regions = mergeRegions(cands, 0.5 * lineH);
+
+  // Caption pass — three claim mechanisms, any one suffices:
+  //  (a) nearest adjacent candidate region (raster boxes, tall clean gaps):
+  //      the caption bbox merges into it, as before;
+  //  (b) figure ENVELOPE: diagrams whose internal label bands chop the gap
+  //      into sub-threshold slivers produce no usable candidate, and a table
+  //      body is a cluster of narrow cell paragraphs with no gaps at all — so
+  //      the whole stretch of non-body material between the caption and the
+  //      nearest FULL-WIDTH body paragraph (above or below, whichever side
+  //      holds more) is claimed as one column-wide region: label bands, gap
+  //      slivers, table cells and the vector graphics between them all land
+  //      inside one crop, in original layout.
+  // A caption-claimed region is widened to its column bounds — a figure is
+  // never narrower than the column holding its caption (otherwise the crop
+  // clips boxes at the figure's right edge). Overlaps re-merge below.
+  // Paragraphs contained in the final regions are excluded from translation
+  // and reflow by the callers (FIG_CONTAIN) — their pixels are in the crop.
+  let claimed = false;
+  for (const p of paras) {
+    if (p.kind !== "prose" || !isCaptionText(p.text)) continue;
+    // column holding the caption = largest x-overlap (cols is non-empty here:
+    // paras.length ≥ 1 guaranteed by iterating paras)
+    let col = cols[0];
+    let bo = -Infinity;
+    for (const c of cols) {
+      const o = Math.min(p.x + p.w, c.r) - Math.max(p.x, c.l);
+      if (o > bo) {
+        bo = o;
+        col = c;
+      }
+    }
+    const colW = col.r - col.l;
+
+    // (a) nearest adjacent candidate region
+    let best: FigureRegion | null = null;
+    let bd = CAPTION_ADJ * lineH;
+    for (const r of regions) {
+      if (xOverlap(p, r) <= 0) continue;
+      const d = yDist(r, p);
+      if (d < bd) {
+        bd = d;
+        best = r;
+      }
+    }
+
+    // (b) envelope: nearest full-width paragraph above/below the caption in
+    // its column bounds the figure material ("full-width" = ≥60% of the
+    // column; figure labels and table cells are narrower — kind is
+    // irrelevant, a wide display formula bounds the envelope too; other
+    // caption-like paras never bound, so stacked figures form one envelope)
+    let aTop = cT - EDGE_INSET * lineH;
+    let bBot = cB + EDGE_INSET * lineH;
+    for (const q of paras) {
+      if (q === p || isCaptionText(q.text)) continue;
+      if (Math.min(q.x + q.w, col.r) - Math.max(q.x, col.l) <= 0 || q.w < 0.6 * colW) continue;
+      if (q.y + q.h <= p.y && q.y + q.h > aTop) aTop = q.y + q.h;
+      if (q.y >= p.y + p.h && q.y < bBot) bBot = q.y;
+    }
+    const spanAbove = p.y - aTop;
+    const spanBelow = bBot - (p.y + p.h);
+    let env: FigureRegion | null = null;
+    if (Math.max(spanAbove, spanBelow) >= ENV_MIN * lineH) {
+      const y0 = spanAbove >= spanBelow ? Math.min(p.y, aTop + EDGE_INSET * lineH) : p.y;
+      const y1 = spanAbove >= spanBelow ? p.y + p.h : Math.max(p.y + p.h, bBot - EDGE_INSET * lineH);
+      env = { x: col.l, y: y0, w: colW, h: y1 - y0 };
+    }
+
+    // (c) table-body swallow: a Table/Listing/Algorithm body is a cluster of
+    // narrow cell/code paragraphs at ordinary leading — no tall gaps for (a),
+    // and its cell columns can fake text columns that derail (b)'s column
+    // scoping (Table 7.1: caption over the left cell column, cells spanning
+    // two clusters). Walk PAGE-WIDE from the caption in both directions,
+    // swallowing sub-body-width paragraphs while the gap stays small; a
+    // full-content-width paragraph (real prose) or a real gap stops the walk.
+    let tbl: FigureRegion | null = null;
+    if (/^(?:table|listing|algorithm)/i.test(p.text)) {
+      const cW = Math.max(...paras.map((q) => q.x + q.w)) - Math.min(...paras.map((q) => q.x));
+      let x0 = p.x;
+      let x1 = p.x + p.w;
+      let top = p.y;
+      let bot = p.y + p.h;
+      const walk = (down: boolean) => {
+        const cand = paras
+          .filter((q) => q !== p && (down ? q.y >= p.y + p.h : q.y + q.h <= p.y))
+          .sort((a, b) => (down ? a.y - b.y : b.y + b.h - (a.y + a.h)));
+        for (const q of cand) {
+          if ((down ? q.y - bot : top - (q.y + q.h)) >= CAPTION_ADJ * lineH) break; // real gap
+          if (q.w >= 0.6 * cW) break; // full-width prose bounds the table
+          x0 = Math.min(x0, q.x);
+          x1 = Math.max(x1, q.x + q.w);
+          if (down) bot = Math.max(bot, q.y + q.h);
+          else top = Math.min(top, q.y);
+        }
+      };
+      walk(true);
+      walk(false);
+      if (p.y - top + (bot - (p.y + p.h)) >= ENV_MIN * lineH)
+        tbl = { x: Math.min(x0, col.l), y: top, w: Math.max(x1, col.r) - Math.min(x0, col.l), h: bot - top };
+    }
+
+    // a successful table walk supersedes (a): merging the pre-caption gap
+    // candidate would drag the region's top edge up to the column edge inset,
+    // slicing through the running-header band above (partially-contained
+    // header = dropped from flow with its pixels clipped at the crop edge);
+    // an unclaimed blank gap candidate is simply blank-dropped at render
+    if (tbl) best = null;
+
+    if (!best && !env && !tbl) continue; // nothing figure-shaped adjacent → stays prose (safety)
+    p.kind = "caption";
+    claimed = true;
+    if (best) {
+      // caption bbox merge + widen to the column bounds
+      const x = Math.min(best.x, p.x, col.l);
+      const y = Math.min(best.y, p.y);
+      best.w = Math.max(best.x + best.w, p.x + p.w, col.r) - x;
+      best.h = Math.max(best.y + best.h, p.y + p.h) - y;
+      best.x = x;
+      best.y = y;
+    }
+    if (env) regions.push(env);
+    if (tbl) regions.push(tbl);
+  }
+  // post-caption re-merge on TRUE OVERLAP only (slack 0): envelopes/table
+  // walks legitimately coalesce the sliver candidates they cover, but a
+  // near-touching unclaimed candidate (the blank pre-caption gap 3px above a
+  // table region) must stay separate — it gets blank-dropped at render, while
+  // merging it would drag the region's edge through the running-header band
+  const out = claimed ? mergeRegions(regions, 0) : regions;
+
+  // Invariant: a paragraph the callers will EXCLUDE from flow/translation
+  // (≥ FIG_CONTAIN of its area inside a region) must sit COMPLETELY inside
+  // that region's crop — partial containment would render it as clipped glyph
+  // shards at the crop edge and no text elsewhere (seen: a running header
+  // sliced by a gap candidate that overlap-merged into a table region).
+  // Expand regions over such paragraphs' bboxes to fixpoint (expansion is the
+  // safe direction — it can only add pixels to the crop), then re-merge any
+  // overlaps the expansion created.
+  for (let changed = true; changed; ) {
+    changed = false;
+    for (const r of out)
+      for (const p of paras) {
+        const a = interArea(p, r);
+        if (a < FIG_CONTAIN * p.w * p.h || a >= p.w * p.h) continue;
+        const x = Math.min(r.x, p.x);
+        const y = Math.min(r.y, p.y);
+        r.w = Math.max(r.x + r.w, p.x + p.w) - x;
+        r.h = Math.max(r.y + r.h, p.y + p.h) - y;
+        r.x = x;
+        r.y = y;
+        changed = true;
+      }
+  }
+  const fin = mergeRegions(out, 0);
+  fin.sort((a, b) => a.y - b.y || a.x - b.x);
+  return fin;
 }

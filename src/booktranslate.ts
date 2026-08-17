@@ -8,22 +8,23 @@
 
 import { appDataDir } from "@tauri-apps/api/path";
 import { mkdir, readFile, remove, writeFile } from "@tauri-apps/plugin-fs";
-import type { PDFDocumentProxy } from "pdfjs-dist";
-import { clusterParagraphs, hash } from "./paragraphs";
-import type { Paragraph, ParaKind } from "./paragraphs";
+import { OPS } from "pdfjs-dist";
+import type { PDFDocumentProxy, PDFPageProxy } from "pdfjs-dist";
+import { FIG_CONTAIN, clusterParagraphs, detectFigures, hash, interArea, mul } from "./paragraphs";
+import type { FigureRegion, Paragraph, ParaKind } from "./paragraphs";
 import { loadGlossaryText, parseGlossary, translate } from "./translate";
 import type { GlossaryEntry } from "./translate";
 
-// dev-console handle: __pdferDev spreads this module, so classification can be
-// inspected in the browser (clusterParagraphs(content.items, viewport)) without UI plumbing
-export { clusterParagraphs } from "./paragraphs";
+// dev-console handle: __pdferDev spreads this module, so classification and
+// figure detection can be inspected in the browser without UI plumbing
+export { clusterParagraphs, detectFigures } from "./paragraphs";
 
 const MODEL = "HY-MT1.5-7B-Q4_K_M";
 const CONCURRENCY = 3; // worker count only — actual requests draw from the shared ≤3 budget in translate.ts
 const ETA_WINDOW = 5; // moving average over the last N text pages
 
 // v2: paragraphs carry fh (glyph height at scale 1) + kind; kind:"other"
-// (display math / figures / tables) is never translated — tr stays ""
+// (display math / tables) and kind:"caption" are never translated — tr stays ""
 export type TrParagraph = Paragraph & { tr: string };
 export type BookTranslation = {
   version: 2;
@@ -33,6 +34,10 @@ export type BookTranslation = {
   // re-translating with a new glossary = deleteBookTranslation + fresh start
   glossaryText: string;
   pages: Record<number, TrParagraph[]>;
+  // candidate figure regions per page, scale-1 coords, caption bboxes merged
+  // in, reading order. Candidates may be blank whitespace — the renderer drops
+  // blanks by pixel inspection of the offscreen render it makes for crops.
+  figures: Record<number, FigureRegion[]>;
   donePages: number[];
   total: number;
   // median fh across prose paragraphs of completed pages — the v2 typesetter's
@@ -40,12 +45,14 @@ export type BookTranslation = {
   bodyFh: number;
 };
 
-// on-disk shape across versions: v1 paragraphs lack fh/kind, v1 meta lacks bodyFh
+// on-disk shape across versions: v1 paragraphs lack fh/kind, v1 meta lacks
+// bodyFh; stores written before figure detection lack figures
 type StoredParagraph = Omit<TrParagraph, "fh" | "kind"> & { fh?: number; kind?: ParaKind };
-type StoredBookTranslation = Omit<BookTranslation, "version" | "pages" | "bodyFh"> & {
+type StoredBookTranslation = Omit<BookTranslation, "version" | "pages" | "bodyFh" | "figures"> & {
   version: number;
   pages: Record<number, StoredParagraph[]>;
   bodyFh?: number;
+  figures?: Record<number, FigureRegion[]>;
 };
 export type BookProgress = { page: number; total: number; donePages: number; etaMs?: number };
 
@@ -93,6 +100,8 @@ export async function loadBookTranslation(bookPath: string): Promise<BookTransla
       }
     }
     st.bodyFh ??= 0;
+    // pre-figure-detection stores simply lack regions until a re-translation
+    st.figures ??= {};
     st.version = 2;
     return st as BookTranslation;
   } catch {
@@ -120,6 +129,48 @@ export async function deleteBookTranslation(bookPath: string): Promise<void> {
 }
 
 // ---- pipeline --------------------------------------------------------------
+
+const MTX_ID = [1, 0, 0, 1, 0, 0];
+
+// Raster-image bounding boxes of a page in CSS px at scale 1: walk the
+// operator list with a CTM stack (save/restore/transform, inlined form
+// XObjects), then map each paint*Image* op's unit square through
+// viewport × CTM. Vector-drawn diagrams emit no image ops — the geometric gap
+// detector in detectFigures covers those. Exported into __pdferDev via the
+// module spread for console inspection.
+export async function pageImageBoxes(page: PDFPageProxy): Promise<FigureRegion[]> {
+  try {
+    const { fnArray, argsArray } = await page.getOperatorList();
+    const vt = page.getViewport({ scale: 1 }).transform as number[];
+    let ctm = MTX_ID;
+    const stack: number[][] = [];
+    const boxes: FigureRegion[] = [];
+    for (let i = 0; i < fnArray.length; i++) {
+      const fn = fnArray[i];
+      const args = argsArray[i] as unknown[] | null;
+      if (fn === OPS.save) stack.push(ctm);
+      else if (fn === OPS.restore) ctm = stack.pop() ?? MTX_ID;
+      else if (fn === OPS.transform) ctm = mul(ctm, args as number[]);
+      else if (fn === OPS.paintFormXObjectBegin) {
+        // begin = save + optional matrix (pdfjs inlines the form's ops next)
+        stack.push(ctm);
+        const m = args?.[0];
+        if (Array.isArray(m) && m.length === 6) ctm = mul(ctm, m as number[]);
+      } else if (fn === OPS.paintFormXObjectEnd) ctm = stack.pop() ?? MTX_ID;
+      else if (fn === OPS.paintImageXObject || fn === OPS.paintInlineImageXObject || fn === OPS.paintImageMaskXObject) {
+        const m = mul(vt, ctm); // device transform of the image's unit square
+        const xs = [m[4], m[0] + m[4], m[2] + m[4], m[0] + m[2] + m[4]];
+        const ys = [m[5], m[1] + m[5], m[3] + m[5], m[1] + m[3] + m[5]];
+        const x = Math.min(...xs);
+        const y = Math.min(...ys);
+        boxes.push({ x, y, w: Math.max(...xs) - x, h: Math.max(...ys) - y });
+      }
+    }
+    return boxes;
+  } catch {
+    return []; // op-list failure only loses raster candidates; gap detection stands
+  }
+}
 
 // uniform body-size reference: median fh over prose paragraphs of every
 // completed page (pages map only ever holds completed pages)
@@ -160,6 +211,7 @@ export async function startBookTranslation(
     model: MODEL,
     glossaryText: loadGlossaryText(bookPath),
     pages: {},
+    figures: {},
     donePages: [],
     total,
     bodyFh: 0,
@@ -176,13 +228,23 @@ export async function startBookTranslation(
 
     const page = await doc.getPage(n);
     const content = await page.getTextContent();
-    const paras = clusterParagraphs(content.items, page.getViewport({ scale: 1 }));
+    const vp1 = page.getViewport({ scale: 1 });
+    const paras = clusterParagraphs(content.items, vp1);
+    // candidate figure regions; reclassifies adjacent "Figure N:" prose
+    // paragraphs to kind:"caption" (mutates paras) and merges their bboxes
+    const figures = detectFigures(paras, vp1.width, vp1.height, await pageImageBoxes(page));
 
     const t0 = performance.now();
     const out: TrParagraph[] = paras.map((p) => ({ ...p, tr: "" }));
-    // kind:"other" (display math / figures / tables) is skipped — tr stays "",
-    // the v2 typesetter crops the original region instead of translating it
-    const todo = out.filter((p) => p.kind === "prose");
+    // kind:"other" (display math / tables) and kind:"caption" are skipped —
+    // tr stays "", the v2 typesetter shows original image crops instead.
+    // Prose mostly contained in a figure region is skipped too: its pixels
+    // are already in the region's crop and the typesetter excludes it from
+    // the flow (FIG_CONTAIN) — translating diagram labels only wastes wire
+    // requests and invites hallucinated sentence expansions
+    const todo = out.filter(
+      (p) => p.kind === "prose" && !figures.some((r) => interArea(p, r) >= FIG_CONTAIN * p.w * p.h),
+    );
     if (todo.length) {
       let i = 0;
       const worker = async () => {
@@ -202,6 +264,7 @@ export async function startBookTranslation(
     }
 
     store.pages[n] = out;
+    store.figures[n] = figures;
     done.add(n);
     store.donePages = [...done].sort((a, b) => a - b);
     store.bodyFh = medianBodyFh(store.pages);
