@@ -193,6 +193,14 @@
   background: #fff;
   box-shadow: 0 2px 12px rgb(0 0 0 / 0.15);
 }
+/* a childless .page is a placeholder whose height is untrusted (base-size guess,
+   or a collapsed translated page pending re-render). Excluding it from scroll
+   anchor candidacy makes Chromium anchor to real content below, so the
+   placeholder→real height correction is always "growth above the anchor" and
+   native scroll anchoring compensates it — kills the upward-scroll jump. */
+.page:empty {
+  overflow-anchor: none;
+}
 .page canvas {
   position: absolute;
   inset: 0;
