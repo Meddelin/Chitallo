@@ -222,6 +222,8 @@ export function GlossaryModal({
   const textRef = useRef(text);
   textRef.current = text;
   const [gen, setGen] = useState<GenState | null>(null);
+  // inline confirm for «Собрать заново» (a rebuild replaces the whole list)
+  const [confirmRebuild, setConfirmRebuild] = useState(false);
   const genCtrl = useRef<AbortController | null>(null);
   const closedRef = useRef(false);
 
@@ -242,8 +244,11 @@ export function GlossaryModal({
 
   // «Собрать глоссарий»: statistical term extraction over the whole book, then
   // the local model translates only the term list (with sentence context).
-  // MERGE semantics — every existing line survives, only new terms appended —
-  // so re-clicks are idempotent and cancel keeps everything translated so far.
+  // MERGE semantics — every existing line survives (broken "term = ?" artifacts
+  // excepted), only new terms appended — so re-clicks are idempotent and cancel
+  // keeps everything translated so far. «Собрать заново» reuses the same run:
+  // the confirmed rebuild clears the textarea first, so the merge base is empty
+  // and the result is a fresh list.
   const runGen = useCallback(async () => {
     if (!doc || genCtrl.current) return;
     const ctrl = new AbortController();
@@ -314,25 +319,54 @@ export function GlossaryModal({
           <div className="mt-2 flex items-center gap-2 text-xs text-neutral-400 dark:text-neutral-500 select-none">
             {doc &&
               (gen === null || gen.phase === "done" || gen.phase === "error" ? (
-                <>
-                  <button
-                    className="hover:text-neutral-600 dark:hover:text-neutral-300 underline underline-offset-2"
-                    title="Статистически извлечь термины из всей книги и перевести их локальной моделью; ваши строки не изменяются, добавляются только новые"
-                    onClick={runGen}
-                  >
-                    {/* re-run keeps merge semantics: existing lines survive, only new terms are appended */}
-                    {text.trim() ? "Собрать заново" : "Собрать глоссарий"}
-                  </button>
-                  <span className="opacity-80">
-                    {gen === null
-                      ? "~2–3 мин, термины извлекаются из всей книги"
-                      : gen.phase === "done"
-                        ? `добавлено: ${gen.added}` +
-                          (gen.skipped ? `, пропущено: ${gen.skipped}` : "") +
-                          (gen.auxUsed ? "" : " · без модели терминов")
-                        : gen.msg}
-                  </span>
-                </>
+                confirmRebuild ? (
+                  // rebuild replaces the whole list — inline confirm, same
+                  // pattern as «Перезапустить перевод» in the App menu
+                  <>
+                    <span>Заменить текущий глоссарий? Ручные правки будут потеряны</span>
+                    <button
+                      className="hover:text-neutral-600 dark:hover:text-neutral-300 underline underline-offset-2"
+                      onClick={() => {
+                        setConfirmRebuild(false);
+                        setText(""); // fresh list: empty merge base, no old content
+                        runGen();
+                      }}
+                    >
+                      да
+                    </button>
+                    <span className="opacity-40">·</span>
+                    <button
+                      className="hover:text-neutral-600 dark:hover:text-neutral-300 underline underline-offset-2"
+                      onClick={() => setConfirmRebuild(false)}
+                    >
+                      нет
+                    </button>
+                  </>
+                ) : (
+                  <>
+                    <button
+                      className="hover:text-neutral-600 dark:hover:text-neutral-300 underline underline-offset-2"
+                      title={
+                        text.trim()
+                          ? "Пересобрать глоссарий с нуля — текущий список будет заменён (с подтверждением)"
+                          : "Статистически извлечь термины из всей книги и перевести их локальной моделью"
+                      }
+                      onClick={() => (text.trim() ? setConfirmRebuild(true) : runGen())}
+                    >
+                      {/* non-empty list ⇒ true rebuild (confirm + replace); empty ⇒ first run */}
+                      {text.trim() ? "Собрать заново" : "Собрать глоссарий"}
+                    </button>
+                    <span className="opacity-80">
+                      {gen === null
+                        ? "~2–3 мин, термины извлекаются из всей книги"
+                        : gen.phase === "done"
+                          ? `добавлено: ${gen.added}` +
+                            (gen.skipped ? `, пропущено: ${gen.skipped}` : "") +
+                            (gen.auxUsed ? "" : " · без модели терминов")
+                          : gen.msg}
+                    </span>
+                  </>
+                )
               ) : (
                 <>
                   <span className="tabular-nums">

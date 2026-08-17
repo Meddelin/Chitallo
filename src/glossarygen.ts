@@ -7,7 +7,8 @@
 //     each term as the segment, its first-occurrence sentence as the context
 //     for the model-card contextual template (translate.ts buildPrompt).
 //   mergeGlossary: appends only genuinely new terms; every existing user line
-//     survives byte-for-byte (idempotent re-runs).
+//     survives byte-for-byte (idempotent re-runs), except broken "term = ?"
+//     artifacts of older runs, which are dropped so the term can be retried.
 
 import type { PDFDocumentProxy } from "pdfjs-dist";
 import { clusterParagraphs } from "./paragraphs";
@@ -606,18 +607,32 @@ export async function translateTerms(
 
 // ---- merge ------------------------------------------------------------------
 
-// same lenient separators as translate.ts parseGlossary
-const LINE_RE = /^\s*(.+?)\s*(?:=|->|→|—)\s*(.+?)\s*$/;
+// same lenient separators as translate.ts parseGlossary, except the right side
+// may also be empty ("term =") so broken artifacts of older buggy runs are all
+// recognizable: "term = ?", "term = —", "term =". A right-hand side without a
+// single letter or digit is junk by definition — no user wants «X = ?».
+const JUNK_LINE_RE = /^\s*(.+?)\s*(?:=|->|→|—)\s*(.*?)\s*$/;
+const brokenRhs = (tr: string) => !/[A-Za-zА-Яа-яЁё0-9]/.test(tr);
 
 // Append pairs whose source term is not already present (case-insensitive on
-// the source side). Existing lines — including junk that parses as nothing —
-// are preserved untouched, so re-runs are idempotent.
+// the source side). Existing lines — including free-form lines that parse as
+// nothing — are preserved byte-for-byte, so re-runs are idempotent. The one
+// exception: parsed lines with a broken right-hand side (see brokenRhs) are
+// dropped BEFORE dedup, so their terms become eligible for a fresh
+// translation in the same run.
 export function mergeGlossary(existing: string, pairs: readonly TermPair[]): { text: string; added: number } {
   const norm = (s: string) => s.toLowerCase().replace(/\s+/g, " ").trim();
   const have = new Set<string>();
+  const kept: string[] = [];
+  let dropped = 0;
   for (const line of existing.split(/\r?\n/)) {
-    const m = line.match(LINE_RE);
-    if (m) have.add(norm(m[1]));
+    const m = line.match(JUNK_LINE_RE);
+    if (m && brokenRhs(m[2])) {
+      dropped++; // junk artifact out; term intentionally NOT added to `have`
+      continue;
+    }
+    kept.push(line);
+    if (m) have.add(norm(m[1])); // non-broken JUNK_LINE_RE match ⇒ LINE_RE-parseable
   }
   const lines: string[] = [];
   for (const p of pairs) {
@@ -626,7 +641,8 @@ export function mergeGlossary(existing: string, pairs: readonly TermPair[]): { t
     have.add(k);
     lines.push(`${p.term} = ${p.tr}`);
   }
-  if (!lines.length) return { text: existing, added: 0 };
-  const base = existing.replace(/\n+\s*$/, "");
-  return { text: (base ? base + "\n" : "") + lines.join("\n") + "\n", added: lines.length };
+  if (!lines.length && !dropped) return { text: existing, added: 0 };
+  const base = (dropped ? kept.join("\n") : existing).replace(/\n+\s*$/, "");
+  const head = base ? base + "\n" : "";
+  return { text: lines.length ? head + lines.join("\n") + "\n" : head, added: lines.length };
 }
