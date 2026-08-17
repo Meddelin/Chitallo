@@ -58,7 +58,7 @@ type Row = {
 };
 
 const ROW =
-  "w-full text-left px-2.5 py-1 rounded-lg hover:bg-neutral-100 dark:hover:bg-neutral-700/70 flex items-center gap-2";
+  "w-full text-left px-2.5 py-1 rounded-lg transition-colors hover:bg-neutral-100 dark:hover:bg-neutral-700/70 flex items-center gap-2";
 
 export default function Outline({
   doc,
@@ -134,7 +134,7 @@ export default function Outline({
   };
 
   return (
-    <div className="absolute left-0 top-full mt-2.5 z-20 w-80 rounded-xl bg-white/95 dark:bg-neutral-800/95 backdrop-blur shadow-xl p-1.5 text-left">
+    <div className="overlay-pop absolute left-0 top-full mt-2.5 z-20 w-80 rounded-xl bg-white/95 dark:bg-neutral-800/95 backdrop-blur shadow-xl p-1.5 text-left">
       <input
         ref={inputRef}
         value={input}
@@ -157,17 +157,21 @@ export default function Outline({
       {rows !== null && (
         <div className="mt-1 border-t border-neutral-200 dark:border-neutral-700 pt-1 max-h-[55vh] overflow-y-auto overscroll-contain">
           {rows.length === 0 ? (
-            <div className="px-2.5 py-1.5 opacity-50 cursor-default">В книге нет оглавления</div>
+            <div className="px-2.5 py-1.5 text-neutral-500 dark:text-neutral-400 cursor-default">В книге нет оглавления</div>
           ) : (
             rows.map((r) => (
               <button key={r.id} className={ROW} onClick={() => activate(r)} title={r.title}>
                 <span
-                  className={`flex-1 min-w-0 truncate ${r.bold ? "font-medium" : ""} ${r.depth ? "opacity-80" : ""}`}
+                  className={`flex-1 min-w-0 truncate ${r.bold ? "font-medium" : ""} ${
+                    r.depth ? "text-neutral-600 dark:text-neutral-300" : ""
+                  }`}
                   style={r.depth ? { paddingLeft: r.depth * 14 } : undefined}
                 >
                   {r.title}
                 </span>
-                {r.page !== undefined && <span className="shrink-0 tabular-nums text-xs opacity-40">{r.page}</span>}
+                {r.page !== undefined && (
+                  <span className="shrink-0 tabular-nums text-xs text-neutral-500 dark:text-neutral-400">{r.page}</span>
+                )}
               </button>
             ))
           )}

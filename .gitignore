@@ -12,6 +12,9 @@ dist
 dist-ssr
 *.local
 
+# staged llama.cpp runtime for the installer (npm run stage-llama)
+llama-bin
+
 # Editor directories and files
 .vscode/*
 !.vscode/extensions.json

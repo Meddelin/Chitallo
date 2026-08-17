@@ -2,6 +2,7 @@ import { useEffect, useState, useSyncExternalStore } from "react";
 import { Channel, invoke } from "@tauri-apps/api/core";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import { isServerUp } from "./translate";
+import { IconClose } from "./icons";
 
 // ---- model onboarding + the single status vocabulary (WP-B) -----------------
 //
@@ -124,6 +125,13 @@ export function cancelDownload(model: ModelKey): void {
   invoke("cancel_model_download", { model }).catch(() => {});
 }
 
+/// After delete_model (Settings): the shared snapshot must go back to a blank
+/// «Скачать», not linger on "done"/"cancelled" from the previous life —
+/// a stale "done" would read as «модель запускается…» in the menu row.
+export function resetDownload(model: ModelKey): void {
+  setDl(model, { status: "idle", received: 0, total: MODEL_META[model].size, bps: 0 });
+}
+
 // after a webview reload: if Rust still runs a download, re-subscribe; if a
 // .part is on disk, surface the resumable state instead of a blank «Скачать»
 const attachTried: Partial<Record<ModelKey, boolean>> = {};
@@ -154,6 +162,29 @@ export function useDownload(model: ModelKey): Dl {
     },
     () => dlState[model],
   );
+}
+
+/// Disk-side snapshot for Settings: is the .gguf installed, how many bytes of
+/// a .part are local, is a download running. null = unknown (plain browser).
+export async function fetchDlSnapshot(
+  model: ModelKey,
+): Promise<{ ready: boolean; received: number; running: boolean } | null> {
+  try {
+    const st = await invoke<{ running: boolean; file_ready: boolean; received: number; total: number }>(
+      "model_download_status",
+      { model, destDir: devDestDir() },
+    );
+    return { ready: st.file_ready, received: st.received, running: st.running };
+  } catch {
+    return null; // plain browser — no Tauri
+  }
+}
+
+/// Settings «Удалить»: remove the weights (and any .part) from disk. The Rust
+/// side first stops the llama-server we spawned for that model.
+export async function deleteModel(model: ModelKey): Promise<void> {
+  await invoke("delete_model", { model, destDir: devDestDir() });
+  resetDownload(model);
 }
 
 /// Is the final .gguf on disk? null = unknown (plain browser).
@@ -216,17 +247,17 @@ export function Spinner() {
   );
 }
 
-function Progress({ dl, onCancel }: { dl: Dl; onCancel: () => void }) {
+export function Progress({ dl, onCancel }: { dl: Dl; onCancel: () => void }) {
   return (
     <div className="select-none">
       <div className="h-0.5 overflow-hidden rounded-full bg-neutral-200 dark:bg-neutral-700">
-        <div className="h-full bg-blue-500 transition-[width] duration-300" style={{ width: `${dlPct(dl)}%` }} />
+        <div className="h-full bg-accent transition-[width] duration-300" style={{ width: `${dlPct(dl)}%` }} />
       </div>
       <div className="mt-1.5 flex items-center gap-2 text-xs text-neutral-500 dark:text-neutral-400">
         <span className="tabular-nums">{dlProgressLine(dl)}</span>
         <span className="flex-1" />
         {dl.status === "running" && (
-          <button className="hover:opacity-60" onClick={onCancel}>
+          <button className="transition-colors hover:text-neutral-700 dark:hover:text-neutral-200" onClick={onCancel}>
             Отменить
           </button>
         )}
@@ -241,11 +272,11 @@ const LICENSE_URL = "https://huggingface.co/tencent/HY-MT1.5-7B-GGUF/blob/main/L
 
 function LicenseNote() {
   return (
-    <p className="text-xs leading-relaxed text-neutral-400 dark:text-neutral-500">
+    <p className="text-xs leading-relaxed text-neutral-500 dark:text-neutral-400">
       Модель HY-MT1.5 (Tencent) — лицензия Hunyuan Community: бесплатно, в том числе для коммерческого
       использования; не действует в ЕС, Великобритании и Южной Корее.{" "}
       <button
-        className="underline underline-offset-2 hover:text-neutral-600 dark:hover:text-neutral-300"
+        className="underline underline-offset-2 transition-colors hover:text-neutral-700 dark:hover:text-neutral-200"
         onClick={() => openUrl(LICENSE_URL).catch(() => window.open(LICENSE_URL, "_blank"))}
       >
         Условия
@@ -255,7 +286,7 @@ function LicenseNote() {
 }
 
 const PRIMARY_BTN =
-  "mt-3 w-full rounded-lg bg-neutral-900 px-3 py-2 text-white transition-opacity hover:opacity-85 dark:bg-neutral-100 dark:text-neutral-900";
+  "mt-3 w-full rounded-lg bg-neutral-900 px-3 py-2 text-white transition-colors hover:bg-neutral-700 dark:bg-neutral-100 dark:text-neutral-900 dark:hover:bg-white";
 
 /// poll the model status while a surface is visible
 function useModelStatus(intervalMs = 2000): ModelStatus | null {
@@ -355,17 +386,21 @@ export function ModelSetupModal({ onClose }: { onClose: () => void }) {
 
   return (
     <div
-      className="fixed inset-0 z-40 flex items-center justify-center bg-black/30"
+      className="modal-backdrop fixed inset-0 z-40 flex items-center justify-center bg-black/30"
       onMouseDown={(e) => {
         if (e.target === e.currentTarget) onClose();
       }}
     >
-      <div className="w-[min(24rem,90vw)] rounded-xl bg-white p-4 text-sm text-neutral-800 shadow-2xl dark:bg-neutral-800 dark:text-neutral-100">
-        <div className="mb-2 flex items-center text-xs text-neutral-400 select-none dark:text-neutral-500">
+      <div className="modal-panel w-[min(24rem,90vw)] rounded-xl bg-white p-4 text-sm text-neutral-800 shadow-2xl dark:bg-neutral-800 dark:text-neutral-100">
+        <div className="mb-2 flex items-center text-xs text-neutral-500 select-none dark:text-neutral-400">
           <span>Модель перевода</span>
           <span className="flex-1" />
-          <button className="px-0.5 hover:opacity-60" onClick={onClose} title="Закрыть (Esc)">
-            ×
+          <button
+            className="px-0.5 transition-colors hover:text-neutral-800 dark:hover:text-neutral-100"
+            onClick={onClose}
+            title="Закрыть (Esc)"
+          >
+            <IconClose />
           </button>
         </div>
         {busy ? (
@@ -398,7 +433,7 @@ export function ModelSetupModal({ onClose }: { onClose: () => void }) {
               pdfer переводит книги локально, без интернета и подписок. Нужна модель перевода — она
               скачивается один раз и остаётся на компьютере.
             </p>
-            <p className="mt-2 text-xs text-neutral-400 dark:text-neutral-500">
+            <p className="mt-2 text-xs text-neutral-500 dark:text-neutral-400">
               HY-MT1.5 · {MODEL_META.main.sizeLabel} · перевод EN→RU офлайн
             </p>
             {dl.status === "error" && (
@@ -449,7 +484,10 @@ export function ModelSetupCard() {
       ) : status === "dead" ? (
         <div className="mt-3 flex items-center gap-2 text-xs text-neutral-500 dark:text-neutral-400">
           <span>Модель не отвечает</span>
-          <button className="underline underline-offset-2 hover:opacity-60" onClick={() => void restartModel()}>
+          <button
+            className="underline underline-offset-2 transition-colors hover:text-neutral-700 dark:hover:text-neutral-200"
+            onClick={() => void restartModel()}
+          >
             Перезапустить
           </button>
         </div>
@@ -465,7 +503,7 @@ export function ModelSetupCard() {
           </button>
           <div className="mt-2 text-center">
             <button
-              className="text-xs text-neutral-400 hover:text-neutral-600 dark:text-neutral-500 dark:hover:text-neutral-300"
+              className="text-xs text-neutral-600 dark:text-neutral-300 transition-colors hover:text-neutral-800 dark:hover:text-neutral-100"
               onClick={() => {
                 localStorage.setItem("pdfer:modellater", "1");
                 setLater(true);

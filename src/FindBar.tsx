@@ -12,6 +12,7 @@ import { FIG_CONTAIN, interArea } from "./paragraphs";
 import type { FigureRegion } from "./paragraphs";
 import type { TrParagraph } from "./booktranslate";
 import { Spinner } from "./ModelSetup";
+import { IconClose } from "./icons";
 
 // one hit. orig mode: start/end are offsets in the page's index text (item
 // strs + "\n" per hasEOL — exactly what walkLayer reads back from the DOM,
@@ -21,6 +22,9 @@ type Match = { page: number; start: number; end: number; tridx?: number };
 
 const H_ALL = "pdfer-find";
 const H_CUR = "pdfer-find-cur";
+
+// pill controls: the app-wide hover grammar (WP-K) — quiet bg tint, no opacity dim
+const BAR_BTN = "rounded-md px-1 transition-colors hover:bg-neutral-900/5 dark:hover:bg-neutral-100/10";
 
 const registry = () => ("highlights" in CSS ? CSS.highlights : null);
 
@@ -343,7 +347,7 @@ export default function FindBar({
   return (
     <div
       data-findbar
-      className="fixed top-[52px] -translate-x-1/2 z-10 flex items-center gap-1 rounded-full bg-white/85 dark:bg-neutral-800/85 backdrop-blur px-3 py-1.5 shadow-lg text-sm text-neutral-700 dark:text-neutral-200 select-none transition-[left] duration-200"
+      className="overlay-pop fixed top-[52px] -translate-x-1/2 z-10 flex items-center gap-1 rounded-full bg-white/85 dark:bg-neutral-800/85 backdrop-blur px-3 py-1.5 shadow-lg text-sm text-neutral-700 dark:text-neutral-200 select-none transition-[left] duration-150"
       style={{ left: leftShift ? `calc(50% - ${leftShift}px)` : "50%" }}
     >
       <input
@@ -356,7 +360,7 @@ export default function FindBar({
         className="w-52 bg-transparent outline-none px-1 placeholder:text-neutral-400 dark:placeholder:text-neutral-500"
       />
       {hasQuery && (
-        <span className="tabular-nums whitespace-nowrap px-1 text-neutral-400 dark:text-neutral-500 flex items-center gap-1.5">
+        <span className="tabular-nums whitespace-nowrap px-1 text-neutral-500 dark:text-neutral-400 flex items-center gap-1.5">
           {matches.length ? `${(idx < 0 ? 0 : idx) + 1}/${matches.length}` : busy ? null : "Не найдено"}
           {busy && <Spinner />}
         </span>
@@ -364,7 +368,7 @@ export default function FindBar({
       <span className="mx-1 h-4 w-px bg-neutral-900/15 dark:bg-neutral-100/20" />
       {/* mousedown-preventDefault keeps focus (and Enter cycling) in the input */}
       <button
-        className="hover:opacity-60 px-1 disabled:opacity-30 disabled:cursor-default"
+        className={`${BAR_BTN} disabled:text-neutral-300 dark:disabled:text-neutral-600 disabled:hover:bg-transparent dark:disabled:hover:bg-transparent disabled:cursor-default`}
         disabled={!matches.length}
         onMouseDown={(e) => e.preventDefault()}
         onClick={() => step(-1)}
@@ -373,7 +377,7 @@ export default function FindBar({
         ↑
       </button>
       <button
-        className="hover:opacity-60 px-1 disabled:opacity-30 disabled:cursor-default"
+        className={`${BAR_BTN} disabled:text-neutral-300 dark:disabled:text-neutral-600 disabled:hover:bg-transparent dark:disabled:hover:bg-transparent disabled:cursor-default`}
         disabled={!matches.length}
         onMouseDown={(e) => e.preventDefault()}
         onClick={() => step(1)}
@@ -382,8 +386,8 @@ export default function FindBar({
         ↓
       </button>
       <span className="mx-1 h-4 w-px bg-neutral-900/15 dark:bg-neutral-100/20" />
-      <button className="hover:opacity-60 px-1" onClick={onClose} title="Закрыть (Esc)">
-        ✕
+      <button className={`${BAR_BTN} py-0.5`} onClick={onClose} title="Закрыть (Esc)">
+        <IconClose />
       </button>
     </div>
   );

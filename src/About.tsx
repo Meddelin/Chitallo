@@ -4,6 +4,7 @@
 
 import { openUrl } from "@tauri-apps/plugin-opener";
 import pkg from "../package.json";
+import { IconClose } from "./icons";
 
 // Инлайн-копия глифа приложения (src-tauri/icons/icon.svg) — те же формы и
 // цвета, что в таскбаре: страница в момент перевода.
@@ -55,17 +56,21 @@ const link = (url: string) => openUrl(url).catch(() => window.open(url, "_blank"
 export function AboutModal({ onClose }: { onClose: () => void }) {
   return (
     <div
-      className="fixed inset-0 z-40 flex items-center justify-center bg-black/30"
+      className="modal-backdrop fixed inset-0 z-40 flex items-center justify-center bg-black/30"
       onMouseDown={(e) => {
         if (e.target === e.currentTarget) onClose();
       }}
     >
-      <div className="w-[min(26rem,90vw)] rounded-xl bg-white p-4 text-sm text-neutral-800 shadow-2xl dark:bg-neutral-800 dark:text-neutral-100 select-none">
-        <div className="mb-3 flex items-center text-xs text-neutral-400 dark:text-neutral-500">
+      <div className="modal-panel w-[min(26rem,90vw)] rounded-xl bg-white p-4 text-sm text-neutral-800 shadow-2xl dark:bg-neutral-800 dark:text-neutral-100 select-none">
+        <div className="mb-3 flex items-center text-xs text-neutral-500 dark:text-neutral-400">
           <span>О программе</span>
           <span className="flex-1" />
-          <button className="px-0.5 hover:opacity-60" onClick={onClose} title="Закрыть (Esc)">
-            ×
+          <button
+            className="px-0.5 transition-colors hover:text-neutral-800 dark:hover:text-neutral-100"
+            onClick={onClose}
+            title="Закрыть (Esc)"
+          >
+            <IconClose />
           </button>
         </div>
 
@@ -74,7 +79,7 @@ export function AboutModal({ onClose }: { onClose: () => void }) {
           <AppGlyph size={40} />
           <div className="min-w-0">
             <div className="text-base font-medium leading-tight">
-              pdfer <span className="ml-1 text-xs font-normal tabular-nums text-neutral-400 dark:text-neutral-500">{pkg.version}</span>
+              pdfer <span className="ml-1 text-xs font-normal tabular-nums text-neutral-500 dark:text-neutral-400">{pkg.version}</span>
             </div>
             <div className="text-xs text-neutral-500 dark:text-neutral-400">Читалка с локальным переводом EN→RU</div>
           </div>
@@ -83,27 +88,27 @@ export function AboutModal({ onClose }: { onClose: () => void }) {
         <p className="mt-3 leading-relaxed">
           Работает полностью офлайн. Книги и переводы не покидают ваш компьютер.
         </p>
-        <p className="mt-1 text-xs leading-relaxed text-neutral-400 dark:text-neutral-500">
+        <p className="mt-1 text-xs leading-relaxed text-neutral-500 dark:text-neutral-400">
           Исключение — «Спросить»: вопрос и фрагмент книги отправляются в Claude.
         </p>
 
         <div className="mt-3 border-t border-neutral-200 pt-2 dark:border-neutral-700">
-          <div className="mb-1 text-xs text-neutral-400 dark:text-neutral-500">Сторонние компоненты</div>
+          <div className="mb-1 text-xs text-neutral-500 dark:text-neutral-400">Сторонние компоненты</div>
           <div className="-mx-1 max-h-[38vh] overflow-y-auto overscroll-contain px-1">
             {NOTICES.map((n) => (
               <div key={n.name} className="py-1">
                 <div className="flex items-baseline gap-3">
                   <button
-                    className="min-w-0 truncate text-left hover:opacity-60"
+                    className="min-w-0 truncate text-left rounded px-1 -mx-1 transition-colors hover:bg-neutral-100 dark:hover:bg-neutral-700/60"
                     onClick={() => void link(n.url)}
                     title={n.url}
                   >
                     {n.name}
                   </button>
-                  <span className="ml-auto shrink-0 text-xs text-neutral-400 dark:text-neutral-500">{n.license}</span>
+                  <span className="ml-auto shrink-0 text-xs text-neutral-500 dark:text-neutral-400">{n.license}</span>
                 </div>
                 {n.note && (
-                  <div className="mt-0.5 text-xs leading-relaxed text-neutral-400 dark:text-neutral-500">{n.note}</div>
+                  <div className="mt-0.5 text-xs leading-relaxed text-neutral-500 dark:text-neutral-400">{n.note}</div>
                 )}
               </div>
             ))}

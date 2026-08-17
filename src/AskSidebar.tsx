@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import { Channel, invoke } from "@tauri-apps/api/core";
+import { IconClose } from "./icons";
 
 // ---- «Спросить»: chat sidebar over headless Claude Code ---------------------
 //
@@ -315,7 +316,7 @@ export function AskSidebar({
         <span className="flex-1" />
         {msgs.length > 0 && (
           <button
-            className="text-xs opacity-50 hover:opacity-80 disabled:opacity-25"
+            className="text-xs text-neutral-500 dark:text-neutral-400 transition-colors hover:text-neutral-700 dark:hover:text-neutral-200 disabled:text-neutral-300 dark:disabled:text-neutral-600"
             disabled={busy}
             onClick={newThread}
             title="Начать новую беседу — история и память беседы будут очищены"
@@ -323,8 +324,12 @@ export function AskSidebar({
             новая беседа
           </button>
         )}
-        <button className="hover:opacity-60 px-0.5" onClick={onClose} title="Закрыть (Ctrl+J)">
-          ×
+        <button
+          className="px-0.5 py-0.5 rounded-md transition-colors hover:bg-neutral-900/5 dark:hover:bg-neutral-100/10"
+          onClick={onClose}
+          title="Закрыть (Ctrl+J)"
+        >
+          <IconClose />
         </button>
       </div>
 
@@ -335,7 +340,7 @@ export function AskSidebar({
           </div>
         )}
         {msgs.length === 0 && !busy && (
-          <div className="h-full flex items-center justify-center text-center px-6 text-xs leading-relaxed opacity-40 select-none whitespace-pre-line">
+          <div className="h-full flex items-center justify-center text-center px-6 text-xs leading-relaxed text-neutral-500 dark:text-neutral-400 select-none whitespace-pre-line">
             {"Выделите фрагмент и нажмите «Спросить» —\nили задайте вопрос о книге здесь"}
           </div>
         )}
@@ -344,7 +349,7 @@ export function AskSidebar({
             <div key={i} className="mt-3 first:mt-0 flex justify-end">
               <div className="max-w-[85%] rounded-xl rounded-br-sm bg-neutral-200/80 dark:bg-neutral-700/70 px-3 py-1.5 whitespace-pre-wrap">
                 {m.quote && (
-                  <div className="mb-1 border-l-2 border-neutral-400/60 dark:border-neutral-500/60 pl-2 text-xs opacity-70 line-clamp-3">
+                  <div className="mb-1 border-l-2 border-neutral-400/60 dark:border-neutral-500/60 pl-2 text-xs text-neutral-600 dark:text-neutral-300 line-clamp-3">
                     {m.page ? `стр. ${m.page} — ` : ""}
                     {m.quote}
                   </div>
@@ -360,7 +365,7 @@ export function AskSidebar({
               }`}
             >
               {m.text}
-              {m.cancelled && <span className="ml-1.5 text-xs opacity-50">(остановлено)</span>}
+              {m.cancelled && <span className="ml-1.5 text-xs text-neutral-500 dark:text-neutral-400">(остановлено)</span>}
             </div>
           ),
         )}
@@ -375,11 +380,15 @@ export function AskSidebar({
       <div className="border-t border-neutral-200 dark:border-neutral-700 p-2.5 shrink-0">
         {pending && (
           <div className="mb-1.5 flex items-start gap-2 rounded-lg bg-neutral-200/70 dark:bg-neutral-700/50 px-2.5 py-1.5 text-xs select-none">
-            <div className="flex-1 line-clamp-3 opacity-80">
+            <div className="flex-1 line-clamp-3 text-neutral-600 dark:text-neutral-300">
               {pending.page ? `стр. ${pending.page}: ` : ""}«{pending.quote}»
             </div>
-            <button className="hover:opacity-60 opacity-50" onClick={() => setPending(null)} title="Убрать фрагмент">
-              ×
+            <button
+              className="text-neutral-500 dark:text-neutral-400 transition-colors hover:text-neutral-800 dark:hover:text-neutral-100"
+              onClick={() => setPending(null)}
+              title="Убрать фрагмент"
+            >
+              <IconClose />
             </button>
           </div>
         )}
@@ -394,12 +403,12 @@ export function AskSidebar({
             onKeyDown={onKeyDown}
           />
           <button
-            className={`h-8 w-8 shrink-0 rounded-full ${
+            className={`h-8 w-8 shrink-0 rounded-full transition-colors ${
               busy
-                ? "bg-neutral-300 dark:bg-neutral-600 hover:opacity-80"
+                ? "bg-neutral-300 dark:bg-neutral-600 hover:bg-neutral-400/70 dark:hover:bg-neutral-500"
                 : sendable
-                  ? "bg-neutral-800 text-neutral-50 dark:bg-neutral-100 dark:text-neutral-900 hover:opacity-80"
-                  : "bg-neutral-200 dark:bg-neutral-700 opacity-40 cursor-default"
+                  ? "bg-neutral-800 text-neutral-50 dark:bg-neutral-100 dark:text-neutral-900 hover:bg-neutral-700 dark:hover:bg-white"
+                  : "bg-neutral-200 text-neutral-400 dark:bg-neutral-700 dark:text-neutral-500 cursor-default"
             }`}
             onClick={busy ? cancel : () => void send()}
             disabled={!busy && !sendable}

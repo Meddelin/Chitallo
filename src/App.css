@@ -2,6 +2,49 @@
 
 @custom-variant dark (&:where(.dark, .dark *));
 
+/* ---- Design tokens (WP-K) ---------------------------------------------------
+   The whole visual system in ~20 lines. The neutral ramp is OVERRIDDEN with
+   warm values (Tailwind's stone): a paper-warm light half, an ink-warm dark
+   half — the same warmth as the app icon — so every existing neutral-* class
+   shifts with it, no redesign. ONE accent — the icon's blue — for selection,
+   progress, active states and the focus ring (use `accent` classes, never a
+   raw blue-*). Amber stays semantic (find highlight, «модель недоступна»),
+   it is not an accent. UI font: Inter when installed, else the native
+   Segoe UI Variable; numbers opt into tabular-nums per element. */
+@theme {
+  --font-sans: "Inter", "Segoe UI Variable Text", "Segoe UI", system-ui, sans-serif;
+  --color-accent: #3b82f6; /* the blue of the app icon */
+  --color-neutral-50: #fafaf9;
+  --color-neutral-100: #f5f5f4;
+  --color-neutral-200: #e7e5e4;
+  --color-neutral-300: #d6d3d1;
+  --color-neutral-400: #a8a29e;
+  --color-neutral-500: #78716c;
+  --color-neutral-600: #57534e;
+  --color-neutral-700: #44403c;
+  --color-neutral-800: #292524;
+  --color-neutral-900: #1c1917;
+  --color-neutral-950: #0c0a09;
+}
+
+/* native widgets (scrollbars, carets, form controls) follow the app theme */
+:root {
+  color-scheme: light;
+}
+.dark {
+  color-scheme: dark;
+}
+
+/* Keyboard focus: one 2px accent ring everywhere interactive. Text fields are
+   exempt — each carries its own quieter treatment (caret, underline, ring). */
+:focus-visible {
+  outline: 2px solid var(--color-accent);
+  outline-offset: 2px;
+}
+:is(input, textarea):focus-visible {
+  outline: none;
+}
+
 /* pdf.js v6 text layer, mirroring node_modules/pdfjs-dist/web/pdf_viewer.css
    .textLayer rules (geometry via custom properties the TextLayer JS sets:
    --font-height/--scale-x/--rotate). Deviations from official: z-index:2 on the
@@ -52,8 +95,12 @@
   cursor: default;
 }
 .textLayer ::selection {
-  background: rgb(59 130 246 / 0.35);
+  background: color-mix(in srgb, var(--color-accent) 35%, transparent);
   color: transparent;
+}
+/* same accent selection on reflowed translation text — one selection color */
+.trPage ::selection {
+  background: color-mix(in srgb, var(--color-accent) 30%, transparent);
 }
 /* the EOL <br>s TextLayer appends have no assigned position: they pile up in a
    synthetic strip at the page's left edge. Keep them selectable (they supply the
@@ -154,17 +201,84 @@
 }
 .dark .page {
   background: #1a1a1a;
+  /* hairline page boundary — the light-mode drop shadow is invisible dark-on-dark */
+  box-shadow: 0 0 0 1px rgb(255 255 255 / 0.08), 0 2px 12px rgb(0 0 0 / 0.5);
 }
-/* ponytail: CSS invert also inverts images; proper recolor-preserving-images is a later upgrade */
 .dark .page canvas {
   filter: invert(93%) hue-rotate(180deg);
+}
+/* Figures/images keep their original colors in dark mode (WP-K): the invert
+   is skipped for reflow crops flagged as figures (.trFig) and for the
+   .figKeep overlays Page paints over the store's known figure rects on
+   original renders (identical pixels — invisible in light mode). */
+.page canvas.figKeep {
+  position: absolute;
+  inset: auto; /* inline left/top/width/height from Page */
+  z-index: 1; /* above the base canvas, below text (2) and links (3) */
+}
+.dark .page canvas.figKeep,
+.dark .page canvas.trFig {
+  filter: none;
+}
+
+/* ---- Motion: one 120–150 ms system (WP-K) ----------------------------------
+   Solid modals: 150 ms fade (backdrop) + 0.98→1 pop (panel). Flyouts, pills
+   and the toast: 120 ms fade + 2 px rise. Page content: 100 ms fade-in when a
+   fresh render swaps in. Keyframed `transform` composes with Tailwind v4
+   translate-* utilities (they use the `translate` property). All of it is
+   off under prefers-reduced-motion. */
+@keyframes modal-fade {
+  from {
+    opacity: 0;
+  }
+}
+@keyframes modal-pop {
+  from {
+    opacity: 0;
+    transform: scale(0.98);
+  }
+}
+@keyframes overlay-pop {
+  from {
+    opacity: 0;
+    transform: translateY(2px);
+  }
+}
+@keyframes page-in {
+  from {
+    opacity: 0;
+  }
+}
+.modal-backdrop {
+  animation: modal-fade 150ms ease-out;
+}
+.modal-panel {
+  animation: modal-pop 150ms ease-out;
+}
+.overlay-pop {
+  animation: overlay-pop 120ms ease-out;
+}
+.page > canvas,
+.page > .trPage {
+  animation: page-in 100ms ease-out;
+}
+@media (prefers-reduced-motion: reduce) {
+  .modal-backdrop,
+  .modal-panel,
+  .overlay-pop,
+  .page > canvas,
+  .page > .trPage {
+    animation: none;
+  }
 }
 
 /* Whole-book translation, v2: a clean re-typeset page. Child of .page (which
    supplies the shadow and the min-height = original page height); natural flow
    height — taller than the original is fine. Both theme colors are explicit:
    the dark invert filter is canvas-only and must never touch this text.
-   ONE uniform body size for the whole book: 15.5px × zoom scale. */
+   ONE uniform body size for the whole book: --tr-font-size × zoom scale.
+   The base size is a setting (WP-L): App sets --tr-font-size on the root
+   (persisted, default 15.5px), zoom multiplies it via --scale-factor. */
 .trPage {
   position: relative;
   box-sizing: border-box;
@@ -173,7 +287,7 @@
   background: #fff;
   color: #1c1c1c;
   font-family: Georgia, "Iowan Old Style", "Times New Roman", serif;
-  font-size: calc(var(--scale-factor, 1) * 15.5px);
+  font-size: calc(var(--scale-factor, 1) * var(--tr-font-size, 15.5px));
   line-height: 1.5;
   text-align: justify;
   hyphens: auto; /* effective via lang="ru" set by buildTrPage */

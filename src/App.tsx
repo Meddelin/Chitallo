@@ -21,14 +21,21 @@ import { FIG_CONTAIN, buildFrags, growParagraph, interArea, medianLineH, paraTex
 import type { FigureRegion, Word } from "./paragraphs";
 import * as booktranslate from "./booktranslate";
 import type { TrParagraph } from "./booktranslate";
+import { hydrateGlossary } from "./translate";
 import * as glossarygen from "./glossarygen";
 import { ModelSetupModal, Spinner, dlBusy, dlPct, fetchModelStatus, restartModel, statusUp, useDownload } from "./ModelSetup";
 import { AboutModal } from "./About";
+import { SettingsModal, TR_FONT_DEFAULT, TR_FONT_MAX, TR_FONT_MIN } from "./Settings";
+import { exportTranslation } from "./export";
+import * as exportmod from "./export";
+import { IconChevronDown, IconColumns, IconMoon, IconSliders, IconSun } from "./icons";
 import "./App.css";
 
 pdfjs.GlobalWorkerOptions.workerSrc = workerUrl;
 
 const DEFAULT_SCALE = 1.25;
+// Н4: every open path (обложка, Ctrl+O, палитра, pdfer:last) fails into the same toast
+const OPEN_FAIL_MSG = "Не удалось открыть файл — он перемещён или повреждён";
 const PAGE_GAP = 16;
 // «Спросить» sidebar width: the reading area shrinks by this (flex row, no
 // overlay), the fixed toolbar shifts left by half to stay centered over it
@@ -36,7 +43,14 @@ const ASK_W = 400;
 
 // full-width action row of the «Перевод» dropdown menu
 const MENU_ROW =
-  "w-full text-left px-2.5 py-1.5 rounded-lg hover:bg-neutral-100 dark:hover:bg-neutral-700/70 whitespace-nowrap";
+  "w-full text-left px-2.5 py-1.5 rounded-lg transition-colors hover:bg-neutral-100 dark:hover:bg-neutral-700/70 whitespace-nowrap";
+// pill/toolbar controls: ONE hover language (WP-K) — a quiet bg tint, never an
+// opacity dim; padding is added per call site
+const TB_BTN = "rounded-md transition-colors hover:bg-neutral-900/5 dark:hover:bg-neutral-100/10";
+// quiet footer rows of the «Перевод» menu (statuses that double as actions):
+// explicit ≥4.5:1 colors, hover strengthens the text — the link grammar
+const MENU_QUIET =
+  "w-full text-left text-neutral-500 dark:text-neutral-400 transition-colors hover:text-neutral-700 dark:hover:text-neutral-200";
 
 type Size = { w: number; h: number };
 type Cols = 1 | 2 | "auto";
@@ -64,14 +78,15 @@ function normalizeSelText(raw: string): string {
   return raw.replace(/[-­]\s*\n\s*/g, "").replace(/\s+/g, " ").trim();
 }
 
-// « · ~40 мин» from the engine's etaMs (moving average over recent pages)
+// « · осталось ~40 мин» from the engine's etaMs (moving average over recent
+// pages); копирайт #18 — префикс «осталось», десятичная запятая
 function fmtEta(ms?: number): string {
   if (ms === undefined) return "";
   const min = Math.round(ms / 60000);
-  if (min < 1) return " · <1 мин";
-  if (min < 60) return ` · ~${min} мин`;
+  if (min < 1) return " · осталось <1 мин";
+  if (min < 60) return ` · осталось ~${min} мин`;
   const h = ms / 3600000;
-  return ` · ~${h < 10 ? h.toFixed(1) : Math.round(h)} ч`;
+  return ` · осталось ~${h < 10 ? h.toFixed(1).replace(".", ",") : Math.round(h)} ч`;
 }
 
 // for 1-2 word selections: pull the containing sentence out of the surrounding
@@ -225,7 +240,9 @@ function buildTrPage(
     const h = Math.min(baseH, y0 + h0) - y;
     if (w <= 0 || h <= 0) return;
     const c = document.createElement("canvas");
-    c.className = "trCrop";
+    // fig-flagged crops carry .trFig — the dark-mode invert skips them, so
+    // figures/images keep their original colors (WP-K)
+    c.className = fig ? "trCrop trFig" : "trCrop";
     c.width = 0; // transparent until drawCrops fills it
     c.height = 0;
     // natural display size at the current zoom, fixed up front so the flow
@@ -387,6 +404,8 @@ function Page({
   const [rendered, setRendered] = useState<{ doc: PDFDocumentProxy; base: Size } | null>(null);
   const base = rendered && rendered.doc === doc ? rendered.base : baseSize;
   const size = { w: base.w * scale, h: base.h * scale };
+  // stale-content policy (WP-K): which doc/page the CURRENT children belong to
+  const staleKeyRef = useRef<{ doc: PDFDocumentProxy; num: number } | null>(null);
 
   // trVersion joins the effect deps ONLY in translation mode: while the engine
   // runs, every finished page bumps it and re-runs the effect (a full page
@@ -400,6 +419,13 @@ function Page({
 
   useEffect(() => {
     const el = ref.current!;
+    // Stale-content policy (WP-K): re-runs for the SAME page (zoom, view-mode
+    // toggle, translation progress) keep the previous render on screen — the
+    // old canvas CSS-stretches to the new size — and the fresh render swaps in
+    // only when ready, so zoom never flashes white. A doc/num change clears
+    // at once (wrong content must not linger).
+    if (staleKeyRef.current?.doc !== doc || staleKeyRef.current?.num !== num) el.replaceChildren();
+    staleKeyRef.current = { doc, num };
     let renderTask: RenderTask | null = null;
     let textLayer: TextLayer | null = null;
     let page: PDFPageProxy | null = null;
@@ -433,7 +459,7 @@ function Page({
             // original is rasterized only offscreen (once, if any non-prose
             // region needs an image crop) and discarded after cropping
             const { root, crops } = buildTrPage(paras, getTrFigs(num), getBodyFh(), scale, vp1.width, vp1.height);
-            el.appendChild(root);
+            el.replaceChildren(root); // swap-in: any stale render leaves only now
             if (crops.length) {
               const off = document.createElement("canvas");
               off.width = Math.floor(vp.width * dpr);
@@ -445,25 +471,50 @@ function Page({
             return;
           }
 
+          // canvas and text layer render DETACHED and swap in together when
+          // both finish (WP-K): the appear as one, and on zoom the stale
+          // render underneath stays visible right until this swap
           const canvas = document.createElement("canvas");
           canvas.width = Math.floor(vp.width * dpr);
           canvas.height = Math.floor(vp.height * dpr);
-          el.appendChild(canvas);
           renderTask = page.render({ canvas, viewport: page.getViewport({ scale: scale * dpr }) });
 
           const textDiv = document.createElement("div");
           textDiv.className = "textLayer";
-          el.appendChild(textDiv);
           textLayer = new TextLayer({ textContentSource: page.streamTextContent(), container: textDiv, viewport: vp });
 
           await Promise.all([renderTask.promise, textLayer.render()]).catch(() => {});
+          if (cancelled || el.dataset.rendered !== run) return;
+          el.replaceChildren(canvas, textDiv);
           // official viewer's selection stabilizer (see TextLayerBuilder): an
           // unselectable div that .selecting expands over the layer so drags
           // through empty areas don't snap the caret to DOM-distant nodes
-          if (!cancelled && el.dataset.rendered === run) {
-            const end = document.createElement("div");
-            end.className = "endOfContent";
-            textDiv.append(end);
+          const end = document.createElement("div");
+          end.className = "endOfContent";
+          textDiv.append(end);
+
+          // dark-mode figure exclusion (WP-K): figure rects known from the
+          // translation store are re-painted into .figKeep overlays that the
+          // .dark canvas invert skips — figures/images keep their original
+          // colors. In light mode the pixels are identical, so the overlays
+          // are invisible. Books never translated have no rects — no overlays.
+          const k = scale * dpr;
+          for (const f of getTrFigs(num)) {
+            const sx = Math.max(0, Math.round(f.x * k));
+            const sy = Math.max(0, Math.round(f.y * k));
+            const sw = Math.min(canvas.width - sx, Math.round(f.w * k));
+            const sh = Math.min(canvas.height - sy, Math.round(f.h * k));
+            if (sw <= 0 || sh <= 0) continue;
+            const c = document.createElement("canvas");
+            c.className = "figKeep";
+            c.width = sw;
+            c.height = sh;
+            c.getContext("2d")!.drawImage(canvas, sx, sy, sw, sh, 0, 0, sw, sh);
+            c.style.left = `${f.x * scale}px`;
+            c.style.top = `${f.y * scale}px`;
+            c.style.width = `${f.w * scale}px`;
+            c.style.height = `${f.h * scale}px`;
+            el.insertBefore(c, textDiv);
           }
 
           // annotation layer, LINKS ONLY: internal dests jump via the app's
@@ -506,6 +557,10 @@ function Page({
           textLayer?.cancel();
           page?.cleanup();
           el.replaceChildren();
+        } else {
+          // far-away page holding only a stale keepsake render (zoom re-run
+          // keeps children, see above) — free it, nobody is looking
+          el.replaceChildren();
         }
       },
       { rootMargin: "1500px 0px" },
@@ -518,8 +573,11 @@ function Page({
       renderTask?.cancel();
       textLayer?.cancel();
       delete el.dataset.rendered;
-      el.replaceChildren();
-      // NOTE: `rendered` (the page's true base size) is deliberately NOT reset —
+      // children are deliberately NOT cleared here (WP-K): on zoom/view-mode
+      // re-runs the stale render must stay visible until the replacement is
+      // ready; a doc/num change clears at the top of the next run, and
+      // unmount removes the whole node anyway.
+      // NOTE: `rendered` (the page's true base size) is also NOT reset —
       // see the placeholder comment above.
     };
   }, [doc, num, scale, viewMode, trDep, getTrPage, getTrFigs, getBodyFh, linkService]);
@@ -574,6 +632,13 @@ export default function App() {
   const [shortcutsOpen, setShortcutsOpen] = useState(false);
   // ---- «О pdfer» (WP-F): версия, приватность, лицензии ----
   const [aboutOpen, setAboutOpen] = useState(false);
+  // ---- Настройки (WP-L): Ctrl+, / меню / глиф в тулбаре библиотеки ----
+  const [settingsOpen, setSettingsOpen] = useState(false);
+  // кегль текста перевода при 100% (persisted); питает --tr-font-size на корне
+  const [trFont, setTrFont] = useState(() => {
+    const v = parseFloat(localStorage.getItem("pdfer:trfont") ?? "");
+    return Number.isFinite(v) && v >= TR_FONT_MIN && v <= TR_FONT_MAX ? v : TR_FONT_DEFAULT;
+  });
   // ---- page-navigation flyout (indicator click: go-to-page + оглавление) ----
   const [navOpen, setNavOpen] = useState(false);
   // ---- «Перевод» dropdown menu ----
@@ -592,10 +657,12 @@ export default function App() {
   const [viewMode, setViewMode] = useState<ViewMode>("orig");
   // store meta for the toolbar: null = no stored translation for this book
   const [trInfo, setTrInfo] = useState<{ done: number; total: number } | null>(null);
-  const [trRun, setTrRun] = useState(false);
-  const [trEta, setTrEta] = useState<number | undefined>(undefined);
-  // engine is waiting out a model outage (auto-resumes on health recovery)
-  const [trStall, setTrStall] = useState(false);
+  // active background run for the OPEN book only (Р-6: runs are path-keyed in
+  // booktranslate's manager and outlive the doc; other books' runs are
+  // invisible here — the toolbar reflects only the matching book)
+  const [run, setRun] = useState<booktranslate.RunInfo | null>(null);
+  // a run somewhere (any book) is waiting out a model outage → sticky toast
+  const [anyStall, setAnyStall] = useState(false);
   // startTr is waiting for a "starting" model to come up (auto-starts then)
   const [trWait, setTrWait] = useState(false);
   const trWaitRef = useRef(false);
@@ -613,8 +680,6 @@ export default function App() {
   // bumped whenever trStoreRef content changes — tr-mode Pages re-read overlays
   const [trVersion, setTrVersion] = useState(0);
   const trStoreRef = useRef<booktranslate.BookTranslation | null>(null);
-  const trRunRef = useRef<AbortController | null>(null);
-  const trPromiseRef = useRef<Promise<unknown> | null>(null);
   const viewModeRef = useRef(viewMode);
   viewModeRef.current = viewMode;
   const trAvailRef = useRef(false);
@@ -635,6 +700,8 @@ export default function App() {
   shortcutsRef.current = shortcutsOpen;
   const aboutRef = useRef(aboutOpen);
   aboutRef.current = aboutOpen;
+  const settingsRef = useRef(settingsOpen);
+  settingsRef.current = settingsOpen;
   const navOpenRef = useRef(navOpen);
   navOpenRef.current = navOpen;
   const docRef = useRef<PDFDocumentProxy | null>(null);
@@ -665,7 +732,7 @@ export default function App() {
   //   __pdferDev.startBookTranslation(__pdferDev.doc, __pdferDev.path, { pageLimit: 3 })
   useEffect(() => {
     if (!import.meta.env.DEV) return;
-    (window as unknown as Record<string, unknown>).__pdferDev = { doc, path, ...booktranslate, ...glossarygen };
+    (window as unknown as Record<string, unknown>).__pdferDev = { doc, path, ...booktranslate, ...glossarygen, ...exportmod };
   }, [doc, path]);
 
   // dev-only: auto-start/resume the book translation when a marker file
@@ -693,7 +760,7 @@ export default function App() {
         await dbg("marker matched, scheduling startTr");
         setTimeout(() => {
           if (stale) return void dbg("stale at timeout");
-          if (trRunRef.current) return void dbg("trRunRef busy at timeout");
+          if (booktranslate.getRun(path)) return void dbg("run busy at timeout");
           dbg("calling startTr");
           startTr();
         }, 1500);
@@ -766,6 +833,36 @@ export default function App() {
   const getTrPage = useCallback((n: number) => trStoreRef.current?.pages[n], []);
   const getTrFigs = useCallback((n: number) => trStoreRef.current?.figures[n] ?? [], []);
   const getBodyFh = useCallback(() => trStoreRef.current?.bodyFh ?? 0, []);
+
+  // Mirror the path-keyed run manager (Р-6). The open book's run feeds the
+  // toolbar; every progress step of THAT run re-reads the freshly written
+  // store (visible pages gain their translation live), and the run ending —
+  // pause or completion — re-reads once more for the final meta. Other books'
+  // background runs pass through as no-ops (both setStates bail on equality).
+  useEffect(() => {
+    const p = path;
+    let prevDone = -2; // impossible marker: the first change always syncs
+    const sync = () => {
+      const r = p ? booktranslate.getRun(p) : undefined;
+      setRun(r ? { ...r } : null);
+      setAnyStall(booktranslate.listRuns().some((x) => x.stalled));
+      if (!p) return;
+      const d = r ? r.done : -1; // -1 = no active run for this book
+      if (d === prevDone) return;
+      const hadRun = prevDone >= 0;
+      prevDone = d;
+      if (!r && !hadRun) return; // initial store load belongs to loadBytes
+      booktranslate.loadBookTranslation(p).then((st) => {
+        if (st && pathRef.current === p) {
+          trStoreRef.current = st;
+          setTrInfo({ done: st.donePages.length, total: st.total });
+          setTrVersion((v) => v + 1);
+        }
+      });
+    };
+    sync();
+    return booktranslate.onRunsChange(sync);
+  }, [path]);
 
   // «Перевод» menu: click outside closes (capture, same pattern as the
   // popover); closing always disarms the restart confirm
@@ -950,21 +1047,22 @@ export default function App() {
     setView(viewModeRef.current === "tr" ? "orig" : "tr");
   }, [setView, showNotice]);
 
-  // One-button whole-book translation. Pause = abort: progress is persisted per
-  // page by the engine, so pressing the button again later resumes for free
-  // (donePages are skipped). Runs with concurrency 3 of the server's 4 slots —
-  // selection translate stays responsive on the free slot.
+  // One-button whole-book translation. The run itself lives in booktranslate's
+  // path-keyed manager (Р-6): it opens its own doc, keeps going when the book
+  // is closed or another one is opened, and pause = stopRun (per-page store
+  // persistence makes resume free — donePages are skipped). Concurrency 3 of
+  // the server's 4 slots — selection translate stays responsive on the spare.
   // Gated: a run only ever starts against a live model. "starting" is waited
   // out (auto-start on ready), "none"/"dead" surface the reason instead of
   // fake-succeeding (WP-B routes these into the model-setup flow), and a book
   // with no text layer never starts a run at all.
   const startTr = useCallback(async () => {
-    if (!doc || !path || trRunRef.current || trWaitRef.current) return;
+    if (!doc || !path || booktranslate.getRun(path) || trWaitRef.current) return;
     if ((await hasTextProbeRef.current) === false) {
       if (pathRef.current === path) showNotice("В книге нет текстового слоя — нужен OCR");
       return;
     }
-    if (pathRef.current !== path || trRunRef.current) return; // book changed during the probe
+    if (pathRef.current !== path || booktranslate.getRun(path)) return; // book changed during the probe
     let status = await fetchModelStatus();
     if (status === "starting") {
       trWaitRef.current = true;
@@ -972,7 +1070,7 @@ export default function App() {
       try {
         while (status === "starting") {
           await new Promise((r) => setTimeout(r, 2000));
-          if (pathRef.current !== path || trRunRef.current) return;
+          if (pathRef.current !== path || booktranslate.getRun(path)) return;
           status = await fetchModelStatus();
         }
       } finally {
@@ -980,7 +1078,7 @@ export default function App() {
         setTrWait(false);
       }
     }
-    if (pathRef.current !== path || trRunRef.current) return;
+    if (pathRef.current !== path || booktranslate.getRun(path)) return;
     if (status !== "spawned" && status !== "external") {
       // none/dead: no honest run possible — route into the model setup flow
       // (license + download / «Перезапустить») instead of a dead-end toast
@@ -988,59 +1086,21 @@ export default function App() {
       setSetupOpen(true);
       return;
     }
-    const ctrl = new AbortController();
-    trRunRef.current = ctrl;
-    setTrRun(true);
-    trPromiseRef.current = booktranslate
-      .startBookTranslation(doc, path, {
-        signal: ctrl.signal,
-        onStall: (stalled) => {
-          if (trRunRef.current === ctrl) setTrStall(stalled);
-        },
-        onProgress: (p) => {
-          if (trRunRef.current !== ctrl) return;
-          setTrInfo({ done: p.donePages, total: p.total });
-          setTrEta(p.etaMs);
-          // refresh page data from the just-written store (a page completes
-          // every ~10-30s; the reload is cheap next to that)
-          booktranslate.loadBookTranslation(path).then((st) => {
-            if (st && pathRef.current === path) {
-              trStoreRef.current = st;
-              setTrVersion((v) => v + 1);
-            }
-          });
-        },
-      })
-      .then((st) => {
-        // resolves on natural completion AND on abort (partial store)
-        if (pathRef.current === path) {
-          trStoreRef.current = st;
-          setTrInfo({ done: st.donePages.length, total: st.total });
-          setTrVersion((v) => v + 1);
-        }
-      })
-      .catch((e) => console.error("book translation failed", e))
-      .finally(() => {
-        if (trRunRef.current === ctrl) {
-          trRunRef.current = null;
-          setTrRun(false);
-          setTrEta(undefined);
-          setTrStall(false);
-        }
-      });
+    // rejects only when the book file cannot be re-opened for the run's doc
+    booktranslate.startRun(path).catch(() => {
+      if (pathRef.current === path) showNotice(OPEN_FAIL_MSG);
+    });
   }, [doc, path, showNotice]);
 
   // «Перевести заново» (glossary modal): drop the store, restart from page 1
   const retranslate = useCallback(async () => {
     if (!path) return;
     setGlossOpen(false);
-    trRunRef.current?.abort();
-    await trPromiseRef.current; // let a running pipeline settle before deleting
+    await booktranslate.stopRun(path); // let a running pipeline settle before deleting
     await booktranslate.deleteBookTranslation(path).catch(() => {});
     if (pathRef.current !== path) return;
     trStoreRef.current = null;
     setTrInfo(null);
-    setTrEta(undefined);
     setView("orig");
     setTrVersion((v) => v + 1);
     startTr();
@@ -1055,6 +1115,9 @@ export default function App() {
           scrollTop: el.scrollTop,
           scale: scaleRef.current,
           progress: Math.min(1, el.scrollTop / Math.max(1, el.scrollHeight - el.clientHeight)),
+          // recency feeds the library's «Читаю» ordering; refreshed on every
+          // save so active reading keeps the book on top
+          lastOpened: Date.now(),
         }),
       );
     }
@@ -1076,6 +1139,12 @@ export default function App() {
   }, [savePos]);
 
   const loadBytes = useCallback(async (bytes: Uint8Array, key: string, title: string) => {
+    // Content identity first (WP-M): pdf.js transfers `bytes` to its worker
+    // below, and binding is what re-attaches a moved/renamed file to its
+    // translation store; glossary hydration (localStorage → appdata file)
+    // rides the same moment, ahead of the store read and the popover.
+    await booktranslate.bindBook(key, bytes).catch(() => {});
+    void hydrateGlossary(key);
     const d = await pdfjs.getDocument({
       data: bytes,
       cMapUrl: "/cmaps/",
@@ -1088,10 +1157,12 @@ export default function App() {
     const vp = p1.getViewport({ scale: 1 });
 
     const saved = localStorage.getItem(`pdfer:pos:${key}`);
-    const pos = saved ? (JSON.parse(saved) as { scrollTop: number; scale: number }) : null;
+    // the pos record can be partial: loadFile stamps { lastOpened } before the
+    // first scroll-save ever writes scrollTop/scale — guard each field
+    const pos = saved ? (JSON.parse(saved) as { scrollTop?: number; scale?: number }) : null;
 
-    // switching books: stop any running translation, load the new book's store
-    trRunRef.current?.abort();
+    // switching books: the previous book's run (if any) keeps going in the
+    // background (Р-6 — the manager owns its doc); only swap per-book UI state
     setFindOpen(false); // find state is per book
     setFindSeed(null);
     setNavOpen(false);
@@ -1099,7 +1170,6 @@ export default function App() {
     setAskSeed(null); // a stale seed must not leak into the next book's sidebar
     trStoreRef.current = null;
     setTrInfo(null);
-    setTrEta(undefined);
     setViewMode(localStorage.getItem(`pdfer:view:${key}`) === "tr" ? "tr" : "orig");
     pathRef.current = key; // ahead of render, for the async loads' staleness guards
     booktranslate.loadBookTranslation(key).then((st) => {
@@ -1147,10 +1217,11 @@ export default function App() {
       document.title = title;
     }
 
-    if (pos) {
+    if (pos && typeof pos.scrollTop === "number") {
+      const top = pos.scrollTop;
       requestAnimationFrame(() =>
         requestAnimationFrame(() => {
-          if (scrollRef.current) scrollRef.current.scrollTop = pos.scrollTop;
+          if (scrollRef.current) scrollRef.current.scrollTop = top;
         }),
       );
     }
@@ -1160,12 +1231,26 @@ export default function App() {
     const bytes = await readFile(p);
     await loadBytes(bytes, p, p.split(/[\\/]/).pop() ?? "pdfer");
     localStorage.setItem("pdfer:last", p);
+    // recency stamp for the library's «Читаю» row — merged into the existing
+    // pos record so a book opened but never scrolled still counts as opened
+    try {
+      const k = `pdfer:pos:${p}`;
+      const pos = JSON.parse(localStorage.getItem(k) ?? "{}") as Record<string, unknown>;
+      pos.lastOpened = Date.now();
+      localStorage.setItem(k, JSON.stringify(pos));
+    } catch {
+      // corrupt pos record — the next savePos rewrites it wholesale
+    }
   }, [loadBytes]);
 
   const openDialog = useCallback(async () => {
     const p = await open({ multiple: false, filters: [{ name: "PDF", extensions: ["pdf"] }] });
-    if (typeof p === "string") loadFile(p).catch((e) => console.error("open failed", e));
-  }, [loadFile]);
+    if (typeof p === "string")
+      loadFile(p).catch((e) => {
+        console.error("open failed", e);
+        showNotice(OPEN_FAIL_MSG);
+      });
+  }, [loadFile, showNotice]);
 
   // reopen last book on start; ?test=<url> loads a PDF over HTTP (browser-based UI debugging)
   useEffect(() => {
@@ -1177,8 +1262,12 @@ export default function App() {
       return;
     }
     const last = localStorage.getItem("pdfer:last");
-    if (last) loadFile(last).catch(() => localStorage.removeItem("pdfer:last"));
-  }, [loadFile, loadBytes]);
+    if (last)
+      loadFile(last).catch(() => {
+        localStorage.removeItem("pdfer:last");
+        showNotice(OPEN_FAIL_MSG); // the book moved/vanished since last session
+      });
+  }, [loadFile, loadBytes, showNotice]);
 
   const zoomTo = useCallback(
     (next: number) => {
@@ -1212,10 +1301,10 @@ export default function App() {
 
   const closeBook = useCallback(() => {
     savePos();
-    trRunRef.current?.abort(); // the doc proxy is about to be destroyed
+    // an active run is NOT aborted (Р-6): it owns its own doc and keeps
+    // translating in the background — the library card shows its chip
     trStoreRef.current = null;
     setTrInfo(null);
-    setTrEta(undefined);
     setHasText(null);
     hasTextProbeRef.current = null;
     pathRef.current = null;
@@ -1246,6 +1335,70 @@ export default function App() {
       return !d;
     });
   }, []);
+
+  // явная установка темы (сегмент в настройках; toggleDark остаётся для D)
+  const setTheme = useCallback((d: boolean) => {
+    localStorage.setItem("pdfer:dark", d ? "1" : "0");
+    setDark(d);
+  }, []);
+
+  // кегль перевода: клампится и сохраняется; CSS-переменная на корне применяет
+  // его к каждой .trPage мгновенно (чистый reflow, без ре-рендера страниц)
+  const setTrFontPersist = useCallback((px: number) => {
+    const v = Math.min(TR_FONT_MAX, Math.max(TR_FONT_MIN, Math.round(px * 2) / 2));
+    localStorage.setItem("pdfer:trfont", String(v));
+    setTrFont(v);
+  }, []);
+
+  // Настройки → «Удалить переводы» (все или одну книгу): файлы уже стёрты —
+  // сбросить зеркало открытой книги, чтобы меню и тулбар не показывали
+  // несуществующий store; удаление ДРУГОЙ книги открытую не трогает
+  const onTranslationsCleared = useCallback((p?: string) => {
+    if (p && p !== pathRef.current) return;
+    trStoreRef.current = null;
+    setTrInfo(null);
+    setViewMode("orig");
+    setTrVersion((v) => v + 1);
+  }, []);
+
+  // «Экспортировать перевод…» (WP-L, Р-9): диалог сохранения решает формат
+  // (TXT/HTML); HTML собирает кропы фигур из собственного рендера — прогресс
+  // идёт в тост, финал называет результат тем же именем, что и пункт меню
+  const exportBusyRef = useRef(false);
+  const exportTr = useCallback(async () => {
+    const p = pathRef.current;
+    if (!p || exportBusyRef.current) return;
+    let title = p.split(/[\\/]/).pop()?.replace(/\.pdf$/i, "") ?? "перевод";
+    try {
+      const idx = JSON.parse(localStorage.getItem("pdfer:books") ?? "{}") as Record<string, { title?: string }>;
+      title = (idx[p]?.title ?? "").trim() || title;
+    } catch {
+      // индекса нет — остаётся имя файла
+    }
+    exportBusyRef.current = true;
+    try {
+      const res = await exportTranslation(p, title, (done, total) => {
+        if (done === total || done % 5 === 0) showNotice(`Экспорт… ${Math.floor((100 * done) / total)}%`);
+      });
+      if (res === "saved") showNotice("Перевод сохранён");
+      else if (res === "cancelled") setNotice(null); // диалог закрыт — тихо
+    } catch (e) {
+      console.error("export failed", e);
+      showNotice("Не удалось экспортировать перевод");
+    } finally {
+      exportBusyRef.current = false;
+    }
+  }, [showNotice]);
+
+  // the OS-side window chrome (titlebar) follows the app theme (WP-K); also
+  // runs once on start so a persisted dark theme gets a dark titlebar
+  useEffect(() => {
+    try {
+      getCurrentWindow().setTheme(dark ? "dark" : "light").catch(() => {});
+    } catch {
+      // plain browser (vite dev) — no Tauri
+    }
+  }, [dark]);
 
   const setColsMode = useCallback((c: Cols) => {
     localStorage.setItem("pdfer:cols", String(c));
@@ -1288,9 +1441,11 @@ export default function App() {
       }
       // «?» / Ctrl+/ — все клавиши одним экраном
       else if (ctrl && e.code === "Slash") { e.preventDefault(); setPaletteOpen(false); setShortcutsOpen((o) => !o); }
+      // Ctrl+, — настройки (WP-L)
+      else if (ctrl && e.code === "Comma") { e.preventDefault(); setSettingsOpen((o) => !o); }
       else if (!ctrl && !e.altKey && !typing && e.key === "?") { e.preventDefault(); setPaletteOpen(false); setShortcutsOpen((o) => !o); }
       // bare-letter hotkeys stay live while the «Перевод» menu is open — it has
-      // no text inputs, and T visibly flips the menu's own Ориг/Перевод row
+      // no text inputs, and T visibly flips the pill's Ориг|Перевод segment
       else if (!ctrl && !e.altKey && !typing && e.code === "KeyD") toggleDark();
       else if (!ctrl && !e.altKey && !typing && e.code === "KeyT") toggleView();
       // Alt+←/→ — jump history (link/outline/go-to-page jumps record positions)
@@ -1333,12 +1488,13 @@ export default function App() {
       }
       else if (e.key === "Escape") {
         // Esc peels UI layers before closing the book:
-        // палитра → шорткаты → «О pdfer» → оглавление → меню → модель → глоссарий → перевод → поиск → сайдбар (только при фокусе в нём) → выделение
+        // палитра → шорткаты → «О pdfer» → настройки → оглавление → меню → модель → глоссарий → перевод → поиск → сайдбар (только при фокусе в нём) → выделение
         // (Esc typed INSIDE the find/page/palette inputs is handled there and never reaches this chain)
         const ae = document.activeElement as HTMLElement | null;
         if (paletteRef.current) setPaletteOpen(false);
         else if (shortcutsRef.current) setShortcutsOpen(false);
         else if (aboutRef.current) setAboutOpen(false);
+        else if (settingsRef.current) setSettingsOpen(false);
         else if (navOpenRef.current) setNavOpen(false);
         else if (menuRef.current) setMenuOpen(false);
         else if (setupRef.current) setSetupOpen(false);
@@ -1401,6 +1557,8 @@ export default function App() {
   const nColsEff = doc ? Math.min(nCols, doc.numPages) : nCols;
 
   const trPct = trInfo ? Math.floor((100 * trInfo.done) / Math.max(1, trInfo.total)) : 0;
+  // active background run for the OPEN book (mirrored from the manager)
+  const trRun = run !== null;
 
   // Ctrl+K commands — every action already in the UI, one name each, with its
   // key as the hint (the palette doubles as the cheat-sheet). Built only while
@@ -1425,7 +1583,9 @@ export default function App() {
           id: "trpause",
           label: "Приостановить перевод",
           keywords: "пауза pause стоп",
-          run: () => trRunRef.current?.abort(),
+          run: () => {
+            if (path) void booktranslate.stopRun(path);
+          },
         });
       else if (trInfo === null ? hasText !== false : trInfo.done < trInfo.total)
         paletteCommands.push({
@@ -1433,6 +1593,13 @@ export default function App() {
           label: trInfo === null ? "Перевести книгу" : `Продолжить перевод · ${trPct}%`,
           keywords: "translate перевод книга",
           run: startTr,
+        });
+      if (trInfo !== null && trInfo.done > 0)
+        paletteCommands.push({
+          id: "export",
+          label: "Экспортировать перевод…",
+          keywords: "экспорт сохранить export txt html",
+          run: exportTr,
         });
       paletteCommands.push(
         { id: "gloss", label: "Глоссарий…", keywords: "термины glossary", run: () => setGlossOpen(true) },
@@ -1452,36 +1619,56 @@ export default function App() {
       { id: "open", label: "Открыть файл…", hint: "Ctrl+O", keywords: "open file pdf", run: openDialog },
       { id: "dark", label: dark ? "Светлая тема" : "Тёмная тема", hint: "D", keywords: "тема theme dark light", run: toggleDark },
       { id: "keys", label: "Клавиши", hint: "?", keywords: "шорткаты клавиатура shortcuts помощь help", run: () => setShortcutsOpen(true) },
+      { id: "settings", label: "Настройки…", hint: "Ctrl+,", keywords: "настройки settings тема размер модели хранилище", run: () => setSettingsOpen(true) },
       { id: "about", label: "О pdfer", keywords: "версия лицензии приватность about version license", run: () => setAboutOpen(true) },
     );
   }
 
-  // sticky engine states outrank the transient notice; stall clears itself on recovery
-  const toastMsg = trStall
+  // sticky engine states outrank the transient notice; stall clears itself on
+  // recovery. anyStall covers BACKGROUND runs too — a model outage while the
+  // library (or another book) is on screen must not fail silently.
+  const toastMsg = anyStall
     ? "Модель недоступна — перевод приостановлен, готовые страницы сохранены"
     : trWait
       ? "Модель запускается… Перевод начнётся автоматически"
       : notice;
 
   return (
-    <div className={`${dark ? "dark" : ""} h-screen w-screen overflow-hidden bg-neutral-200 dark:bg-neutral-900 transition-colors`}>
+    /* no transition-colors on the root: the theme switches everywhere in the
+       same instant — a lone animated surface reads as a glitch (WP-K) */
+    <div
+      className={`${dark ? "dark" : ""} h-screen w-screen overflow-hidden bg-neutral-200 dark:bg-neutral-900`}
+      // кегль перевода (WP-L): каждая .trPage читает переменную, зум умножает
+      style={{ "--tr-font-size": `${trFont}px` } as React.CSSProperties}
+    >
       <div
-        className="toolbar fixed top-3 -translate-x-1/2 z-10 flex items-center gap-1 rounded-full bg-white/85 dark:bg-neutral-800/85 backdrop-blur px-3 py-1.5 shadow-lg text-sm text-neutral-700 dark:text-neutral-200 select-none transition-[left] duration-200"
+        className="toolbar fixed top-3 -translate-x-1/2 z-10 flex items-center gap-1 rounded-full bg-white/85 dark:bg-neutral-800/85 backdrop-blur px-3 py-1.5 shadow-lg text-sm text-neutral-700 dark:text-neutral-200 select-none transition-[left] duration-150"
         // stay centered over the READING area: shift by half the sidebar width
         style={{ left: doc && askOpen ? `calc(50% - ${ASK_W / 2}px)` : "50%" }}
       >
+        {/* run progress — 2px band along the pill's bottom edge; the trigger
+            label stays constant so the pill never resizes mid-run (WP-H) */}
+        {doc && trRun && trInfo && (
+          <span aria-hidden className="pointer-events-none absolute inset-0 overflow-hidden rounded-full">
+            <span
+              className="absolute bottom-0 left-0 h-0.5 bg-accent transition-[width] duration-300"
+              style={{ width: `${trPct}%` }}
+            />
+          </span>
+        )}
         {/* left: library */}
-        <button className="hover:opacity-60 px-1" onClick={doc ? closeBook : openDialog} title={doc ? "Библиотека (Esc)" : "Открыть файл (Ctrl+O)"}>
+        <button className={`${TB_BTN} px-1`} onClick={doc ? closeBook : openDialog} title={doc ? "Библиотека (Esc)" : "Открыть файл (Ctrl+O)"}>
           {doc ? "Библиотека" : "Открыть файл"}
         </button>
         {doc && (
           <>
-            <span className="mx-2 h-4 w-px bg-neutral-900/15 dark:bg-neutral-100/20" />
-            {/* center: view controls — pages · zoom · columns; the indicator
-                opens the go-to-page + оглавление flyout */}
+            {/* group «навигация»: Библиотека + страница; the indicator opens
+                the go-to-page + оглавление flyout. Width is reserved for the
+                widest page number so the pill never shifts while scrolling */}
             <span className="relative" data-pagenav>
               <button
-                className="tabular-nums opacity-70 hover:opacity-100 px-1 whitespace-nowrap"
+                className={`${TB_BTN} tabular-nums text-neutral-600 dark:text-neutral-300 hover:text-neutral-800 dark:hover:text-neutral-100 px-1 whitespace-nowrap text-center`}
+                style={{ minWidth: `calc(${2 * String(doc.numPages).length + 3}ch + 0.5rem)` }}
                 onClick={() => setNavOpen((o) => !o)}
                 title="Страница и оглавление"
               >
@@ -1498,26 +1685,51 @@ export default function App() {
                 />
               )}
             </span>
-            <span className="mx-2 opacity-40">·</span>
-            <button className="hover:opacity-60 px-1.5" onClick={() => zoomTo(scale - 0.125)} title="Мельче (Ctrl −)">−</button>
-            <span className="tabular-nums opacity-70 w-11 text-center">{Math.round(scale * 100)}%</span>
-            <button className="hover:opacity-60 px-1.5" onClick={() => zoomTo(scale + 0.125)} title="Крупнее (Ctrl +)">+</button>
-            <span className="mx-2 opacity-40">·</span>
-            {([1, 2, "auto"] as const).map((c) => (
-              <button
-                key={String(c)}
-                className={`hover:opacity-60 px-1.5 ${cols === c ? "" : "opacity-40"}`}
-                onClick={() => setColsMode(c)}
-                title={c === 1 ? "Одна страница в ряд (Ctrl+1)" : c === 2 ? "Две страницы в ряд (Ctrl+2)" : "Автоподбор по ширине (Ctrl+3)"}
-              >
-                {c === "auto" ? "Авто" : c}
-              </button>
-            ))}
             <span className="mx-2 h-4 w-px bg-neutral-900/15 dark:bg-neutral-100/20" />
-            {/* right: «Перевод» dropdown (trigger shows live % while running) */}
+            {/* group «вид»: масштаб · колонки · тема */}
+            <button className={`${TB_BTN} px-1.5`} onClick={() => zoomTo(scale - 0.125)} title="Мельче (Ctrl −)">−</button>
+            <span className="tabular-nums text-neutral-600 dark:text-neutral-300 w-11 text-center">{Math.round(scale * 100)}%</span>
+            <button className={`${TB_BTN} px-1.5`} onClick={() => zoomTo(scale + 0.125)} title="Крупнее (Ctrl +)">+</button>
+            <span className="ml-1 flex items-center gap-1">
+              {/* active column mode carries the accent — the app's one active color */}
+              {([1, 2, "auto"] as const).map((c) => (
+                <button
+                  key={String(c)}
+                  className={`${TB_BTN} px-1.5 py-0.5 ${cols === c ? "text-accent" : "text-neutral-500 dark:text-neutral-400"}`}
+                  onClick={() => setColsMode(c)}
+                  title={c === 1 ? "Одна страница в ряд (Ctrl+1)" : c === 2 ? "Две страницы в ряд (Ctrl+2)" : "Автоподбор по ширине (Ctrl+3)"}
+                >
+                  <IconColumns n={c === "auto" ? 3 : c} />
+                </button>
+              ))}
+            </span>
+            <button className={`${TB_BTN} ml-1 px-1 py-0.5`} onClick={toggleDark} title={dark ? "Светлая тема (D)" : "Тёмная тема (D)"}>
+              {dark ? <IconSun /> : <IconMoon />}
+            </button>
+            <span className="mx-2 h-4 w-px bg-neutral-900/15 dark:bg-neutral-100/20" />
+            {/* group «перевод+инструменты»: Ориг|Перевод сегмент (зеркалит T),
+                меню рана, «Спросить» */}
+            {trInfo !== null && (
+              <div className="flex gap-0.5 p-0.5 mr-1 rounded-full bg-neutral-100 dark:bg-neutral-900/50">
+                {(["orig", "tr"] as const).map((m) => (
+                  <button
+                    key={m}
+                    className={`rounded-full px-2 transition-colors ${
+                      viewMode === m
+                        ? "bg-white dark:bg-neutral-700 shadow-sm"
+                        : "text-neutral-500 dark:text-neutral-400 hover:bg-neutral-900/5 dark:hover:bg-neutral-100/10"
+                    }`}
+                    onClick={() => setView(m)}
+                    title={m === "orig" ? "Оригинал (T)" : "Перевод (T)"}
+                  >
+                    {m === "orig" ? "Оригинал" : "Перевод"}
+                  </button>
+                ))}
+              </div>
+            )}
             <span className="relative" data-trmenu>
               <button
-                className="hover:opacity-60 px-1 whitespace-nowrap tabular-nums"
+                className={`${TB_BTN} px-1 whitespace-nowrap`}
                 onClick={() => setMenuOpen((o) => !o)}
                 title="Перевод книги"
               >
@@ -1529,51 +1741,43 @@ export default function App() {
                     }`}
                   />
                 )}
-                {trRun ? `Перевод · ${trPct}%` : "Перевод"} <span className="text-[9px] opacity-60">▾</span>
+                Перевод <IconChevronDown className="ml-0.5" />
               </button>
               {menuOpen && (
-                <div className="absolute right-0 top-full mt-2.5 z-20 w-64 rounded-xl bg-white/95 dark:bg-neutral-800/95 backdrop-blur shadow-xl p-1.5 text-left">
-                  {/* Ориг|Перевод segmented — mirrors hotkey T */}
-                  <div className={`flex gap-0.5 p-0.5 rounded-lg bg-neutral-100 dark:bg-neutral-900/50 ${trInfo === null ? "opacity-40" : ""}`}>
-                    {(["orig", "tr"] as const).map((m) => (
-                      <button
-                        key={m}
-                        disabled={trInfo === null}
-                        className={`flex-1 rounded-md px-2 py-1 ${
-                          viewMode === m && trInfo !== null
-                            ? "bg-white dark:bg-neutral-700 shadow-sm"
-                            : trInfo === null
-                              ? "cursor-default"
-                              : "opacity-50 hover:opacity-90"
-                        }`}
-                        onClick={() => setView(m)}
-                        title={trInfo === null ? "Сначала переведите книгу" : m === "orig" ? "Оригинал (T)" : "Перевод (T)"}
-                      >
-                        {m === "orig" ? "Оригинал" : "Перевод"}
-                      </button>
-                    ))}
-                  </div>
-                  <div className="mt-1">
+                <div className="overlay-pop absolute right-0 top-full mt-2.5 z-20 w-64 rounded-xl bg-white/95 dark:bg-neutral-800/95 backdrop-blur shadow-xl p-1.5 text-left">
+                  <div>
                     {trRun ? (
-                      <button
-                        className={`${MENU_ROW} tabular-nums`}
-                        onClick={() => trRunRef.current?.abort()}
-                        title="Пауза — готовые страницы сохранены, продолжить можно в любой момент"
-                      >
-                        Пауза · {trPct}%{fmtEta(trEta)}
-                      </button>
+                      // копирайт #14: статус некликабелен, пауза — своя кнопка,
+                      // подпись постоянна (движок пишет каждую страницу сразу)
+                      <div className="px-2.5 py-1.5 select-none">
+                        <div className="tabular-nums">
+                          {trPct}%{run?.stalled ? " · модель недоступна" : fmtEta(run?.etaMs)}
+                        </div>
+                        <button
+                          className="mt-1 -mx-1 px-1 rounded transition-colors hover:bg-neutral-100 dark:hover:bg-neutral-700/70"
+                          onClick={() => {
+                            if (path) void booktranslate.stopRun(path);
+                          }}
+                        >
+                          Приостановить
+                        </button>
+                        <div className="mt-1 text-xs text-neutral-500 dark:text-neutral-400">Готовые страницы сохраняются</div>
+                      </div>
                     ) : trInfo === null ? (
                       hasText === false ? (
                         // scan: nothing to feed the model — honest refusal
                         // instead of an instantly-«done» empty translation
-                        <div className="px-2.5 py-1.5 opacity-50 cursor-default">
+                        <div className="px-2.5 py-1.5 text-neutral-500 dark:text-neutral-400 cursor-default">
                           В книге нет текстового слоя — нужен OCR
                         </div>
                       ) : (
                         <button
                           className={MENU_ROW}
-                          onClick={startTr}
-                          title="Перевести всю книгу локальной моделью (можно прервать в любой момент)"
+                          onClick={() => {
+                            setMenuOpen(false);
+                            startTr();
+                          }}
+                          title="Вся книга переводится офлайн, на вашем компьютере. Можно прервать в любой момент"
                         >
                           Перевести книгу
                         </button>
@@ -1581,31 +1785,38 @@ export default function App() {
                     ) : trInfo.done < trInfo.total ? (
                       <button
                         className={`${MENU_ROW} tabular-nums`}
-                        onClick={startTr}
+                        onClick={() => {
+                          setMenuOpen(false);
+                          startTr();
+                        }}
                         title={`Продолжить перевод (готово ${trInfo.done} из ${trInfo.total} страниц)`}
                       >
-                        Продолжить · {trPct}%
+                        Продолжить перевод · {trPct}%
                       </button>
                     ) : (
-                      <div className="px-2.5 py-1.5 opacity-50">Переведено · 100%</div>
+                      <div className="px-2.5 py-1.5 text-neutral-500 dark:text-neutral-400">Книга переведена</div>
                     )}
                     {/* деструктивное подтверждение (#11): следствие + кнопка,
                         называющая действие; «Перевести заново» (#13) */}
                     {trInfo !== null &&
                       (confirmRestart ? (
                         <div className="px-2.5 py-1.5">
-                          <div className="opacity-70">Готовый перевод будет удалён</div>
+                          <div className="text-neutral-600 dark:text-neutral-300">Готовый перевод будет удалён</div>
                           <div className="mt-1 flex flex-col items-start gap-1">
                             <button
-                              className="hover:opacity-60 text-red-600 dark:text-red-400"
+                              className="-mx-1 px-1 rounded text-red-600 dark:text-red-400 transition-colors hover:bg-red-500/10"
                               onClick={() => {
                                 setConfirmRestart(false);
+                                setMenuOpen(false);
                                 retranslate();
                               }}
                             >
                               Удалить и перевести заново
                             </button>
-                            <button className="hover:opacity-60" onClick={() => setConfirmRestart(false)}>
+                            <button
+                              className="-mx-1 px-1 rounded transition-colors hover:bg-neutral-100 dark:hover:bg-neutral-700/70"
+                              onClick={() => setConfirmRestart(false)}
+                            >
                               Отмена
                             </button>
                           </div>
@@ -1619,6 +1830,25 @@ export default function App() {
                           Перевести заново
                         </button>
                       ))}
+                    {/* экспорт (WP-L, Р-9): при частичном переводе — честная
+                        подпись, сколько страниц попадёт в файл */}
+                    {trInfo !== null && trInfo.done > 0 && (
+                      <button
+                        className={MENU_ROW}
+                        onClick={() => {
+                          setMenuOpen(false);
+                          exportTr();
+                        }}
+                        title="Сохранить перевод в TXT или HTML"
+                      >
+                        Экспортировать перевод…
+                        {trInfo.done < trInfo.total && (
+                          <div className="text-xs text-neutral-500 dark:text-neutral-400 tabular-nums">
+                            Готово {trInfo.done} из {trInfo.total} страниц
+                          </div>
+                        )}
+                      </button>
+                    )}
                     <button
                       className={MENU_ROW}
                       onClick={() => {
@@ -1635,7 +1865,7 @@ export default function App() {
                     <div className="mt-1 border-t border-neutral-200 dark:border-neutral-700 px-2.5 pt-1.5 pb-1 text-xs">
                       {dlBusy(dlMain) ? (
                         <button
-                          className="w-full text-left tabular-nums text-neutral-500 hover:opacity-70 dark:text-neutral-400"
+                          className={`${MENU_QUIET} tabular-nums`}
                           onClick={() => {
                             setMenuOpen(false);
                             setSetupOpen(true);
@@ -1645,21 +1875,21 @@ export default function App() {
                           Модель скачивается · {dlPct(dlMain)}%
                         </button>
                       ) : modelStatus === "starting" || (dlMain.status === "done" && !statusUp(modelStatus)) ? (
-                        <span className="flex items-center gap-1.5 opacity-50">
+                        <span className="flex items-center gap-1.5 text-neutral-500 dark:text-neutral-400">
                           <Spinner /> Модель перевода: запускается…
                         </span>
                       ) : statusUp(modelStatus) ? (
-                        <span className="opacity-50">Модель перевода: готова</span>
+                        <span className="text-neutral-500 dark:text-neutral-400">Модель перевода: готова</span>
                       ) : modelStatus === "dead" ? (
                         <button
-                          className="w-full text-left text-neutral-500 hover:opacity-70 dark:text-neutral-400"
+                          className={MENU_QUIET}
                           onClick={() => restartModel().then((s) => setModelStatus(s))}
                         >
                           Модель не отвечает · Перезапустить
                         </button>
                       ) : (
                         <button
-                          className="w-full text-left text-neutral-500 hover:opacity-70 dark:text-neutral-400"
+                          className={MENU_QUIET}
                           onClick={() => {
                             setMenuOpen(false);
                             setSetupOpen(true);
@@ -1670,10 +1900,19 @@ export default function App() {
                       )}
                     </div>
                   )}
-                  {/* «О pdfer» (WP-F): версия, приватность, лицензии */}
-                  <div className="mt-1 border-t border-neutral-200 dark:border-neutral-700 px-2.5 pt-1.5 pb-1 text-xs">
+                  {/* «Настройки» (WP-L) + «О pdfer» (WP-F) */}
+                  <div className="mt-1 flex flex-col gap-1 border-t border-neutral-200 dark:border-neutral-700 px-2.5 pt-1.5 pb-1 text-xs">
                     <button
-                      className="w-full text-left text-neutral-500 hover:opacity-70 dark:text-neutral-400"
+                      className={MENU_QUIET}
+                      onClick={() => {
+                        setMenuOpen(false);
+                        setSettingsOpen(true);
+                      }}
+                    >
+                      Настройки…
+                    </button>
+                    <button
+                      className={MENU_QUIET}
                       onClick={() => {
                         setMenuOpen(false);
                         setAboutOpen(true);
@@ -1685,17 +1924,23 @@ export default function App() {
                 </div>
               )}
             </span>
-            <span className="mx-2 opacity-40">·</span>
             {/* «Спросить»: chat sidebar over Claude, empty thread from here */}
-            <button className="hover:opacity-60 px-1" onClick={toggleAsk} title="Вопросы по книге (Ctrl+J)">
+            <button className={`${TB_BTN} px-1`} onClick={toggleAsk} title="Вопросы по книге (Ctrl+J)">
               Спросить
             </button>
           </>
         )}
-        <span className="mx-2 opacity-40">·</span>
-        <button className="hover:opacity-60 px-1" onClick={toggleDark} title="Тёмная тема (D)">
-          {dark ? "☀" : "☾"}
-        </button>
+        {!doc && (
+          <>
+            <button className={`${TB_BTN} px-1 py-0.5`} onClick={toggleDark} title={dark ? "Светлая тема (D)" : "Тёмная тема (D)"}>
+              {dark ? <IconSun /> : <IconMoon />}
+            </button>
+            {/* в читалке настройки живут в меню «Перевод»; здесь — свой глиф */}
+            <button className={`${TB_BTN} px-1 py-0.5`} onClick={() => setSettingsOpen(true)} title="Настройки (Ctrl+,)">
+              <IconSliders />
+            </button>
+          </>
+        )}
       </div>
 
       {/* Ctrl+F — sibling pill under the toolbar, same centering shift */}
@@ -1741,7 +1986,15 @@ export default function App() {
           </div>
         ) : (
           <div className="flex-1 min-w-0 h-full">
-            <Library onOpen={(p) => loadFile(p).catch((e) => console.error("open failed", e))} onAbout={() => setAboutOpen(true)} />
+            <Library
+              onOpen={(p) =>
+                loadFile(p).catch((e) => {
+                  console.error("open failed", e);
+                  showNotice(OPEN_FAIL_MSG);
+                })
+              }
+              onAbout={() => setAboutOpen(true)}
+            />
           </div>
         )}
         {/* mounted (hidden) while a book is open so an in-flight ask streams on across toggles */}
@@ -1796,12 +2049,27 @@ export default function App() {
       )}
       {setupOpen && <ModelSetupModal onClose={() => setSetupOpen(false)} />}
       {aboutOpen && <AboutModal onClose={() => setAboutOpen(false)} />}
+      {settingsOpen && (
+        <SettingsModal
+          dark={dark}
+          onTheme={setTheme}
+          trFont={trFont}
+          onTrFont={setTrFontPersist}
+          onTranslationsCleared={onTranslationsCleared}
+          onClose={() => setSettingsOpen(false)}
+        />
+      )}
       {paletteOpen && (
         <Palette
           commands={paletteCommands}
           numPages={doc?.numPages}
           currentPath={path}
-          onOpenBook={(p) => loadFile(p).catch((e) => console.error("open failed", e))}
+          onOpenBook={(p) =>
+            loadFile(p).catch((e) => {
+              console.error("open failed", e);
+              showNotice(OPEN_FAIL_MSG);
+            })
+          }
           onGoToPage={goToPage}
           onFind={
             doc
@@ -1817,7 +2085,7 @@ export default function App() {
       )}
       {shortcutsOpen && <ShortcutsOverlay onClose={() => setShortcutsOpen(false)} />}
       {toastMsg && (
-        <div className="fixed bottom-6 left-1/2 -translate-x-1/2 z-30 rounded-full bg-white/95 dark:bg-neutral-800/95 backdrop-blur px-4 py-2 shadow-xl text-sm text-neutral-700 dark:text-neutral-200 select-none pointer-events-none whitespace-nowrap">
+        <div className="overlay-pop fixed bottom-6 left-1/2 -translate-x-1/2 z-30 rounded-full bg-white/95 dark:bg-neutral-800/95 backdrop-blur px-4 py-2 shadow-xl text-sm text-neutral-700 dark:text-neutral-200 select-none pointer-events-none whitespace-nowrap">
           {toastMsg}
         </div>
       )}

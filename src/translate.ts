@@ -5,6 +5,11 @@
 //   contextual:     "{context}\n参考上面的信息，把下面的文本翻译成{lang}，注意不需要翻译上文，也不要额外解释：\n{text}"
 // The chat template lives in the GGUF, so plain messages:[{role:"user",...}] is correct transport.
 
+import { appDataDir } from "@tauri-apps/api/path";
+import { mkdir, readFile, remove, writeFile } from "@tauri-apps/plugin-fs";
+import { bookKey } from "./bookid";
+import { hash } from "./paragraphs";
+
 // Dev/test hook: lets a plain-browser engine run point at a controlled port
 // (e.g. a dead one, to exercise the outage path) without touching the real
 // server. Read once at module load; dead code in production builds.
@@ -49,16 +54,102 @@ export function isAuxUp(timeoutMs = 1200): Promise<boolean> {
   return healthOk(AUX_BASE, timeoutMs);
 }
 
-// ---- glossary storage: localStorage "pdfer:glossary:<bookPath>", one "термин = перевод" per line
+// ---- glossary storage (WP-M) ------------------------------------------------
+// Files under <appDataDir>\glossaries\<key>.txt, one "термин = перевод" per
+// line, named by the same durable content key as translation stores (path-hash
+// fallback until the book is bound) — a glossary survives the app profile,
+// localStorage eviction, and the book file moving. Access goes through a
+// session cache so the existing sync call sites keep working; hydrateGlossary
+// is awaited at book open (App.loadBytes) and at run start (booktranslate)
+// before any sync read matters. Entries written by earlier builds to
+// localStorage ("pdfer:glossary:<bookPath>") migrate to files on first
+// hydration. Plain-browser dev (?test=, no Tauri IPC) keeps the localStorage
+// flavor so the popover stays testable outside the webview.
+
+const IS_TAURI = typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
+const glossCache = new Map<string, string>();
+let glossDirP: Promise<string> | null = null;
+const glossDir = () => (glossDirP ??= appDataDir().then((d) => `${d}\\glossaries`));
+const glossFile = async (bookPath: string, key = bookKey(bookPath) ?? hash(bookPath)) =>
+  `${await glossDir()}\\${key}.txt`;
+const glossLsKey = (bookPath: string) => `pdfer:glossary:${bookPath}`;
+
+async function writeGlossFile(bookPath: string, text: string): Promise<void> {
+  if (text.trim()) {
+    await mkdir(await glossDir(), { recursive: true }).catch(() => {});
+    await writeFile(await glossFile(bookPath), new TextEncoder().encode(text));
+  } else {
+    await remove(await glossFile(bookPath)).catch(() => {});
+  }
+}
+
+async function readGlossFile(bookPath: string): Promise<string | null> {
+  try {
+    return new TextDecoder().decode(await readFile(await glossFile(bookPath)));
+  } catch {
+    // a pre-binding session may have saved under the path hash — adopt silently
+    if (bookKey(bookPath) === null || bookKey(bookPath) === hash(bookPath)) return null;
+    try {
+      const old = await glossFile(bookPath, hash(bookPath));
+      const text = new TextDecoder().decode(await readFile(old));
+      await writeGlossFile(bookPath, text);
+      await remove(old).catch(() => {});
+      return text;
+    } catch {
+      return null;
+    }
+  }
+}
+
+// Load the glossary into the session cache: appdata file first, else a
+// one-time migration out of localStorage (removed there only after the file
+// write succeeded — a failed migration loses nothing).
+export async function hydrateGlossary(bookPath: string): Promise<string> {
+  if (!IS_TAURI) return loadGlossaryText(bookPath);
+  const cached = glossCache.get(bookPath);
+  if (cached !== undefined) return cached;
+  let text = await readGlossFile(bookPath);
+  if (text === null) {
+    const legacy = localStorage.getItem(glossLsKey(bookPath));
+    if (legacy !== null) {
+      text = legacy;
+      try {
+        await writeGlossFile(bookPath, legacy);
+        localStorage.removeItem(glossLsKey(bookPath));
+      } catch (e) {
+        console.error("glossary migration failed", e);
+      }
+    }
+  }
+  const out = text ?? "";
+  glossCache.set(bookPath, out);
+  return out;
+}
 
 export function loadGlossaryText(bookPath: string): string {
-  return localStorage.getItem(`pdfer:glossary:${bookPath}`) ?? "";
+  if (!IS_TAURI) return localStorage.getItem(glossLsKey(bookPath)) ?? "";
+  // pre-hydration reads see the not-yet-migrated localStorage entry, not ""
+  return glossCache.get(bookPath) ?? localStorage.getItem(glossLsKey(bookPath)) ?? "";
 }
 
 export function saveGlossaryText(bookPath: string, text: string): void {
-  const key = `pdfer:glossary:${bookPath}`;
-  if (text.trim()) localStorage.setItem(key, text);
-  else localStorage.removeItem(key);
+  if (!IS_TAURI) {
+    if (text.trim()) localStorage.setItem(glossLsKey(bookPath), text);
+    else localStorage.removeItem(glossLsKey(bookPath));
+    return;
+  }
+  glossCache.set(bookPath, text);
+  writeGlossFile(bookPath, text).then(
+    () => localStorage.removeItem(glossLsKey(bookPath)), // both directions: the file is now the truth
+    (e) => {
+      console.error("glossary save failed", e);
+      try {
+        localStorage.setItem(glossLsKey(bookPath), text); // keep the text durable SOMEWHERE
+      } catch {
+        // quota — the session cache still holds it
+      }
+    },
+  );
 }
 
 // lenient line parse: "термин = перевод", also "->", "→", "—" as separators.

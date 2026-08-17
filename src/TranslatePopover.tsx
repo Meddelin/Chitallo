@@ -18,8 +18,14 @@ import {
   statusUp,
   useDownload,
 } from "./ModelSetup";
+import { IconClose } from "./icons";
 
 export type Anchor = { x: number; y: number };
+
+// pill controls: the app-wide hover grammar (WP-K) — quiet bg tint, no opacity dim
+const PILL_BTN = "rounded-md transition-colors hover:bg-neutral-900/5 dark:hover:bg-neutral-100/10";
+// inline text links: muted base, hover strengthens the color (same grammar as QUIET_LINK)
+const LINK_HOVER = "transition-colors hover:text-neutral-800 dark:hover:text-neutral-100";
 
 // popover-openings counter for the Alt+click footer hint (Н6, first 3 opens)
 const ALT_HINT_KEY = "pdfer:hint:altclick";
@@ -56,16 +62,16 @@ export function SelectionBar({
     <div
       ref={ref}
       data-selbar
-      className="fixed z-20 flex items-center gap-1 rounded-full bg-white/90 dark:bg-neutral-800/90 backdrop-blur px-2 py-1 shadow-lg text-sm text-neutral-700 dark:text-neutral-200 select-none"
+      className="overlay-pop fixed z-20 flex items-center gap-1 rounded-full bg-white/90 dark:bg-neutral-800/90 backdrop-blur px-2 py-1 shadow-lg text-sm text-neutral-700 dark:text-neutral-200 select-none"
       // preserve the text selection: never let the bar steal focus/collapse it
       onMouseDown={(e) => e.preventDefault()}
       onPointerDown={(e) => e.stopPropagation()}
     >
-      <button className="hover:opacity-60 px-1.5" onClick={onTranslate} title="Перевести выделенное (Enter)">
-        Перевести <span className="text-xs opacity-50">⏎</span>
+      <button className={`${PILL_BTN} px-1.5`} onClick={onTranslate} title="Перевести выделенное (Enter)">
+        Перевести <span className="text-xs text-neutral-500 dark:text-neutral-400">⏎</span>
       </button>
-      <span className="opacity-40">·</span>
-      <button className="hover:opacity-60 px-1.5" onClick={onAsk} title="Спросить Claude об этом фрагменте">
+      <span className="text-neutral-300 dark:text-neutral-600">·</span>
+      <button className={`${PILL_BTN} px-1.5`} onClick={onAsk} title="Спросить Claude об этом фрагменте">
         Спросить
       </button>
     </div>
@@ -180,44 +186,46 @@ export function TranslatePopover({
     <div
       ref={ref}
       data-popover
-      className="fixed z-30 w-max max-w-[26rem] rounded-xl bg-white/95 dark:bg-neutral-800/95 backdrop-blur shadow-xl text-sm text-neutral-800 dark:text-neutral-100"
+      className="overlay-pop fixed z-30 w-max max-w-[26rem] rounded-xl bg-white/95 dark:bg-neutral-800/95 backdrop-blur shadow-xl text-sm text-neutral-800 dark:text-neutral-100"
       onMouseDown={(e) => e.stopPropagation()}
     >
-      <div className="flex items-center gap-2 px-3 pt-2 text-xs text-neutral-400 dark:text-neutral-500 select-none">
+      <div className="flex items-center gap-2 px-3 pt-2 text-xs text-neutral-500 dark:text-neutral-400 select-none">
         <span>{label ?? "Перевод"}</span>
         <span className="flex-1" />
         {(phase === "done" || out) && (
-          <button className="hover:opacity-60" onClick={copy}>
-            {copied ? "скопировано" : "копировать"}
+          <button className={LINK_HOVER} onClick={copy}>
+            {copied ? "Скопировано" : "Копировать"}
           </button>
         )}
-        <button className="hover:opacity-60 px-0.5" onClick={onClose} title="Закрыть (Esc)">
-          ×
+        <button className={`${LINK_HOVER} px-0.5`} onClick={onClose} title="Закрыть (Esc)">
+          <IconClose />
         </button>
       </div>
       <div className="px-3 pb-2.5 pt-1 max-h-[45vh] overflow-y-auto leading-relaxed whitespace-pre-wrap">
         {phase === "starting" ? (
-          <span className="flex items-center gap-2 opacity-60">
+          <span className="flex items-center gap-2 text-neutral-500 dark:text-neutral-400">
             <Spinner /> Модель запускается… ≈20 с
           </span>
         ) : phase === "nomodel" ? (
           dlBusy(dl) ? (
-            <span className="opacity-60 tabular-nums">Модель скачивается · {dlProgressLine(dl)}</span>
+            <span className="text-neutral-500 dark:text-neutral-400 tabular-nums">
+              Модель скачивается · {dlProgressLine(dl)}
+            </span>
           ) : (
-            <div className="opacity-80">
+            <div className="text-neutral-600 dark:text-neutral-300">
               <div>Для перевода нужна модель — 4,6 ГБ, скачивается один раз, работает офлайн</div>
               {onSetup && (
-                <button className="mt-1.5 underline underline-offset-2 hover:opacity-60" onClick={onSetup}>
+                <button className={`mt-1.5 underline underline-offset-2 ${LINK_HOVER}`} onClick={onSetup}>
                   Скачать модель
                 </button>
               )}
             </div>
           )
         ) : phase === "dead" ? (
-          <div className="opacity-80">
+          <div className="text-neutral-600 dark:text-neutral-300">
             <div>Модель не отвечает</div>
             <button
-              className="mt-1.5 underline underline-offset-2 hover:opacity-60"
+              className={`mt-1.5 underline underline-offset-2 ${LINK_HOVER}`}
               onClick={() => {
                 void restartModel();
                 setAttempt((a) => a + 1);
@@ -227,10 +235,10 @@ export function TranslatePopover({
             </button>
           </div>
         ) : phase === "error" ? (
-          <div className="opacity-80">
+          <div className="text-neutral-600 dark:text-neutral-300">
             <div>Не удалось перевести. Попробуйте ещё раз</div>
             <button
-              className="mt-1.5 underline underline-offset-2 hover:opacity-60"
+              className={`mt-1.5 underline underline-offset-2 ${LINK_HOVER}`}
               onClick={() => setAttempt((a) => a + 1)}
             >
               Повторить
@@ -244,7 +252,7 @@ export function TranslatePopover({
         )}
       </div>
       {showAltHint && (
-        <div className="border-t border-neutral-200/70 dark:border-neutral-700/70 px-3 py-1.5 text-xs text-neutral-400 dark:text-neutral-500 select-none">
+        <div className="border-t border-neutral-200/70 dark:border-neutral-700/70 px-3 py-1.5 text-xs text-neutral-500 dark:text-neutral-400 select-none">
           Alt+клик по абзацу — перевод целиком
         </div>
       )}
@@ -302,6 +310,14 @@ async function ensureAux(signal: AbortSignal): Promise<boolean> {
   return false;
 }
 
+// glossary modal hierarchy (WP-J): ONE primary action — the same filled-button
+// idiom as ModelSetup's PRIMARY_BTN, compact; every other control is a quiet
+// link, and «Перевести заново» is a quiet secondary so it can never be read
+// as the modal's main verb.
+const GEN_BTN =
+  "inline-flex items-center gap-2 rounded-lg bg-neutral-900 px-3 py-1.5 text-[13px] font-medium text-white dark:bg-neutral-100 dark:text-neutral-900";
+const QUIET_LINK = "transition-colors hover:text-neutral-700 dark:hover:text-neutral-200 underline underline-offset-2";
+
 export function GlossaryModal({
   bookPath,
   doc,
@@ -354,17 +370,38 @@ export function GlossaryModal({
   // the local model translates only the term list (with sentence context).
   // MERGE semantics — every existing line survives (broken "term = ?" artifacts
   // excepted), only new terms appended — so re-clicks are idempotent and cancel
-  // keeps everything translated so far. «Собрать заново» reuses the same run:
-  // the confirmed rebuild clears the textarea first, so the merge base is empty
-  // and the result is a fresh list.
-  const runGen = useCallback(async () => {
+  // keeps everything translated so far. «Собрать заново» reuses the same run
+  // with fresh=true: the merge base is empty, so the RESULT replaces the list —
+  // the textarea itself is never cleared up front, and an early failure (no
+  // model, no terms) costs the user nothing.
+  const runGen = useCallback(async (fresh = false) => {
     if (!doc || genCtrl.current) return;
     const ctrl = new AbortController();
     genCtrl.current = ctrl;
     const devCap = import.meta.env.DEV
       ? Number((window as unknown as { __pdferGlossCap?: unknown }).__pdferGlossCap)
       : NaN;
+    // model gate — the shared vocabulary (#5/#6/#8): "starting" is waited out,
+    // none/dead surface an action instead of a dead-end message. Checked BEFORE
+    // the minutes-long extraction (WP-J: no model must fail in a second, not
+    // after the mining) and re-checked after it — the model can die meanwhile.
+    const modelGate = async (): Promise<boolean> => {
+      let ms = await fetchModelStatus();
+      while (ms === "starting") {
+        setGen({ phase: "modelwait" });
+        await sleep(2000, ctrl.signal);
+        ms = await fetchModelStatus();
+      }
+      if (statusUp(ms)) return true;
+      setGen(
+        ms === "dead"
+          ? { phase: "error", msg: "Модель не отвечает", action: "restart" }
+          : { phase: "error", msg: "Для перевода нужна модель — 4,6 ГБ, скачивается один раз", action: "setup" },
+      );
+      return false;
+    };
     try {
+      if (!(await modelGate())) return;
       setGen({ phase: "extract", done: 0, total: doc.numPages });
       const terms = await extractTerms(doc, {
         cap: Number.isFinite(devCap) && devCap > 0 ? devCap : undefined,
@@ -372,20 +409,7 @@ export function GlossaryModal({
         onProgress: (done, total) => setGen({ phase: "extract", done, total }),
       });
       if (!terms.length) return setGen({ phase: "error", msg: "В книге не нашлось характерных терминов" });
-      // model gate — the shared vocabulary (#5/#6/#8): "starting" is waited
-      // out, none/dead surface an action instead of a dead-end message
-      let ms = await fetchModelStatus();
-      while (ms === "starting") {
-        setGen({ phase: "modelwait" });
-        await sleep(2000, ctrl.signal);
-        ms = await fetchModelStatus();
-      }
-      if (!statusUp(ms))
-        return setGen(
-          ms === "dead"
-            ? { phase: "error", msg: "Модель не отвечает", action: "restart" }
-            : { phase: "error", msg: "Для перевода нужна модель — 4,6 ГБ, скачивается один раз", action: "setup" },
-        );
+      if (!(await modelGate())) return;
       // terminologist model: started on demand for this run, stopped in finally
       setGen({ phase: "auxstart" });
       const useAux = await ensureAux(ctrl.signal);
@@ -395,7 +419,8 @@ export function GlossaryModal({
         useAux,
         onProgress: (done, total) => setGen({ phase: "translate", done, total }),
       });
-      const base = closedRef.current ? loadGlossaryText(bookPath) : textRef.current;
+      // fresh (confirmed rebuild): empty base — the result replaces the list
+      const base = fresh ? "" : closedRef.current ? loadGlossaryText(bookPath) : textRef.current;
       const { text: merged, added } = mergeGlossary(base, pairs);
       if (closedRef.current) {
         saveGlossaryText(bookPath, merged); // modal closed mid-run — don't lose the work
@@ -405,7 +430,7 @@ export function GlossaryModal({
       }
     } catch {
       if (!ctrl.signal.aborted) setGen({ phase: "error", msg: "Не удалось собрать глоссарий. Попробуйте ещё раз" });
-      else if (!closedRef.current) setGen(null); // cancelled during extraction/aux start
+      else if (!closedRef.current) setGen(null); // cancelled before the translate phase
     } finally {
       genCtrl.current = null;
       // always free the aux model's VRAM — done, cancelled or failed alike
@@ -416,57 +441,59 @@ export function GlossaryModal({
 
   return (
     <div
-      className="fixed inset-0 z-40 flex items-center justify-center bg-black/30"
+      className="modal-backdrop fixed inset-0 z-40 flex items-center justify-center bg-black/30"
       onMouseDown={(e) => {
         if (e.target === e.currentTarget) onClose();
       }}
     >
-      <div className="rounded-xl bg-white dark:bg-neutral-800 shadow-2xl p-4 w-[min(30rem,90vw)] text-sm text-neutral-800 dark:text-neutral-100">
-        <div className="flex items-center mb-2 text-xs text-neutral-400 dark:text-neutral-500 select-none">
-          <span>Глоссарий — {bookPath.split(/[\\/]/).pop()}</span>
-          <span className="flex-1" />
-          <button className="hover:opacity-60 px-0.5" onClick={onClose} title="Закрыть (Esc)">
-            ×
+      <div className="modal-panel rounded-xl bg-white dark:bg-neutral-800 shadow-2xl p-4 w-[min(30rem,90vw)] text-sm text-neutral-800 dark:text-neutral-100">
+        {/* 14px medium title: the modal has a name; the filename is context */}
+        <div className="flex items-center gap-2 mb-2.5 select-none">
+          <span className="font-medium">Глоссарий</span>
+          <span className="min-w-0 flex-1 truncate text-xs text-neutral-400 dark:text-neutral-500">
+            {bookPath.split(/[\\/]/).pop()}
+          </span>
+          <button
+            className="px-0.5 text-neutral-500 dark:text-neutral-400 transition-colors hover:text-neutral-800 dark:hover:text-neutral-100"
+            onClick={onClose}
+            title="Закрыть (Esc)"
+          >
+            <IconClose />
           </button>
         </div>
         <textarea
           autoFocus
-          className="w-full h-64 resize-y rounded-lg bg-neutral-100 dark:bg-neutral-900 p-2.5 font-mono text-[13px] leading-relaxed outline-none"
-          placeholder={"термин = перевод, по строке"}
+          className="w-full h-64 resize-y rounded-lg bg-neutral-100 dark:bg-neutral-900 p-2.5 font-mono text-[13px] leading-relaxed outline-none focus:ring-2 focus:ring-accent/60 dark:focus:ring-accent/50"
+          placeholder={"attention = внимание\nпо одной паре на строку"}
           value={text}
           onChange={(e) => setText(e.target.value)}
         />
         {(doc || onRetranslate) && (
-          <div className="mt-2 flex items-center gap-2 text-xs text-neutral-400 dark:text-neutral-500 select-none">
+          <div className="mt-2.5 flex flex-wrap items-center gap-x-2.5 gap-y-1.5 text-xs text-neutral-500 dark:text-neutral-400 select-none">
             {doc &&
               (gen === null || gen.phase === "done" || gen.phase === "error" ? (
                 confirmRebuild ? (
-                  // rebuild replaces the whole list — inline confirm, same
-                  // pattern as «Перезапустить перевод» in the App menu
+                  // rebuild replaces the whole list — inline confirm (#12):
+                  // consequence + a button naming the action, never «да/нет»
                   <>
-                    <span>Заменить текущий глоссарий? Ручные правки будут потеряны</span>
+                    <span>Список будет заменён, ручные правки пропадут</span>
                     <button
-                      className="hover:text-neutral-600 dark:hover:text-neutral-300 underline underline-offset-2"
+                      className="text-red-600 dark:text-red-400 underline underline-offset-2 transition-colors hover:text-red-700 dark:hover:text-red-300"
                       onClick={() => {
                         setConfirmRebuild(false);
-                        setText(""); // fresh list: empty merge base, no old content
-                        runGen();
+                        runGen(true); // fresh run — the result replaces the list
                       }}
                     >
-                      да
+                      Заменить
                     </button>
-                    <span className="opacity-40">·</span>
-                    <button
-                      className="hover:text-neutral-600 dark:hover:text-neutral-300 underline underline-offset-2"
-                      onClick={() => setConfirmRebuild(false)}
-                    >
-                      нет
+                    <button className={QUIET_LINK} onClick={() => setConfirmRebuild(false)}>
+                      Отмена
                     </button>
                   </>
                 ) : (
                   <>
                     <button
-                      className="hover:text-neutral-600 dark:hover:text-neutral-300 underline underline-offset-2"
+                      className={`${GEN_BTN} transition-colors hover:bg-neutral-700 dark:hover:bg-white`}
                       title={
                         text.trim()
                           ? "Пересобрать глоссарий с нуля — текущий список будет заменён (с подтверждением)"
@@ -478,7 +505,6 @@ export function GlossaryModal({
                       {text.trim() ? "Собрать заново" : "Собрать глоссарий"}
                     </button>
                     <span
-                      className="opacity-80"
                       title={
                         gen?.phase === "done" && !gen.auxUsed
                           ? "Термины переведены основной моделью — качество может быть ниже"
@@ -492,16 +518,13 @@ export function GlossaryModal({
                           : gen.msg}
                     </span>
                     {gen?.phase === "error" && gen.action === "setup" && onSetup && (
-                      <button
-                        className="hover:text-neutral-600 dark:hover:text-neutral-300 underline underline-offset-2"
-                        onClick={onSetup}
-                      >
+                      <button className={QUIET_LINK} onClick={onSetup}>
                         Скачать модель
                       </button>
                     )}
                     {gen?.phase === "error" && gen.action === "restart" && (
                       <button
-                        className="hover:text-neutral-600 dark:hover:text-neutral-300 underline underline-offset-2"
+                        className={QUIET_LINK}
                         onClick={() => {
                           void restartModel();
                           setGen(null);
@@ -513,18 +536,24 @@ export function GlossaryModal({
                   </>
                 )
               ) : (
+                // the running state lives INSIDE the primary button — the modal
+                // keeps one clear main action whether idle or working; a click
+                // is a no-op (runGen's re-entry guard), cancel is explicit
                 <>
-                  <span className="tabular-nums">
-                    {gen.phase === "extract"
-                      ? `Поиск терминов… ${gen.done}/${gen.total}`
-                      : gen.phase === "modelwait"
-                        ? "Модель запускается… ≈20 с"
-                        : gen.phase === "auxstart"
-                          ? "Загрузка модели… (до 30 с)"
-                          : `Перевод терминов… ${gen.done}/${gen.total}`}
+                  <span className={`${GEN_BTN} cursor-default`} aria-busy="true">
+                    <Spinner />
+                    <span className="tabular-nums">
+                      {gen.phase === "extract"
+                        ? `Поиск терминов… ${gen.done}/${gen.total}`
+                        : gen.phase === "modelwait"
+                          ? "Модель запускается… ≈20 с"
+                          : gen.phase === "auxstart"
+                            ? "Загрузка модели… (до 30 с)"
+                            : `Перевод терминов… ${gen.done}/${gen.total}`}
+                    </span>
                   </span>
                   <button
-                    className="hover:text-neutral-600 dark:hover:text-neutral-300 underline underline-offset-2"
+                    className={QUIET_LINK}
                     onClick={() => genCtrl.current?.abort()}
                     title="Остановить — уже переведённые термины будут добавлены"
                   >
@@ -535,7 +564,7 @@ export function GlossaryModal({
             <span className="flex-1" />
             {onRetranslate && (
               <button
-                className="hover:text-neutral-600 dark:hover:text-neutral-300 underline underline-offset-2"
+                className="rounded-lg px-2.5 py-1.5 text-[13px] text-neutral-500 transition-colors hover:bg-neutral-100 hover:text-neutral-700 dark:text-neutral-400 dark:hover:bg-neutral-700/60 dark:hover:text-neutral-200"
                 title="Удалить сохранённый перевод книги и перевести заново с текущим глоссарием"
                 onClick={() => {
                   // the pipeline snapshots the glossary at start — save the
@@ -552,14 +581,11 @@ export function GlossaryModal({
         {/* optional Qwen terminologist (Р-3: user-initiated, license named);
             without it term translation falls back to the main model */}
         {showAuxOffer && (
-          <div className="mt-1.5 flex items-center gap-2 text-xs text-neutral-400 dark:text-neutral-500 select-none">
+          <div className="mt-1.5 flex items-center gap-2 text-xs text-neutral-500 dark:text-neutral-400 select-none">
             {dlBusy(auxDl) ? (
               <>
                 <span className="tabular-nums">Модель терминов: {dlProgressLine(auxDl)}</span>
-                <button
-                  className="hover:text-neutral-600 dark:hover:text-neutral-300 underline underline-offset-2"
-                  onClick={() => cancelDownload("aux")}
-                >
+                <button className={QUIET_LINK} onClick={() => cancelDownload("aux")}>
                   Отменить
                 </button>
               </>
@@ -570,10 +596,7 @@ export function GlossaryModal({
                     ? dlErrorLine(auxDl.error)
                     : `Перевод терминов точнее с дополнительной моделью — ${MODEL_META.aux.sizeLabel}, лицензия Apache-2.0`}
                 </span>
-                <button
-                  className="hover:text-neutral-600 dark:hover:text-neutral-300 underline underline-offset-2"
-                  onClick={() => startDownload("aux")}
-                >
+                <button className={QUIET_LINK} onClick={() => startDownload("aux")}>
                   {auxDl.received > 0 && (auxDl.status === "cancelled" || auxDl.status === "error")
                     ? `Продолжить · ${dlPct(auxDl)}%`
                     : "Скачать"}

@@ -22,7 +22,9 @@ export default defineConfig(async () => ({
         }
       : undefined,
     watch: {
-      ignored: ["**/src-tauri/**"],
+      // llama-bin holds multi-MB model-server binaries staged for the installer;
+      // watching them crashes chokidar (EBUSY) while they are being copied
+      ignored: ["**/src-tauri/**", "**/llama-bin/**"],
     },
   },
 }));

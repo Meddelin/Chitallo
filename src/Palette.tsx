@@ -8,6 +8,7 @@
 // palette, solid modal like GlossaryModal for the overlay).
 
 import { useEffect, useMemo, useRef, useState } from "react";
+import { IconClose } from "./icons";
 
 export type PaletteCommand = {
   id: string;
@@ -150,12 +151,12 @@ export function Palette({
   return (
     <div
       data-palette
-      className="fixed inset-0 z-50 flex items-start justify-center bg-black/20"
+      className="modal-backdrop fixed inset-0 z-50 flex items-start justify-center bg-black/20"
       onMouseDown={(e) => {
         if (e.target === e.currentTarget) onClose();
       }}
     >
-      <div className="mt-[16vh] w-[min(33rem,92vw)] rounded-xl bg-white/95 dark:bg-neutral-800/95 backdrop-blur shadow-xl text-sm text-neutral-800 dark:text-neutral-100 select-none">
+      <div className="overlay-pop mt-[16vh] w-[min(33rem,92vw)] rounded-xl bg-white/95 dark:bg-neutral-800/95 backdrop-blur shadow-xl text-sm text-neutral-800 dark:text-neutral-100 select-none">
         <input
           ref={inputRef}
           value={query}
@@ -170,7 +171,7 @@ export function Palette({
           className="border-t border-neutral-200 dark:border-neutral-700 max-h-[45vh] overflow-y-auto overscroll-contain p-1.5"
         >
           {rows.length === 0 ? (
-            <div className="px-2.5 py-1.5 opacity-50 cursor-default">Ничего не найдено</div>
+            <div className="px-2.5 py-1.5 text-neutral-500 dark:text-neutral-400 cursor-default">Ничего не найдено</div>
           ) : (
             rows.map((r, i) => (
               <button
@@ -186,8 +187,12 @@ export function Palette({
                 onClick={() => run(r)}
               >
                 <span className="flex-1 min-w-0 truncate">{r.label}</span>
-                {r.tag && <span className="shrink-0 text-xs opacity-40">{r.tag}</span>}
-                {r.hint && <span className="shrink-0 text-xs opacity-40 tabular-nums whitespace-nowrap">{r.hint}</span>}
+                {r.tag && <span className="shrink-0 text-xs text-neutral-500 dark:text-neutral-400">{r.tag}</span>}
+                {r.hint && (
+                  <span className="shrink-0 text-xs text-neutral-500 dark:text-neutral-400 tabular-nums whitespace-nowrap">
+                    {r.hint}
+                  </span>
+                )}
               </button>
             ))
           )}
@@ -225,6 +230,7 @@ const GROUPS: { name: string; rows: [string, string][] }[] = [
       ["Ctrl+K", "Палитра команд"],
       ["Ctrl+F", "Найти в книге"],
       ["Ctrl+O", "Открыть файл"],
+      ["Ctrl+,", "Настройки"],
       ["Esc", "Закрыть"],
       ["? / Ctrl+/", "Клавиши"],
     ],
@@ -244,27 +250,31 @@ export function ShortcutsOverlay({ onClose }: { onClose: () => void }) {
   return (
     <div
       data-shortcuts
-      className="fixed inset-0 z-50 flex items-center justify-center bg-black/30"
+      className="modal-backdrop fixed inset-0 z-50 flex items-center justify-center bg-black/30"
       onMouseDown={(e) => {
         if (e.target === e.currentTarget) onClose();
       }}
     >
-      <div className="rounded-xl bg-white dark:bg-neutral-800 shadow-2xl p-4 w-[min(36rem,92vw)] text-sm text-neutral-800 dark:text-neutral-100 select-none">
-        <div className="flex items-center mb-3 text-xs text-neutral-400 dark:text-neutral-500">
+      <div className="modal-panel rounded-xl bg-white dark:bg-neutral-800 shadow-2xl p-4 w-[min(36rem,92vw)] text-sm text-neutral-800 dark:text-neutral-100 select-none">
+        <div className="flex items-center mb-3 text-xs text-neutral-500 dark:text-neutral-400">
           <span>Клавиши</span>
           <span className="flex-1" />
-          <button className="hover:opacity-60 px-0.5" onClick={onClose} title="Закрыть (Esc)">
-            ×
+          <button
+            className="px-0.5 transition-colors hover:text-neutral-800 dark:hover:text-neutral-100"
+            onClick={onClose}
+            title="Закрыть (Esc)"
+          >
+            <IconClose />
           </button>
         </div>
         <div className="grid grid-cols-2 gap-x-10 gap-y-4">
           {GROUPS.map((g) => (
             <div key={g.name}>
-              <div className="mb-1 text-xs font-medium text-neutral-400 dark:text-neutral-500">{g.name}</div>
+              <div className="mb-1 text-xs font-medium text-neutral-500 dark:text-neutral-400">{g.name}</div>
               {g.rows.map(([keys, label]) => (
                 <div key={keys} className="flex items-center justify-between gap-3 py-[3px]">
                   <span className="text-neutral-600 dark:text-neutral-300">{label}</span>
-                  <span className="shrink-0 rounded-md bg-neutral-100 dark:bg-neutral-900/60 px-1.5 py-0.5 text-[11px] tabular-nums text-neutral-500 dark:text-neutral-400 whitespace-nowrap">
+                  <span className="shrink-0 rounded-md bg-neutral-100 dark:bg-neutral-900/60 px-1.5 py-0.5 text-[11px] tabular-nums text-neutral-600 dark:text-neutral-400 whitespace-nowrap">
                     {keys}
                   </span>
                 </div>

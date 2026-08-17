@@ -54,17 +54,52 @@ npm run tauri dev     # разработка (Vite + HMR)
 npm run tauri build   # релизная сборка и инсталлятор
 ```
 
-Инференс выполняет `llama-server.exe` (llama.cpp), который приложение ищет в
-`%APPDATA%\com.stas.pdfer\llama\llama-server.exe`; веса моделей лежат в
-`%APPDATA%\com.stas.pdfer\models\`. В дев-режиме llama-server кладётся туда
-вручную, веса можно скачать из приложения; в дистрибутив llama-server входит,
-веса скачивает само приложение.
+Инференс выполняет `llama-server.exe` (llama.cpp). В инсталлятор он входит
+как ресурс: перед сборкой скрипт `npm run stage-llama` (вызывается
+автоматически из `beforeBuildCommand`) копирует `llama-server.exe` и его
+DLL из `%APPDATA%\com.stas.pdfer\llama\` (источник переопределяется
+переменной `PDFER_LLAMA_SRC`) в gitignored-папку `llama-bin/`, откуда они
+попадают в ресурсы приложения (`<resources>\llama\`). Приложение сначала
+ищет `llama-server.exe` среди своих ресурсов, затем — в
+`%APPDATA%\com.stas.pdfer\llama\` (дев-режим и ручные установки). Веса
+моделей всегда в `%APPDATA%\com.stas.pdfer\models\` — их скачивает само
+приложение.
 
 Иконка генерируется из `src-tauri/icons/icon.svg`:
 
 ```sh
 npx tauri icon src-tauri/icons/icon.svg
 ```
+
+## Обновления
+
+Автообновление намеренно **выключено**: манифесту апдейтера нужен хостинг
+(решение Р-7 — статический манифест на своём домене), которого пока нет.
+Когда домен появится, включение — три шага:
+
+1. `src-tauri/Cargo.toml`: добавить `tauri-plugin-updater = "2"`, в
+   `src-tauri/src/lib.rs` — `.plugin(tauri_plugin_updater::Builder::new().build())`.
+2. `src-tauri/tauri.conf.json` — секция плагина (ключи генерирует
+   `npx tauri signer generate`; приватный ключ в CI-секрет, ни в коем случае
+   не в репозиторий):
+
+   ```jsonc
+   // добавить в корень конфига:
+   "plugins": {
+     "updater": {
+       "pubkey": "<публичный ключ из tauri signer generate>",
+       "endpoints": ["https://<домен>/pdfer/latest.json"]
+     }
+   }
+   ```
+
+3. `latest.json` на домене — статический манифест формата updater v2
+   (version, notes, pub_date, platforms."windows-x86_64".{signature, url});
+   собранный `*-setup.exe` подписывается тем же ключом при сборке.
+
+Подпись кода (SmartScreen) — отдельная задача владельца (решение Р-4):
+сертификат покупается, `certificateThumbprint`/`signCommand` добавляются в
+`bundle.windows` конфига.
 
 ## Технологии
 

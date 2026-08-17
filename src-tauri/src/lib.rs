@@ -162,6 +162,21 @@ fn set_status<S: LlamaSrv>(app: &tauri::AppHandle, s: &str) {
     *state.status().lock().unwrap() = s.into();
 }
 
+/// Resolve llama-server.exe: the copy bundled as an installer resource wins
+/// (решение Р-5 — the installer ships the engine, only weights are
+/// downloaded); the appData copy remains as a fallback for dev setups and
+/// manual installs. The DLLs live next to the exe either way, so spawning
+/// from the returned path always finds them.
+fn llama_server_exe(app: &tauri::AppHandle, data_dir: &Path) -> PathBuf {
+    if let Ok(res) = app.path().resource_dir() {
+        let bundled = res.join("llama").join("llama-server.exe");
+        if bundled.exists() {
+            return bundled;
+        }
+    }
+    data_dir.join("llama").join("llama-server.exe")
+}
+
 /// Spawn (or attach to) a llama-server instance for S. Blocking: run on a
 /// background thread. Status transitions:
 ///   model missing / exe missing -> "none"
@@ -179,7 +194,7 @@ fn init_llama_server<S: LlamaSrv>(app: tauri::AppHandle) {
         }
     };
     let model = data_dir.join("models").join(S::MODEL_FILE);
-    let exe = data_dir.join("llama").join("llama-server.exe");
+    let exe = llama_server_exe(&app, &data_dir);
 
     if !model.exists() {
         eprintln!("[{label}] model not found at {} -> status none", model.display());
@@ -1066,6 +1081,63 @@ fn model_download_status(
     Ok(DlStatus { running, file_ready, received, total: spec.size })
 }
 
+/// Delete a model's weights from disk (Settings → Модели). Frees the mmap
+/// lock first by killing the llama-server WE spawned for that model; an
+/// external instance (user-run, on the same port) is never touched — if it
+/// happens to hold this very file, the remove below fails and the error
+/// surfaces honestly. The .part of an interrupted download is removed too.
+/// Refused while a download for the model is in flight.
+#[tauri::command]
+fn delete_model(
+    app: tauri::AppHandle,
+    dls: tauri::State<'_, DownloadsState>,
+    model: String,
+    dest_dir: Option<String>,
+) -> Result<(), String> {
+    let spec = model_spec(&model).ok_or_else(|| format!("unknown model: {model}"))?;
+    if dls
+        .slots
+        .lock()
+        .unwrap()
+        .get(&model)
+        .map(|s| s.running)
+        .unwrap_or(false)
+    {
+        return Err("busy: download in progress".into());
+    }
+    let dir = resolve_models_dir(&app, dest_dir)?;
+
+    fn stop_spawned<S: LlamaSrv>(app: &tauri::AppHandle) {
+        let state = app.state::<S>();
+        let taken = state.child().lock().unwrap().take();
+        if let Some(mut child) = taken {
+            eprintln!(
+                "[{}] delete_model -> killing spawned llama-server pid {}",
+                S::LABEL,
+                child.id()
+            );
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        let mut status = state.status().lock().unwrap();
+        if status.as_str() != "external" {
+            *status = "none".into();
+        }
+    }
+    match model.as_str() {
+        "main" => stop_spawned::<TranslationState>(&app),
+        _ => stop_spawned::<AuxState>(&app),
+    }
+
+    let _ = std::fs::remove_file(dir.join(format!("{}.part", spec.file)));
+    let final_path = dir.join(spec.file);
+    if final_path.exists() {
+        std::fs::remove_file(&final_path).map_err(|e| format!("io:{e}"))?;
+        eprintln!("[dl:{model}] deleted {}", final_path.display());
+    }
+    Ok(())
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -1085,6 +1157,7 @@ pub fn run() {
             download_model,
             cancel_model_download,
             model_download_status,
+            delete_model,
             ask_claude,
             ask_claude_cancel
         ])
