@@ -11,7 +11,7 @@
 
 import type { PDFDocumentProxy } from "pdfjs-dist";
 import { clusterParagraphs } from "./paragraphs";
-import { translate } from "./translate";
+import { completeRaw, translate } from "./translate";
 
 export type ExtractedTerm = { term: string; freq: number; sample: string };
 export type TermPair = { term: string; tr: string };
@@ -21,7 +21,7 @@ const MIN_CAP_FREQ = 8; // capitalized-in-running-text unigrams
 const MAX_N = 4;
 const DEFAULT_CAP = 120;
 const PASS2_MULTI = 500; // multiword candidates carried into the form/sample pass
-const CONCURRENCY = 3; // llama-server n_slots=4 — keep one slot interactive
+const CONCURRENCY = 3; // worker count only — actual requests draw from the shared ≤3 budget in translate.ts
 
 // ---- stoplists --------------------------------------------------------------
 
@@ -416,9 +416,37 @@ function cleanTr(raw: string, term: string): string {
   return t;
 }
 
-// Translate the mined terms on the shared llama-server, ≤3 in flight. Each
-// term goes through the contextual template (segment = term, context = its
-// sample sentence, glossary empty). Failed/garbage → one retry → skipped.
+const words = (s: string) => s.split(/\s+/).filter(Boolean).length;
+
+// sanity gate: a TERM's translation is a term, not a sentence. The word-count
+// ratio catches whole-sample translations that a pure char limit lets through
+// for long multiword terms ("knowledge graphs = <целое предложение>"); the
+// char cap additionally stops space-free runaways (e.g. Chinese output).
+const plausible = (tr: string, term: string) =>
+  !!tr && words(tr) <= words(term) * 2 + 2 && tr.length <= Math.max(60, term.length * 4);
+
+// Retry framing for terms the contextual template fails to isolate: when the
+// segment is a short word contained in its own context (recall, IR, QAC…) the
+// model translates the whole sample instead of the term. An explicit English
+// instruction makes it NAME the term's translation; the model usually answers
+// with a restated sentence, so the actual translation is its LAST quoted span.
+const retryPrompt = (term: string, sample: string) =>
+  `In the sentence "${sample}", translate the term "${term}" into Russian. ` +
+  `Output only the Russian translation of "${term}", nothing else.`;
+
+function lastQuoted(raw: string): string {
+  let last = "";
+  for (const m of raw.matchAll(/[«"“]([^«»"“”]+)[»"”]/g)) last = m[1];
+  return last.trim() || raw; // no quotes → the model obeyed → answer as-is
+}
+
+// Translate the mined terms on the shared llama-server (shared ≤3 request
+// budget in translate.ts). Attempt 0: model-card contextual template
+// (segment = term, context = its sample sentence, glossary empty). Attempt 1
+// switches strategy — instruction framing via retryPrompt — because repeating
+// the contextual template on a short ambiguous term just fails identically.
+// Still failed/garbage → surfaced as "term = ?" so the user sees exactly what
+// needs manual entry (parseGlossary never feeds "?" pairs into prompts).
 // On abort resolves with whatever finished — callers merge the partial result.
 export async function translateTerms(
   terms: readonly { term: string; sample?: string }[],
@@ -434,18 +462,20 @@ export async function translateTerms(
       const k = next++;
       if (k >= terms.length) return;
       const { term, sample } = terms[k];
-      for (let attempt = 0; attempt < 2; attempt++) {
+      let pair: TermPair | null = null;
+      for (let attempt = 0; attempt < 2 && !pair; attempt++) {
         try {
-          const tr = cleanTr(await translate(term, [], { context: sample || undefined, signal }), term);
-          // sanity: a term's translation can't be a paragraph
-          if (tr && tr.length <= Math.max(60, term.length * 8)) {
-            out[k] = { term, tr };
-            break;
-          }
+          const raw =
+            attempt === 1 && sample
+              ? lastQuoted(await completeRaw(retryPrompt(term, sample), signal))
+              : await translate(term, [], { context: sample || undefined, signal });
+          const tr = cleanTr(raw, term);
+          if (plausible(tr, term)) pair = { term, tr };
         } catch {
           if (signal?.aborted) return;
         }
       }
+      out[k] = pair ?? { term, tr: "?" }; // "?" = needs manual entry
       done++;
       onProgress?.(done, terms.length);
     }

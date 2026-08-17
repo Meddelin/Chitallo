@@ -15,7 +15,7 @@ import { loadGlossaryText, parseGlossary, translate } from "./translate";
 import type { GlossaryEntry } from "./translate";
 
 const MODEL = "HY-MT1.5-7B-Q4_K_M";
-const CONCURRENCY = 3; // llama-server runs n_slots=4 — keep one slot free for interactive use
+const CONCURRENCY = 3; // worker count only — actual requests draw from the shared ≤3 budget in translate.ts
 const ETA_WINDOW = 5; // moving average over the last N text pages
 
 export type TrParagraph = Paragraph & { tr: string };

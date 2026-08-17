@@ -173,15 +173,19 @@ export function GlossaryModal({
   const closedRef = useRef(false);
 
   // autosave on close/unmount; a running generation is aborted, its partial
-  // result is merged into storage by runGen's tail (closedRef branch)
-  useEffect(
-    () => () => {
+  // result is merged into storage by runGen's tail (closedRef branch).
+  // closedRef is re-armed in the effect BODY: StrictMode's dev double-mount
+  // runs this cleanup once on a still-open modal, and the ref survives the
+  // remount — without the reset every later runGen would take the "modal
+  // closed" branch and never show its result.
+  useEffect(() => {
+    closedRef.current = false;
+    return () => {
       closedRef.current = true;
       genCtrl.current?.abort();
       saveGlossaryText(bookPath, textRef.current);
-    },
-    [bookPath],
-  );
+    };
+  }, [bookPath]);
 
   // «Собрать глоссарий»: statistical term extraction over the whole book, then
   // the local model translates only the term list (with sentence context).

@@ -32,12 +32,14 @@ export function saveGlossaryText(bookPath: string, text: string): void {
   else localStorage.removeItem(key);
 }
 
-// lenient line parse: "термин = перевод", also "->", "→", "—" as separators
+// lenient line parse: "термин = перевод", also "->", "→", "—" as separators.
+// A dst of "?" is the glossary generator's "needs manual entry" placeholder —
+// the line stays visible in the textarea but is never fed into prompts.
 export function parseGlossary(text: string): GlossaryEntry[] {
   const out: GlossaryEntry[] = [];
   for (const line of text.split(/\r?\n/)) {
     const m = line.match(/^\s*(.+?)\s*(?:=|->|→|—)\s*(.+?)\s*$/);
-    if (m) out.push({ src: m[1], dst: m[2] });
+    if (m && m[2] !== "?") out.push({ src: m[1], dst: m[2] });
   }
   return out;
 }
@@ -65,6 +67,62 @@ export function buildPrompt(text: string, glossary: GlossaryEntry[], context?: s
 // sampling per the HY-MT1.5 model card
 const SAMPLING = { temperature: 0.7, top_k: 20, top_p: 0.6, repeat_penalty: 1.05 };
 
+// ---- shared request budget --------------------------------------------------
+// ONE pool for every consumer — interactive popover, batch book translation,
+// glossary generation. Combined in-flight stays ≤3 against n_slots=4, so the
+// server always has a spare slot and two pipelines running at once cannot
+// stack their per-module worker pools into 6 concurrent requests.
+
+const MAX_INFLIGHT = 3;
+let inflight = 0;
+const waiters: (() => void)[] = [];
+
+function acquireSlot(signal?: AbortSignal): Promise<void> {
+  if (signal?.aborted) return Promise.reject(new DOMException("translate aborted", "AbortError"));
+  if (inflight < MAX_INFLIGHT) {
+    inflight++;
+    return Promise.resolve();
+  }
+  return new Promise((res, rej) => {
+    const grant = () => {
+      signal?.removeEventListener("abort", onAbort);
+      inflight++;
+      res();
+    };
+    const onAbort = () => {
+      const i = waiters.indexOf(grant);
+      if (i >= 0) waiters.splice(i, 1);
+      rej(new DOMException("translate aborted", "AbortError"));
+    };
+    signal?.addEventListener("abort", onAbort);
+    waiters.push(grant);
+  });
+}
+
+function releaseSlot(): void {
+  inflight--;
+  waiters.shift()?.();
+}
+
+// single non-streaming completion for an already-built prompt, drawing from
+// the shared budget (glossarygen's retry framing needs this raw entry point)
+export async function completeRaw(prompt: string, signal?: AbortSignal): Promise<string> {
+  await acquireSlot(signal);
+  try {
+    const resp = await fetch(`${BASE}/v1/chat/completions`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ messages: [{ role: "user", content: prompt }], ...SAMPLING }),
+      signal,
+    });
+    if (!resp.ok) throw new Error(`llama-server HTTP ${resp.status}`);
+    const data = (await resp.json()) as { choices?: { message?: { content?: string } }[] };
+    return (data.choices?.[0]?.message?.content ?? "").trim();
+  } finally {
+    releaseSlot();
+  }
+}
+
 // non-streaming variant (batch book translation): same prompt/sampling as
 // translateStream, resolves with the whole translation
 export async function translate(
@@ -72,18 +130,7 @@ export async function translate(
   glossary: GlossaryEntry[],
   opts?: { context?: string; signal?: AbortSignal },
 ): Promise<string> {
-  const resp = await fetch(`${BASE}/v1/chat/completions`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      messages: [{ role: "user", content: buildPrompt(text, glossary, opts?.context) }],
-      ...SAMPLING,
-    }),
-    signal: opts?.signal,
-  });
-  if (!resp.ok) throw new Error(`llama-server HTTP ${resp.status}`);
-  const data = (await resp.json()) as { choices?: { message?: { content?: string } }[] };
-  return (data.choices?.[0]?.message?.content ?? "").trim();
+  return completeRaw(buildPrompt(text, glossary, opts?.context), opts?.signal);
 }
 
 export async function translateStream(
@@ -92,44 +139,49 @@ export async function translateStream(
   onDelta: (chunk: string) => void,
   opts?: { context?: string; signal?: AbortSignal },
 ): Promise<string> {
-  const resp = await fetch(`${BASE}/v1/chat/completions`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      messages: [{ role: "user", content: buildPrompt(text, glossary, opts?.context) }],
-      stream: true,
-      ...SAMPLING,
-    }),
-    signal: opts?.signal,
-  });
-  if (!resp.ok || !resp.body) throw new Error(`llama-server HTTP ${resp.status}`);
+  await acquireSlot(opts?.signal); // slot held until the stream finishes
+  try {
+    const resp = await fetch(`${BASE}/v1/chat/completions`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        messages: [{ role: "user", content: buildPrompt(text, glossary, opts?.context) }],
+        stream: true,
+        ...SAMPLING,
+      }),
+      signal: opts?.signal,
+    });
+    if (!resp.ok || !resp.body) throw new Error(`llama-server HTTP ${resp.status}`);
 
-  const reader = resp.body.getReader();
-  const dec = new TextDecoder();
-  let buf = "";
-  let full = "";
-  for (;;) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    buf += dec.decode(value, { stream: true });
-    const lines = buf.split("\n");
-    buf = lines.pop()!;
-    for (const raw of lines) {
-      const line = raw.trim();
-      if (!line.startsWith("data:")) continue;
-      const data = line.slice(5).trim();
-      if (data === "[DONE]") return full;
-      try {
-        const delta: unknown = JSON.parse(data);
-        const chunk = (delta as { choices?: { delta?: { content?: string } }[] }).choices?.[0]?.delta?.content;
-        if (chunk) {
-          full += chunk;
-          onDelta(chunk);
+    const reader = resp.body.getReader();
+    const dec = new TextDecoder();
+    let buf = "";
+    let full = "";
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buf += dec.decode(value, { stream: true });
+      const lines = buf.split("\n");
+      buf = lines.pop()!;
+      for (const raw of lines) {
+        const line = raw.trim();
+        if (!line.startsWith("data:")) continue;
+        const data = line.slice(5).trim();
+        if (data === "[DONE]") return full;
+        try {
+          const delta: unknown = JSON.parse(data);
+          const chunk = (delta as { choices?: { delta?: { content?: string } }[] }).choices?.[0]?.delta?.content;
+          if (chunk) {
+            full += chunk;
+            onDelta(chunk);
+          }
+        } catch {
+          // partial/keepalive line — ignore
         }
-      } catch {
-        // partial/keepalive line — ignore
       }
     }
+    return full;
+  } finally {
+    releaseSlot();
   }
-  return full;
 }
