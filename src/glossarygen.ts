@@ -11,7 +11,7 @@
 
 import type { PDFDocumentProxy } from "pdfjs-dist";
 import { clusterParagraphs } from "./paragraphs";
-import { completeRaw, translate } from "./translate";
+import { auxComplete, completeRaw, translate, type ChatMessage } from "./translate";
 
 export type ExtractedTerm = { term: string; freq: number; sample: string };
 export type TermPair = { term: string; tr: string };
@@ -372,7 +372,8 @@ export async function extractTerms(
 
   // 5) unigram acceptance: acronyms/all-caps, or capitalized-in-running-text
   // (non-sentence-initial, frequent, not a common English word)
-  const accepted: (Scored & { disp: string })[] = [];
+  type Accepted = Scored & { disp: string; sampleOverride?: string };
+  const accepted: Accepted[] = [];
   for (const c of multiTop) {
     const st = stats.get(c.key)!;
     accepted.push({ ...c, disp: dominantForm(c.key, st) });
@@ -392,11 +393,44 @@ export async function extractTerms(
       accepted.push({ ...c, disp });
   }
 
-  accepted.sort((a, b) => b.score - a.score);
-  return accepted.slice(0, cap).map((c) => ({
+  // 6) conjunction split: a candidate like "precision and recall" is two terms
+  // joined by prose, not one — IF both halves stand alone in the text (each
+  // occurs ≥ MIN_FREQ on its own). The pair is replaced by its halves, which
+  // inherit its score and, when the half has no sample of its own, its sample.
+  // Universal: purely structural, no domain knowledge involved.
+  const CONJ = new Set(["and", "or"]);
+  const acceptedKeys = new Set(accepted.map((c) => c.key));
+  const split: Accepted[] = [];
+  for (const c of accepted) {
+    const toks = c.key.split(" ");
+    const ci = toks.findIndex((t) => CONJ.has(t));
+    const oneConj = ci > 0 && ci < toks.length - 1 && !toks.some((t, i) => i !== ci && CONJ.has(t));
+    const halves = oneConj ? [toks.slice(0, ci).join(" "), toks.slice(ci + 1).join(" ")] : [];
+    if (!halves.length || !halves.every((h) => (counts.get(h) ?? 0) >= MIN_FREQ)) {
+      split.push(c);
+      continue;
+    }
+    for (const h of halves) {
+      if (acceptedKeys.has(h)) continue; // half already a term in its own right
+      acceptedKeys.add(h);
+      const st = stats.get(h);
+      split.push({
+        key: h,
+        n: h.split(" ").length,
+        freq: counts.get(h)!,
+        adj: c.adj,
+        score: c.score,
+        disp: st ? dominantForm(h, st) : h,
+        sampleOverride: st?.sample ? undefined : stats.get(c.key)!.sample,
+      });
+    }
+  }
+
+  split.sort((a, b) => b.score - a.score);
+  return split.slice(0, cap).map((c) => ({
     term: c.disp,
     freq: c.freq,
-    sample: clampSample(stats.get(c.key)!.sample, c.key),
+    sample: clampSample(c.sampleOverride ?? stats.get(c.key)?.sample ?? "", c.key),
   }));
 }
 
@@ -425,6 +459,30 @@ const words = (s: string) => s.split(/\s+/).filter(Boolean).length;
 const plausible = (tr: string, term: string) =>
   !!tr && words(tr) <= words(term) * 2 + 2 && tr.length <= Math.max(60, term.length * 4);
 
+// junk gate on top of plausible(): question marks (refusals / "term = ?"
+// artifacts), symbol-only output, or an echoed span of the sample sentence
+// (the model quoting its context instead of translating the term). An answer
+// EQUAL to the term is fine — that is the keep-untranslated convention.
+function junky(tr: string, term: string, sample?: string): boolean {
+  if (!tr || tr.includes("?")) return true;
+  if (!/[A-Za-zА-Яа-яЁё0-9]/.test(tr)) return true;
+  if (
+    sample &&
+    tr.length > term.length + 4 &&
+    tr.toLowerCase() !== term.toLowerCase() &&
+    sample.toLowerCase().includes(tr.toLowerCase())
+  )
+    return true;
+  return false;
+}
+
+const passesGates = (tr: string, term: string, sample?: string) =>
+  plausible(tr, term) && !junky(tr, term, sample);
+
+// acronym/symbol terms (all-caps, digits: BM25, TF-IDF, DCG) are conventionally
+// kept as-is in translation — glossary pins them without any model call
+const keepAsIs = (term: string) => /^[A-Z0-9][A-Z0-9.+/&-]*$/.test(term) && /[A-Z]/.test(term);
+
 // Retry framing for terms the contextual template fails to isolate: when the
 // segment is a short word contained in its own context (recall, IR, QAC…) the
 // model translates the whole sample instead of the term. An explicit English
@@ -440,48 +498,110 @@ function lastQuoted(raw: string): string {
   return last.trim() || raw; // no quotes → the model obeyed → answer as-is
 }
 
-// Translate the mined terms on the shared llama-server (shared ≤3 request
-// budget in translate.ts). Attempt 0: model-card contextual template
-// (segment = term, context = its sample sentence, glossary empty). Attempt 1
-// switches strategy — instruction framing via retryPrompt — because repeating
-// the contextual template on a short ambiguous term just fails identically.
-// Still failed/garbage → surfaced as "term = ?" so the user sees exactly what
-// needs manual entry (parseGlossary never feeds "?" pairs into prompts).
+// ---- terminologist prompting (aux Qwen3.5-4B) -------------------------------
+// The aux model is an instruct model that KNOWS established terminology across
+// domains; the only domain signal it needs is the book's own top mined terms.
+// No embedded dictionaries anywhere — works for any book.
+
+const AUX_SYSTEM =
+  "Ты — терминолог. Тебе дают английский термин из книги, тематику книги и предложение-контекст. " +
+  "Ответь ТОЛЬКО устоявшимся русским эквивалентом этого термина — без пояснений, без кавычек, без точки в конце. " +
+  "Если термин по общепринятой конвенции не переводится (аббревиатура, имя собственное, название продукта или компании) — верни его без изменений.";
+
+const auxMessages = (term: string, sample: string | undefined, domain: string): ChatMessage[] => [
+  { role: "system", content: AUX_SYSTEM },
+  {
+    role: "user",
+    content:
+      (domain ? `Тематика книги (ключевые термины): ${domain}\n` : "") +
+      (sample ? `Контекст: ${sample}\n` : "") +
+      `Термин: ${term}`,
+  },
+];
+
+// Translate the mined terms. Route per term:
+//   keep-as-is: acronym/symbol terms never hit a model — "BM25 = BM25" pins
+//     the surface form so the translator leaves it alone.
+//   terminologist (useAux): one aux chat call per term (system role + domain
+//     line from the top mined terms + sample sentence). Attempt 1 retries at a
+//     higher temperature (0.2 is near-deterministic — an identical retry would
+//     fail identically). HY-MT ladder remains the last resort per term.
+//   fallback (no aux): the HY-MT ladder unchanged — attempt 0 model-card
+//     contextual template, attempt 1 instruction framing via retryPrompt.
+// Every model answer passes the same gates (plausible + junky). Failed after
+// everything → DROPPED and counted in `skipped` (never "term = ?" lines).
 // On abort resolves with whatever finished — callers merge the partial result.
 export async function translateTerms(
   terms: readonly { term: string; sample?: string }[],
-  opts: { onProgress?: (done: number, total: number) => void; signal?: AbortSignal } = {},
-): Promise<TermPair[]> {
-  const { onProgress, signal } = opts;
+  opts: {
+    onProgress?: (done: number, total: number) => void;
+    signal?: AbortSignal;
+    // aux terminologist server confirmed up — use it as the primary path
+    useAux?: boolean;
+  } = {},
+): Promise<{ pairs: TermPair[]; skipped: number }> {
+  const { onProgress, signal, useAux } = opts;
+  const domain = terms
+    .slice(0, 10)
+    .map((t) => t.term)
+    .join(", ");
   const out: (TermPair | null)[] = terms.map(() => null);
   let next = 0;
   let done = 0;
+
+  const hymtLadder = async (term: string, sample?: string): Promise<TermPair | null> => {
+    for (let attempt = 0; attempt < 2; attempt++) {
+      try {
+        const raw =
+          attempt === 1 && sample
+            ? lastQuoted(await completeRaw(retryPrompt(term, sample), signal))
+            : await translate(term, [], { context: sample || undefined, signal });
+        const tr = cleanTr(raw, term);
+        if (passesGates(tr, term, sample)) return { term, tr };
+      } catch {
+        if (signal?.aborted) return null;
+      }
+    }
+    return null;
+  };
+
+  const auxPath = async (term: string, sample?: string): Promise<TermPair | null> => {
+    for (let attempt = 0; attempt < 2; attempt++) {
+      try {
+        const raw = await auxComplete(auxMessages(term, sample, domain), signal, {
+          temperature: attempt === 0 ? 0.2 : 0.7,
+        });
+        const tr = cleanTr(raw, term);
+        if (passesGates(tr, term, sample)) return { term, tr };
+      } catch {
+        if (signal?.aborted) return null;
+        break; // aux server unreachable mid-run — no point in attempt 2
+      }
+    }
+    return hymtLadder(term, sample); // last resort for this term
+  };
+
   const worker = async () => {
     for (;;) {
       if (signal?.aborted) return;
       const k = next++;
       if (k >= terms.length) return;
       const { term, sample } = terms[k];
-      let pair: TermPair | null = null;
-      for (let attempt = 0; attempt < 2 && !pair; attempt++) {
-        try {
-          const raw =
-            attempt === 1 && sample
-              ? lastQuoted(await completeRaw(retryPrompt(term, sample), signal))
-              : await translate(term, [], { context: sample || undefined, signal });
-          const tr = cleanTr(raw, term);
-          if (plausible(tr, term)) pair = { term, tr };
-        } catch {
-          if (signal?.aborted) return;
-        }
-      }
-      out[k] = pair ?? { term, tr: "?" }; // "?" = needs manual entry
+      out[k] = keepAsIs(term)
+        ? { term, tr: term }
+        : useAux
+          ? await auxPath(term, sample)
+          : await hymtLadder(term, sample);
       done++;
       onProgress?.(done, terms.length);
     }
   };
   await Promise.all(Array.from({ length: Math.min(CONCURRENCY, Math.max(1, terms.length)) }, worker));
-  return out.filter((p): p is TermPair => p !== null);
+  const pairs = out.filter((p): p is TermPair => p !== null);
+  // skipped counts only ATTEMPTED terms that failed every path (abort leaves
+  // untouched nulls behind — those were never tried, not "пропущено")
+  const attempted = signal?.aborted ? done : terms.length;
+  return { pairs, skipped: Math.max(0, attempted - pairs.length) };
 }
 
 // ---- merge ------------------------------------------------------------------

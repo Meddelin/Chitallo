@@ -6,18 +6,27 @@
 // The chat template lives in the GGUF, so plain messages:[{role:"user",...}] is correct transport.
 
 const BASE = "http://127.0.0.1:11544";
+const AUX_BASE = "http://127.0.0.1:11545"; // aux terminologist (Qwen3.5-4B), on-demand
 const TARGET_EN = "Russian"; // English-worded template
 const TARGET_ZH = "俄语"; // Chinese-worded templates (terminology/contextual are documented only in Chinese)
 
 export type GlossaryEntry = { src: string; dst: string };
 
-export async function isServerUp(timeoutMs = 1200): Promise<boolean> {
+async function healthOk(base: string, timeoutMs: number): Promise<boolean> {
   try {
-    const r = await fetch(`${BASE}/health`, { signal: AbortSignal.timeout(timeoutMs) });
+    const r = await fetch(`${base}/health`, { signal: AbortSignal.timeout(timeoutMs) });
     return r.ok;
   } catch {
     return false;
   }
+}
+
+export function isServerUp(timeoutMs = 1200): Promise<boolean> {
+  return healthOk(BASE, timeoutMs);
+}
+
+export function isAuxUp(timeoutMs = 1200): Promise<boolean> {
+  return healthOk(AUX_BASE, timeoutMs);
 }
 
 // ---- glossary storage: localStorage "pdfer:glossary:<bookPath>", one "термин = перевод" per line
@@ -67,41 +76,55 @@ export function buildPrompt(text: string, glossary: GlossaryEntry[], context?: s
 // sampling per the HY-MT1.5 model card
 const SAMPLING = { temperature: 0.7, top_k: 20, top_p: 0.6, repeat_penalty: 1.05 };
 
-// ---- shared request budget --------------------------------------------------
-// ONE pool for every consumer — interactive popover, batch book translation,
-// glossary generation. Combined in-flight stays ≤3 against n_slots=4, so the
-// server always has a spare slot and two pipelines running at once cannot
-// stack their per-module worker pools into 6 concurrent requests.
+// ---- request budgets --------------------------------------------------------
+// ONE pool per SERVER. The 11544 pool is shared by every HY-MT consumer —
+// interactive popover, batch book translation, glossary fallback. Combined
+// in-flight stays ≤3 against n_slots=4, so the server always has a spare slot
+// and two pipelines running at once cannot stack their per-module worker pools
+// into 6 concurrent requests. The aux terminologist (11545) gets its OWN
+// separate ≤3 budget — its requests never eat into the translator's slots.
 
-const MAX_INFLIGHT = 3;
-let inflight = 0;
-const waiters: (() => void)[] = [];
+function makeLimiter(max: number) {
+  let inflight = 0;
+  const waiters: (() => void)[] = [];
+  return {
+    acquire(signal?: AbortSignal): Promise<void> {
+      if (signal?.aborted) return Promise.reject(new DOMException("translate aborted", "AbortError"));
+      if (inflight < max) {
+        inflight++;
+        return Promise.resolve();
+      }
+      return new Promise((res, rej) => {
+        const grant = () => {
+          signal?.removeEventListener("abort", onAbort);
+          inflight++;
+          res();
+        };
+        const onAbort = () => {
+          const i = waiters.indexOf(grant);
+          if (i >= 0) waiters.splice(i, 1);
+          rej(new DOMException("translate aborted", "AbortError"));
+        };
+        signal?.addEventListener("abort", onAbort);
+        waiters.push(grant);
+      });
+    },
+    release(): void {
+      inflight--;
+      waiters.shift()?.();
+    },
+  };
+}
+
+const mainPool = makeLimiter(3);
+const auxPool = makeLimiter(3);
 
 function acquireSlot(signal?: AbortSignal): Promise<void> {
-  if (signal?.aborted) return Promise.reject(new DOMException("translate aborted", "AbortError"));
-  if (inflight < MAX_INFLIGHT) {
-    inflight++;
-    return Promise.resolve();
-  }
-  return new Promise((res, rej) => {
-    const grant = () => {
-      signal?.removeEventListener("abort", onAbort);
-      inflight++;
-      res();
-    };
-    const onAbort = () => {
-      const i = waiters.indexOf(grant);
-      if (i >= 0) waiters.splice(i, 1);
-      rej(new DOMException("translate aborted", "AbortError"));
-    };
-    signal?.addEventListener("abort", onAbort);
-    waiters.push(grant);
-  });
+  return mainPool.acquire(signal);
 }
 
 function releaseSlot(): void {
-  inflight--;
-  waiters.shift()?.();
+  mainPool.release();
 }
 
 // single non-streaming completion for an already-built prompt, drawing from
@@ -120,6 +143,46 @@ export async function completeRaw(prompt: string, signal?: AbortSignal): Promise
     return (data.choices?.[0]?.message?.content ?? "").trim();
   } finally {
     releaseSlot();
+  }
+}
+
+// ---- aux terminologist client (Qwen3.5-4B on 11545) -------------------------
+// Chat-style completion against the on-demand aux server. Qwen3.5 is a
+// hybrid-thinking model: thinking is disabled via chat_template_kwargs
+// (supported by this llama-server build — verified empirically), and a leading
+// <think> block is stripped anyway as a safety net. Low temperature: term
+// rendering wants the ESTABLISHED equivalent, not creativity.
+
+export type ChatMessage = { role: "system" | "user" | "assistant"; content: string };
+
+export async function auxComplete(
+  messages: ChatMessage[],
+  signal?: AbortSignal,
+  opts?: { temperature?: number },
+): Promise<string> {
+  await auxPool.acquire(signal);
+  try {
+    const resp = await fetch(`${AUX_BASE}/v1/chat/completions`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        messages,
+        temperature: opts?.temperature ?? 0.2,
+        top_p: 0.8,
+        max_tokens: 512,
+        chat_template_kwargs: { enable_thinking: false },
+      }),
+      signal,
+    });
+    if (!resp.ok) throw new Error(`aux llama-server HTTP ${resp.status}`);
+    const data = (await resp.json()) as { choices?: { message?: { content?: string } }[] };
+    let text = (data.choices?.[0]?.message?.content ?? "").trim();
+    // safety net: closed think block → strip; unclosed (truncated) → unusable
+    text = text.replace(/^<think>[\s\S]*?<\/think>\s*/i, "").trim();
+    if (/^<think>/i.test(text)) return "";
+    return text;
+  } finally {
+    auxPool.release();
   }
 }
 

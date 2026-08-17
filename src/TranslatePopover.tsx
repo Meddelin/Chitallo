@@ -1,7 +1,8 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import type { PDFDocumentProxy } from "pdfjs-dist";
+import { invoke } from "@tauri-apps/api/core";
 import { extractTerms, mergeGlossary, translateTerms } from "./glossarygen";
-import { isServerUp, loadGlossaryText, parseGlossary, saveGlossaryText, translateStream } from "./translate";
+import { isAuxUp, isServerUp, loadGlossaryText, parseGlossary, saveGlossaryText, translateStream } from "./translate";
 
 export type Anchor = { x: number; y: number };
 
@@ -159,9 +160,49 @@ export function TranslatePopover({
 
 type GenState =
   | { phase: "extract"; done: number; total: number }
+  | { phase: "auxstart" }
   | { phase: "translate"; done: number; total: number }
-  | { phase: "done"; added: number }
+  | { phase: "done"; added: number; skipped: number; auxUsed: boolean }
   | { phase: "error"; msg: string };
+
+const sleep = (ms: number, signal?: AbortSignal) =>
+  new Promise<void>((res, rej) => {
+    const onAbort = () => {
+      clearTimeout(t);
+      rej(new DOMException("aborted", "AbortError"));
+    };
+    const t = setTimeout(() => {
+      signal?.removeEventListener("abort", onAbort);
+      res();
+    }, ms);
+    signal?.addEventListener("abort", onAbort);
+  });
+
+// Bring the on-demand terminologist model (Qwen3.5-4B on 11545) up for the
+// glossary run. Resolves true when the aux server answers; false → the caller
+// falls back to the HY-MT ladder. Outside Tauri the invoke throws — an HTTP
+// health probe of the same server stands in (same pattern as the status row).
+// Model load takes ~10-30s; give up after 90s so the run never hangs.
+async function ensureAux(signal: AbortSignal): Promise<boolean> {
+  let s: string;
+  try {
+    s = await invoke<string>("aux_model_start");
+  } catch {
+    return isAuxUp();
+  }
+  const deadline = Date.now() + 90_000;
+  while (Date.now() < deadline) {
+    if (s === "up" || s === "external") return true;
+    if (s === "dead" || s === "none") return false;
+    await sleep(1500, signal); // "starting"
+    try {
+      s = await invoke<string>("aux_model_status");
+    } catch {
+      return isAuxUp();
+    }
+  }
+  return false;
+}
 
 export function GlossaryModal({
   bookPath,
@@ -219,9 +260,13 @@ export function GlossaryModal({
       });
       if (!terms.length) return setGen({ phase: "error", msg: "термины не найдены" });
       if (!(await isServerUp())) return setGen({ phase: "error", msg: "модель перевода не запущена" });
+      // terminologist model: started on demand for this run, stopped in finally
+      setGen({ phase: "auxstart" });
+      const useAux = await ensureAux(ctrl.signal);
       setGen({ phase: "translate", done: 0, total: terms.length });
-      const pairs = await translateTerms(terms, {
+      const { pairs, skipped } = await translateTerms(terms, {
         signal: ctrl.signal,
+        useAux,
         onProgress: (done, total) => setGen({ phase: "translate", done, total }),
       });
       const base = closedRef.current ? loadGlossaryText(bookPath) : textRef.current;
@@ -230,13 +275,16 @@ export function GlossaryModal({
         saveGlossaryText(bookPath, merged); // modal closed mid-run — don't lose the work
       } else {
         setText(merged);
-        setGen({ phase: "done", added });
+        setGen({ phase: "done", added, skipped, auxUsed: useAux });
       }
     } catch {
       if (!ctrl.signal.aborted) setGen({ phase: "error", msg: "ошибка генерации" });
-      else if (!closedRef.current) setGen(null); // cancelled during extraction
+      else if (!closedRef.current) setGen(null); // cancelled during extraction/aux start
     } finally {
       genCtrl.current = null;
+      // always free the aux model's VRAM — done, cancelled or failed alike
+      // (no-op outside Tauri or when nothing was started; externals untouched)
+      invoke("aux_model_stop").catch(() => {});
     }
   }, [doc, bookPath]);
 
@@ -279,7 +327,9 @@ export function GlossaryModal({
                     {gen === null
                       ? "~2–3 мин, термины извлекаются из всей книги"
                       : gen.phase === "done"
-                        ? `добавлено: ${gen.added}`
+                        ? `добавлено: ${gen.added}` +
+                          (gen.skipped ? `, пропущено: ${gen.skipped}` : "") +
+                          (gen.auxUsed ? "" : " · без модели терминов")
                         : gen.msg}
                   </span>
                 </>
@@ -288,7 +338,9 @@ export function GlossaryModal({
                   <span className="tabular-nums">
                     {gen.phase === "extract"
                       ? `Извлечение… ${gen.done}/${gen.total}`
-                      : `Перевод терминов ${gen.done}/${gen.total}`}
+                      : gen.phase === "auxstart"
+                        ? "Запуск модели терминов…"
+                        : `Перевод терминов ${gen.done}/${gen.total}`}
                   </span>
                   <button
                     className="hover:text-neutral-600 dark:hover:text-neutral-300 underline underline-offset-2"
