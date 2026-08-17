@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { open } from "@tauri-apps/plugin-dialog";
 import { readFile } from "@tauri-apps/plugin-fs";
+import { appDataDir } from "@tauri-apps/api/path";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { invoke } from "@tauri-apps/api/core";
 import * as pdfjs from "pdfjs-dist";
@@ -555,6 +556,45 @@ export default function App() {
   useEffect(() => {
     if (!import.meta.env.DEV) return;
     (window as unknown as Record<string, unknown>).__pdferDev = { doc, path, ...booktranslate, ...glossarygen };
+  }, [doc, path]);
+
+  // dev-only: auto-start/resume the book translation when a marker file
+  // in appData names the open book; keeps the batch alive across HMR reloads
+  // and app restarts while agent work is ongoing (delete the marker to stop)
+  useEffect(() => {
+    if (!import.meta.env.DEV || !doc || !path) return;
+    let stale = false;
+    (async () => {
+      const dbg = async (msg: string) => {
+        try {
+          const { writeFile } = await import("@tauri-apps/plugin-fs");
+          const dir = await appDataDir();
+          await writeFile(`${dir}\\autotranslate.log`, new TextEncoder().encode(`${new Date().toISOString()} ${msg}`));
+        } catch {
+          /* ignore */
+        }
+      };
+      try {
+        const dir = await appDataDir();
+        const bytes = await readFile(`${dir}\\autotranslate.json`);
+        const marker = JSON.parse(new TextDecoder().decode(bytes)) as { bookPath?: string };
+        if (stale) return void (await dbg("stale after read"));
+        if (marker.bookPath !== path) return void (await dbg(`path mismatch: marker=${marker.bookPath} path=${path}`));
+        await dbg("marker matched, scheduling startTr");
+        setTimeout(() => {
+          if (stale) return void dbg("stale at timeout");
+          if (trRunRef.current) return void dbg("trRunRef busy at timeout");
+          dbg("calling startTr");
+          startTr();
+        }, 1500);
+      } catch (e) {
+        await dbg(`read failed: ${String(e)}`);
+      }
+    })();
+    return () => {
+      stale = true;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [doc, path]);
 
   // while a mouse selection is in progress, mark all text layers .selecting so
