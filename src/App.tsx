@@ -2,6 +2,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { open } from "@tauri-apps/plugin-dialog";
 import { readFile } from "@tauri-apps/plugin-fs";
 import { getCurrentWindow } from "@tauri-apps/api/window";
+import { invoke } from "@tauri-apps/api/core";
 import * as pdfjs from "pdfjs-dist";
 import { TextLayer } from "pdfjs-dist";
 import type { PDFDocumentProxy, PDFPageProxy, RenderTask } from "pdfjs-dist";
@@ -14,6 +15,7 @@ import type { Word } from "./paragraphs";
 import * as booktranslate from "./booktranslate";
 import type { TrParagraph } from "./booktranslate";
 import * as glossarygen from "./glossarygen";
+import { isServerUp } from "./translate";
 import "./App.css";
 
 pdfjs.GlobalWorkerOptions.workerSrc = workerUrl;
@@ -21,10 +23,14 @@ pdfjs.GlobalWorkerOptions.workerSrc = workerUrl;
 const DEFAULT_SCALE = 1.25;
 const PAGE_GAP = 16;
 
+// full-width action row of the «Перевод» dropdown menu
+const MENU_ROW =
+  "w-full text-left px-2.5 py-1.5 rounded-lg hover:bg-neutral-100 dark:hover:bg-neutral-700/70 whitespace-nowrap";
+
 type Size = { w: number; h: number };
 type Cols = 1 | 2 | "auto";
 type ViewMode = "orig" | "tr";
-type TrRequest = { anchor: Anchor; text: string; context?: string };
+type TrRequest = { anchor: Anchor; text: string; context?: string; label?: string; noTranslate?: boolean };
 
 // ---- selection → translation helpers ---------------------------------------
 
@@ -45,13 +51,13 @@ function fmtEta(ms?: number): string {
 }
 
 // for 1-2 word selections: pull the containing sentence out of the surrounding
-// text (text-layer spans, or the whole paragraph box for translation-overlay
+// text (text-layer spans, or the whole paragraph block for reflowed-translation
 // selections), so the model can disambiguate the word
 function sentenceAround(range: Range, selText: string): string | undefined {
   const n = range.startContainer;
   const el = n instanceof Element ? n : n.parentElement;
   let txt = "";
-  const trPara = el?.closest(".trPara");
+  const trPara = el?.closest(".trPage [data-tridx]");
   if (trPara) {
     txt = (trPara.textContent ?? "").replace(/\s+/g, " ").trim();
   } else {
@@ -110,53 +116,86 @@ function paragraphAround(clicked: HTMLElement): { text: string; left: number; bo
   };
 }
 
-// Fit translated text into its paragraph box: closed-form starting size from
-// the box area (height ≈ lines × 1.35 × fs, chars/line ≈ width / (0.5 × fs) ⇒
-// fs ≈ √(w·h / (0.675·len))), then shrink stepwise until nothing overflows
-// (typically 0-3 iterations, hard floor 9px). Small boxes (footnote lines) and
-// Russian's ~1.2x expansion can still overflow at the floor — tighten the
-// leading before letting overflow:hidden clip.
-function fitTrText(d: HTMLElement) {
-  const len = Math.max(1, (d.textContent ?? "").length);
-  let fs = Math.sqrt((d.clientWidth * d.clientHeight) / (0.675 * len));
-  fs = Math.max(9, Math.min(fs, d.clientHeight / 1.35, 28));
-  d.style.fontSize = `${fs}px`;
-  while (fs > 9 && d.scrollHeight > d.clientHeight + 1) {
-    fs = Math.max(9, fs - Math.max(0.5, fs * 0.08));
-    d.style.fontSize = `${fs}px`;
-  }
-  for (const lh of [1.25, 1.15, 1.05, 1]) {
-    if (d.scrollHeight <= d.clientHeight + 1) break;
-    d.style.lineHeight = String(lh);
-  }
+// ---- reflowed translated page (v2) -----------------------------------------
+
+// list-item openers for hanging indents: "(1) ", "1. ", "1) ", "• ", "a) ", "а) ", "— "
+const LIST_RE = /^\s*(?:\(\d{1,3}\)|\d{1,3}[.)]|\(?[a-zа-яё]\)|[•◦▪‣–—])\s/i;
+
+const CROP_PAD = 3; // scale-1 px of original context kept around a cropped region
+const PAGE_PAD_X = 0.085; // trPage horizontal padding as a fraction of page width — mirrors App.css
+
+type Crop = { canvas: HTMLCanvasElement; x: number; y: number; w: number; h: number }; // scale-1 rect
+
+// Clean re-typeset page replacing the original render in translation mode.
+// Prose paragraphs flow as <p> at ONE uniform body size for the whole book
+// (15.5px × scale, via --scale-factor in App.css); headings are recognised by
+// the stored glyph height relative to the book's body median (fh/bodyFh ≥ 1.25,
+// size capped at 1.8×), list items get a hanging indent. kind:"other" regions
+// (display math / figures / tables) and failed paragraphs (tr:"") are never
+// dropped: they become placeholder canvases, later filled by drawCrops with
+// image crops of the original page render. data-tridx on every block links back
+// to the store paragraph (Alt+click «Оригинал», sentence context).
+function buildTrPage(paras: TrParagraph[], bodyFh: number, scale: number, baseW: number, baseH: number) {
+  const root = document.createElement("div");
+  root.className = "trPage";
+  root.lang = "ru"; // enables hyphens:auto for the justified Russian text
+  const crops: Crop[] = [];
+  const maxW = baseW * scale * (1 - 2 * PAGE_PAD_X); // text column width — crop display cap
+  paras.forEach((p, i) => {
+    if (p.kind === "prose" && p.tr) {
+      const d = document.createElement("p");
+      const ratio = bodyFh > 0 && p.fh > 0 ? p.fh / bodyFh : 1;
+      if (ratio >= 1.25) {
+        d.className = "trHead";
+        d.style.fontSize = `${Math.min(1.8, ratio).toFixed(3)}em`;
+      } else {
+        d.className = LIST_RE.test(p.tr) || LIST_RE.test(p.text) ? "trHang" : "trP";
+      }
+      d.textContent = p.tr;
+      d.dataset.tridx = String(i);
+      root.append(d);
+    } else {
+      const x = Math.max(0, p.x - CROP_PAD);
+      const y = Math.max(0, p.y - CROP_PAD);
+      const w = Math.min(baseW, p.x + p.w + CROP_PAD) - x;
+      const h = Math.min(baseH, p.y + p.h + CROP_PAD) - y;
+      if (w <= 0 || h <= 0) return;
+      const c = document.createElement("canvas");
+      c.className = "trCrop";
+      c.width = 0; // transparent until drawCrops fills it
+      c.height = 0;
+      // natural display size at the current zoom, fixed up front so the flow
+      // never jumps when the async original render lands
+      let cssW = w * scale;
+      let cssH = h * scale;
+      if (cssW > maxW) {
+        cssH *= maxW / cssW;
+        cssW = maxW;
+      }
+      c.style.width = `${cssW}px`;
+      c.style.height = `${cssH}px`;
+      c.dataset.tridx = String(i);
+      root.append(c);
+      crops.push({ canvas: c, x, y, w, h });
+    }
+  });
+  return { root, crops };
 }
 
-// Reading overlay: one absolutely-positioned box per stored paragraph. Coords
-// are saved at viewport scale 1, so multiply by the current scale. Paragraphs
-// whose translation failed (tr === "") get no box — the original shows through,
-// same as figures/formulas around the boxes. The layer is a sibling of the
-// canvas, so the dark-mode invert filter (canvas-only) never touches it; its
-// colors are explicit in App.css.
-function appendTrLayer(el: HTMLElement, paras: TrParagraph[] | undefined, scale: number) {
-  if (!paras?.length) return;
-  const layer = document.createElement("div");
-  layer.className = "trLayer";
-  const boxes: HTMLElement[] = [];
-  for (const p of paras) {
-    if (!p.tr) continue;
-    const d = document.createElement("div");
-    d.className = "trPara";
-    d.style.left = `${p.x * scale}px`;
-    d.style.top = `${p.y * scale}px`;
-    d.style.width = `${p.w * scale}px`;
-    d.style.height = `${p.h * scale}px`;
-    d.textContent = p.tr;
-    layer.append(d);
-    boxes.push(d);
+// copy each crop's region out of the full-page offscreen render (scale × dpr);
+// the offscreen canvas is discarded by the caller right after
+function drawCrops(off: HTMLCanvasElement, crops: Crop[], scale: number, dpr: number) {
+  const k = scale * dpr;
+  for (const cr of crops) {
+    const sx = Math.min(off.width, Math.round(cr.x * k));
+    const sy = Math.min(off.height, Math.round(cr.y * k));
+    const sw = Math.min(off.width - sx, Math.round(cr.w * k));
+    const sh = Math.min(off.height - sy, Math.round(cr.h * k));
+    if (sw <= 0 || sh <= 0) continue;
+    cr.canvas.width = sw;
+    cr.canvas.height = sh;
+    cr.canvas.getContext("2d")!.drawImage(off, sx, sy, sw, sh, 0, 0, sw, sh);
   }
-  if (!boxes.length) return;
-  el.append(layer);
-  boxes.forEach(fitTrText); // after insertion — fitting reads layout
 }
 
 function Page({
@@ -167,6 +206,7 @@ function Page({
   viewMode,
   trVersion,
   getTrPage,
+  getBodyFh,
 }: {
   doc: PDFDocumentProxy;
   num: number;
@@ -175,6 +215,7 @@ function Page({
   viewMode: ViewMode;
   trVersion: number;
   getTrPage: (n: number) => TrParagraph[] | undefined;
+  getBodyFh: () => number;
 }) {
   const ref = useRef<HTMLDivElement>(null);
   // Placeholder: page-1 size until this page renders once, then its own base
@@ -191,9 +232,12 @@ function Page({
   // trVersion joins the effect deps ONLY in translation mode: while the engine
   // runs, every finished page bumps it and re-runs the effect (a full page
   // re-render — accepted cost during active translation) so visible pages gain
-  // their overlay live, without a manual toggle. In orig mode the dep is pinned
-  // to -1, so translation progress never re-renders pages.
+  // their reflowed translation live, without a manual toggle. In orig mode the
+  // dep is pinned to -1, so translation progress never re-renders pages.
   const trDep = viewMode === "tr" ? trVersion : -1;
+  // reflow pages own their height: natural flow height, but never shorter than
+  // the original render (min-height), so virtualization placeholders keep size
+  const reflow = viewMode === "tr" && !!getTrPage(num)?.length;
 
   useEffect(() => {
     const el = ref.current!;
@@ -224,6 +268,24 @@ function Page({
           );
 
           const dpr = window.devicePixelRatio || 1;
+          const paras = viewMode === "tr" ? getTrPage(num) : undefined;
+          if (paras?.length) {
+            // reflowed translated page: NO canvas and NO text layer — the
+            // original is rasterized only offscreen (once, if any non-prose
+            // region needs an image crop) and discarded after cropping
+            const { root, crops } = buildTrPage(paras, getBodyFh(), scale, vp1.width, vp1.height);
+            el.appendChild(root);
+            if (crops.length) {
+              const off = document.createElement("canvas");
+              off.width = Math.floor(vp.width * dpr);
+              off.height = Math.floor(vp.height * dpr);
+              renderTask = page.render({ canvas: off, viewport: page.getViewport({ scale: scale * dpr }) });
+              await renderTask.promise.catch(() => {});
+              if (!cancelled && el.dataset.rendered === run) drawCrops(off, crops, scale, dpr);
+            }
+            return;
+          }
+
           const canvas = document.createElement("canvas");
           canvas.width = Math.floor(vp.width * dpr);
           canvas.height = Math.floor(vp.height * dpr);
@@ -243,7 +305,6 @@ function Page({
             const end = document.createElement("div");
             end.className = "endOfContent";
             textDiv.append(end);
-            if (viewMode === "tr") appendTrLayer(el, getTrPage(num), scale);
           }
         } else if (el.dataset.rendered) {
           // page scrolled far away — free canvas, text layer and pdf.js page resources
@@ -268,14 +329,21 @@ function Page({
       // NOTE: `rendered` (the page's true base size) is deliberately NOT reset —
       // see the placeholder comment above.
     };
-  }, [doc, num, scale, viewMode, trDep, getTrPage]);
+  }, [doc, num, scale, viewMode, trDep, getTrPage, getBodyFh]);
 
   return (
     <div
       ref={ref}
       data-page={num}
       className="page"
-      style={{ width: size.w, height: size.h, "--scale-factor": scale } as React.CSSProperties}
+      style={
+        {
+          width: size.w,
+          minHeight: size.h,
+          height: reflow ? undefined : size.h,
+          "--scale-factor": scale,
+        } as React.CSSProperties
+      }
     />
   );
 }
@@ -295,6 +363,14 @@ export default function App() {
   const [selBar, setSelBar] = useState<TrRequest | null>(null);
   const [pop, setPop] = useState<TrRequest | null>(null);
   const [glossOpen, setGlossOpen] = useState(false);
+  // ---- «Перевод» dropdown menu ----
+  const [menuOpen, setMenuOpen] = useState(false);
+  // inline confirm for «Перезапустить перевод»; reset whenever the menu closes
+  const [confirmRestart, setConfirmRestart] = useState(false);
+  // llama-server state for the menu's status row: Tauri translation_status
+  // ("none"|"external"|"starting"|"spawned"|"dead"), plain-browser dev falls
+  // back to an HTTP /health probe; null until the first fetch resolves
+  const [modelStatus, setModelStatus] = useState<string | null>(null);
   // ---- whole-book translation state ----
   const [viewMode, setViewMode] = useState<ViewMode>("orig");
   // store meta for the toolbar: null = no stored translation for this book
@@ -316,6 +392,8 @@ export default function App() {
   popRef.current = pop;
   const glossRef = useRef(glossOpen);
   glossRef.current = glossOpen;
+  const menuRef = useRef(menuOpen);
+  menuRef.current = menuOpen;
   const scrollRef = useRef<HTMLDivElement>(null);
   const scaleRef = useRef(scale);
   scaleRef.current = scale;
@@ -360,8 +438,8 @@ export default function App() {
       if (!s || s.isCollapsed || s.rangeCount === 0) return setSelBar(null);
       const toEl = (n: Node | null) => (n instanceof Element ? n : n?.parentElement ?? null);
       if (
-        !toEl(s.focusNode)?.closest(".textLayer, .trLayer") &&
-        !toEl(s.anchorNode)?.closest(".textLayer, .trLayer")
+        !toEl(s.focusNode)?.closest(".textLayer, .trPage") &&
+        !toEl(s.anchorNode)?.closest(".textLayer, .trPage")
       )
         return setSelBar(null);
       const text = normalizeSelText(s.toString());
@@ -388,20 +466,75 @@ export default function App() {
     };
   }, []);
 
-  // Alt+click on text → translate the whole visual paragraph
-  const onAltClick = useCallback((e: React.MouseEvent) => {
-    if (!e.altKey) return;
-    const span = (e.target as HTMLElement).closest?.(".textLayer span") as HTMLElement | null;
-    if (!span) return;
-    e.preventDefault();
-    const para = paragraphAround(span);
-    if (!para?.text) return;
-    setSelBar(null);
-    setPop({ anchor: { x: para.left, y: para.bottom + 6 }, text: para.text });
-  }, []);
-
-  // stable page-data getter for Page overlays (reads the ref, never re-created)
+  // stable store getters for Page renders (read the ref, never re-created)
   const getTrPage = useCallback((n: number) => trStoreRef.current?.pages[n], []);
+  const getBodyFh = useCallback(() => trStoreRef.current?.bodyFh ?? 0, []);
+
+  // «Перевод» menu: click outside closes (capture, same pattern as the
+  // popover); closing always disarms the restart confirm
+  useEffect(() => {
+    if (!menuOpen) {
+      setConfirmRestart(false);
+      return;
+    }
+    const onDown = (e: PointerEvent) => {
+      if (!(e.target as Element | null)?.closest?.("[data-trmenu]")) setMenuOpen(false);
+    };
+    document.addEventListener("pointerdown", onDown, true);
+    return () => document.removeEventListener("pointerdown", onDown, true);
+  }, [menuOpen]);
+
+  // menu status row: poll translation_status while the menu is open (3s — the
+  // "starting" state resolves on its own). Outside Tauri the invoke throws;
+  // an HTTP health probe of the same server stands in.
+  useEffect(() => {
+    if (!menuOpen) return;
+    let cancelled = false;
+    const poll = async () => {
+      let s: string;
+      try {
+        s = await invoke<string>("translation_status");
+      } catch {
+        s = (await isServerUp()) ? "external" : "none";
+      }
+      if (!cancelled) setModelStatus(s);
+    };
+    poll();
+    const t = window.setInterval(poll, 3000);
+    return () => {
+      cancelled = true;
+      window.clearInterval(t);
+    };
+  }, [menuOpen]);
+
+  // Alt+click on text → translate the whole visual paragraph; on a reflowed
+  // translated block the translation is already on screen, so show the stored
+  // ORIGINAL paragraph instead (matched by store index via data-tridx)
+  const onAltClick = useCallback(
+    (e: React.MouseEvent) => {
+      if (!e.altKey) return;
+      const target = e.target as HTMLElement;
+      const block = target.closest?.(".trPage [data-tridx]") as HTMLElement | null;
+      if (block) {
+        const pageEl = block.closest("[data-page]") as HTMLElement | null;
+        const orig = getTrPage(Number(pageEl?.dataset.page))?.[Number(block.dataset.tridx)]?.text;
+        if (!orig) return;
+        e.preventDefault();
+        const r = block.getBoundingClientRect();
+        setSelBar(null);
+        setPop({ anchor: { x: r.left, y: r.bottom + 6 }, text: orig, label: "Оригинал", noTranslate: true });
+        return;
+      }
+      const span = target.closest?.(".textLayer span") as HTMLElement | null;
+      if (!span) return;
+      e.preventDefault();
+      const para = paragraphAround(span);
+      if (!para?.text) return;
+      setSelBar(null);
+      setPop({ anchor: { x: para.left, y: para.bottom + 6 }, text: para.text });
+    },
+    [getTrPage],
+  );
 
   // per-book view mode, persisted; default = original
   const setView = useCallback((m: ViewMode) => {
@@ -430,7 +563,7 @@ export default function App() {
           if (trRunRef.current !== ctrl) return;
           setTrInfo({ done: p.donePages, total: p.total });
           setTrEta(p.etaMs);
-          // refresh overlay data from the just-written store (a page completes
+          // refresh page data from the just-written store (a page completes
           // every ~10-30s; the reload is cheap next to that)
           booktranslate.loadBookTranslation(path).then((st) => {
             if (st && pathRef.current === path) {
@@ -620,6 +753,7 @@ export default function App() {
     setSelBar(null);
     setPop(null);
     setGlossOpen(false);
+    setMenuOpen(false);
     try {
       getCurrentWindow().setTitle("pdfer").catch(() => {});
     } catch {
@@ -662,11 +796,15 @@ export default function App() {
       else if (ctrl && e.code === "Digit1") { e.preventDefault(); setColsMode(1); }
       else if (ctrl && e.code === "Digit2") { e.preventDefault(); setColsMode(2); }
       else if (ctrl && e.code === "Digit3") { e.preventDefault(); setColsMode("auto"); }
+      // bare-letter hotkeys stay live while the «Перевод» menu is open — it has
+      // no text inputs, and T visibly flips the menu's own Ориг/Перевод row
       else if (!ctrl && !e.altKey && !typing && e.code === "KeyD") toggleDark();
       else if (!ctrl && !e.altKey && !typing && e.code === "KeyT") toggleView();
       else if (e.key === "Escape") {
-        // Esc peels UI layers before closing the book: глоссарий → перевод → выделение
-        if (glossRef.current) setGlossOpen(false);
+        // Esc peels UI layers before closing the book:
+        // меню → глоссарий → перевод → выделение
+        if (menuRef.current) setMenuOpen(false);
+        else if (glossRef.current) setGlossOpen(false);
         else if (popRef.current) setPop(null);
         else if (selBarRef.current) {
           setSelBar(null);
@@ -722,12 +860,14 @@ export default function App() {
   return (
     <div className={`${dark ? "dark" : ""} h-screen w-screen overflow-hidden bg-neutral-200 dark:bg-neutral-900 transition-colors`}>
       <div className="toolbar fixed top-3 left-1/2 -translate-x-1/2 z-10 flex items-center gap-1 rounded-full bg-white/85 dark:bg-neutral-800/85 backdrop-blur px-3 py-1.5 shadow-lg text-sm text-neutral-700 dark:text-neutral-200 select-none">
+        {/* left: library */}
         <button className="hover:opacity-60 px-1" onClick={doc ? closeBook : openDialog} title={doc ? "Библиотека (Esc)" : "Открыть файл (Ctrl+O)"}>
           {doc ? "Библиотека" : "Открыть файл"}
         </button>
         {doc && (
           <>
-            <span className="mx-2 opacity-40">·</span>
+            <span className="mx-2 h-4 w-px bg-neutral-900/15 dark:bg-neutral-100/20" />
+            {/* center: view controls — pages · zoom · columns */}
             <span className="tabular-nums opacity-70">{curPage} / {doc.numPages}</span>
             <span className="mx-2 opacity-40">·</span>
             <button className="hover:opacity-60 px-1.5" onClick={() => zoomTo(scale - 0.125)} title="Мельче (Ctrl −)">−</button>
@@ -744,56 +884,118 @@ export default function App() {
                 {c === "auto" ? "Авто" : c}
               </button>
             ))}
-            <span className="mx-2 opacity-40">·</span>
-            <button className="hover:opacity-60 px-1" onClick={() => setGlossOpen(true)} title="Глоссарий книги">
-              Глоссарий
-            </button>
-            <span className="mx-2 opacity-40">·</span>
-            {trRun ? (
-              <>
-                <span className="tabular-nums opacity-70 whitespace-nowrap">
-                  Перевод: {trPct}%{fmtEta(trEta)}
-                </span>
-                <button
-                  className="hover:opacity-60 px-1.5"
-                  onClick={() => trRunRef.current?.abort()}
-                  title="Пауза — готовые страницы сохранены, продолжить можно в любой момент"
-                >
-                  ⏸
-                </button>
-              </>
-            ) : trInfo === null ? (
+            <span className="mx-2 h-4 w-px bg-neutral-900/15 dark:bg-neutral-100/20" />
+            {/* right: «Перевод» dropdown (trigger shows live % while running) */}
+            <span className="relative" data-trmenu>
               <button
-                className="hover:opacity-60 px-1"
-                onClick={startTr}
-                title="Перевести всю книгу локальной моделью (можно прервать в любой момент)"
+                className="hover:opacity-60 px-1 whitespace-nowrap tabular-nums"
+                onClick={() => setMenuOpen((o) => !o)}
+                title="Перевод книги"
               >
-                Перевести книгу
+                {trRun ? `Перевод · ${trPct}%` : "Перевод"} <span className="text-[9px] opacity-60">▾</span>
               </button>
-            ) : trInfo.done < trInfo.total ? (
-              <button
-                className="hover:opacity-60 px-1"
-                onClick={startTr}
-                title={`Продолжить перевод (готово ${trInfo.done} из ${trInfo.total} страниц)`}
-              >
-                ▶ {trPct}%
-              </button>
-            ) : null}
-            {trInfo !== null && (
-              <>
-                <span className="mx-2 opacity-40">·</span>
-                {(["orig", "tr"] as const).map((m) => (
-                  <button
-                    key={m}
-                    className={`hover:opacity-60 px-1.5 ${viewMode === m ? "" : "opacity-40"}`}
-                    onClick={() => setView(m)}
-                    title={m === "orig" ? "Оригинал (T)" : "Перевод (T)"}
-                  >
-                    {m === "orig" ? "Ориг" : "Перевод"}
-                  </button>
-                ))}
-              </>
-            )}
+              {menuOpen && (
+                <div className="absolute right-0 top-full mt-2.5 z-20 w-64 rounded-xl bg-white/95 dark:bg-neutral-800/95 backdrop-blur shadow-xl p-1.5 text-left">
+                  {/* Ориг|Перевод segmented — mirrors hotkey T */}
+                  <div className={`flex gap-0.5 p-0.5 rounded-lg bg-neutral-100 dark:bg-neutral-900/50 ${trInfo === null ? "opacity-40" : ""}`}>
+                    {(["orig", "tr"] as const).map((m) => (
+                      <button
+                        key={m}
+                        disabled={trInfo === null}
+                        className={`flex-1 rounded-md px-2 py-1 ${
+                          viewMode === m && trInfo !== null
+                            ? "bg-white dark:bg-neutral-700 shadow-sm"
+                            : trInfo === null
+                              ? "cursor-default"
+                              : "opacity-50 hover:opacity-90"
+                        }`}
+                        onClick={() => setView(m)}
+                        title={trInfo === null ? "Сначала переведите книгу" : m === "orig" ? "Оригинал (T)" : "Перевод (T)"}
+                      >
+                        {m === "orig" ? "Оригинал" : "Перевод"}
+                      </button>
+                    ))}
+                  </div>
+                  <div className="mt-1">
+                    {trRun ? (
+                      <button
+                        className={`${MENU_ROW} tabular-nums`}
+                        onClick={() => trRunRef.current?.abort()}
+                        title="Пауза — готовые страницы сохранены, продолжить можно в любой момент"
+                      >
+                        Пауза · {trPct}%{fmtEta(trEta)}
+                      </button>
+                    ) : trInfo === null ? (
+                      <button
+                        className={MENU_ROW}
+                        onClick={startTr}
+                        title="Перевести всю книгу локальной моделью (можно прервать в любой момент)"
+                      >
+                        Перевести книгу
+                      </button>
+                    ) : trInfo.done < trInfo.total ? (
+                      <button
+                        className={`${MENU_ROW} tabular-nums`}
+                        onClick={startTr}
+                        title={`Продолжить перевод (готово ${trInfo.done} из ${trInfo.total} страниц)`}
+                      >
+                        Продолжить · {trPct}%
+                      </button>
+                    ) : (
+                      <div className="px-2.5 py-1.5 opacity-50">Переведено · 100%</div>
+                    )}
+                    {trInfo !== null &&
+                      (confirmRestart ? (
+                        <div className="px-2.5 py-1.5">
+                          <div className="opacity-70">Точно? Прогресс будет удалён</div>
+                          <div className="mt-0.5 flex gap-4">
+                            <button
+                              className="hover:opacity-60 text-red-600 dark:text-red-400"
+                              onClick={() => {
+                                setConfirmRestart(false);
+                                retranslate();
+                              }}
+                            >
+                              да
+                            </button>
+                            <button className="hover:opacity-60" onClick={() => setConfirmRestart(false)}>
+                              нет
+                            </button>
+                          </div>
+                        </div>
+                      ) : (
+                        <button
+                          className={MENU_ROW}
+                          onClick={() => setConfirmRestart(true)}
+                          title="Удалить сохранённый перевод книги и начать заново"
+                        >
+                          Перезапустить перевод
+                        </button>
+                      ))}
+                    <button
+                      className={MENU_ROW}
+                      onClick={() => {
+                        setMenuOpen(false);
+                        setGlossOpen(true);
+                      }}
+                      title="Глоссарий книги (термин = перевод, по строке)"
+                    >
+                      Глоссарий…
+                    </button>
+                  </div>
+                  {modelStatus && (
+                    <div className="mt-1 border-t border-neutral-200 dark:border-neutral-700 px-2.5 pt-1.5 pb-1 text-xs opacity-50">
+                      Модель:{" "}
+                      {modelStatus === "spawned" || modelStatus === "external"
+                        ? "работает"
+                        : modelStatus === "starting"
+                          ? "запускается"
+                          : "не найдена"}
+                    </div>
+                  )}
+                </div>
+              )}
+            </span>
           </>
         )}
         <span className="mx-2 opacity-40">·</span>
@@ -818,6 +1020,7 @@ export default function App() {
                 viewMode={viewMode}
                 trVersion={trVersion}
                 getTrPage={getTrPage}
+                getBodyFh={getBodyFh}
               />
             ))}
           </div>
@@ -841,6 +1044,8 @@ export default function App() {
           text={pop.text}
           context={pop.context}
           bookPath={path}
+          label={pop.label}
+          noTranslate={pop.noTranslate}
           onClose={() => setPop(null)}
         />
       )}

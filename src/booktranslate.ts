@@ -10,17 +10,23 @@ import { appDataDir } from "@tauri-apps/api/path";
 import { mkdir, readFile, remove, writeFile } from "@tauri-apps/plugin-fs";
 import type { PDFDocumentProxy } from "pdfjs-dist";
 import { clusterParagraphs, hash } from "./paragraphs";
-import type { Paragraph } from "./paragraphs";
+import type { Paragraph, ParaKind } from "./paragraphs";
 import { loadGlossaryText, parseGlossary, translate } from "./translate";
 import type { GlossaryEntry } from "./translate";
+
+// dev-console handle: __pdferDev spreads this module, so classification can be
+// inspected in the browser (clusterParagraphs(content.items, viewport)) without UI plumbing
+export { clusterParagraphs } from "./paragraphs";
 
 const MODEL = "HY-MT1.5-7B-Q4_K_M";
 const CONCURRENCY = 3; // worker count only — actual requests draw from the shared ≤3 budget in translate.ts
 const ETA_WINDOW = 5; // moving average over the last N text pages
 
+// v2: paragraphs carry fh (glyph height at scale 1) + kind; kind:"other"
+// (display math / figures / tables) is never translated — tr stays ""
 export type TrParagraph = Paragraph & { tr: string };
 export type BookTranslation = {
-  version: 1;
+  version: 2;
   bookPath: string;
   model: string;
   // glossary snapshot at start; later edits do not invalidate the store —
@@ -29,6 +35,17 @@ export type BookTranslation = {
   pages: Record<number, TrParagraph[]>;
   donePages: number[];
   total: number;
+  // median fh across prose paragraphs of completed pages — the v2 typesetter's
+  // uniform body size reference; refreshed after every completed page
+  bodyFh: number;
+};
+
+// on-disk shape across versions: v1 paragraphs lack fh/kind, v1 meta lacks bodyFh
+type StoredParagraph = Omit<TrParagraph, "fh" | "kind"> & { fh?: number; kind?: ParaKind };
+type StoredBookTranslation = Omit<BookTranslation, "version" | "pages" | "bodyFh"> & {
+  version: number;
+  pages: Record<number, StoredParagraph[]>;
+  bodyFh?: number;
 };
 export type BookProgress = { page: number; total: number; donePages: number; etaMs?: number };
 
@@ -61,10 +78,23 @@ async function writeStore(st: BookTranslation): Promise<void> {
   await writeFile(await storeFile(st.bookPath), new TextEncoder().encode(json));
 }
 
+// Accepts v1 and v2 stores. v1 data (pre fh/kind/bodyFh) is normalized in
+// memory — fh:0, kind:"prose" — so old translations keep rendering; the
+// version field is bumped to 2 here, so the engine's next writeStore persists
+// v2 (a mid-book v1→v2 resume simply continues into the same store).
 export async function loadBookTranslation(bookPath: string): Promise<BookTranslation | null> {
   try {
-    const st = JSON.parse((await readStore(bookPath)) ?? "") as BookTranslation;
-    return st.version === 1 && st.bookPath === bookPath ? st : null;
+    const st = JSON.parse((await readStore(bookPath)) ?? "") as StoredBookTranslation;
+    if ((st.version !== 1 && st.version !== 2) || st.bookPath !== bookPath) return null;
+    for (const paras of Object.values(st.pages)) {
+      for (const p of paras) {
+        p.fh ??= 0;
+        p.kind ??= "prose";
+      }
+    }
+    st.bodyFh ??= 0;
+    st.version = 2;
+    return st as BookTranslation;
   } catch {
     return null;
   }
@@ -91,6 +121,15 @@ export async function deleteBookTranslation(bookPath: string): Promise<void> {
 
 // ---- pipeline --------------------------------------------------------------
 
+// uniform body-size reference: median fh over prose paragraphs of every
+// completed page (pages map only ever holds completed pages)
+function medianBodyFh(pages: Record<number, TrParagraph[]>): number {
+  const fhs: number[] = [];
+  for (const paras of Object.values(pages)) for (const p of paras) if (p.kind === "prose" && p.fh > 0) fhs.push(p.fh);
+  fhs.sort((a, b) => a - b);
+  return fhs.length ? fhs[fhs.length >> 1] : 0;
+}
+
 // one paragraph: retry a failed request once, then give up with "" (the page
 // still completes); aborts always propagate so the page is NOT marked done
 async function translateRetry(text: string, glossary: GlossaryEntry[], signal?: AbortSignal): Promise<string> {
@@ -116,13 +155,14 @@ export async function startBookTranslation(
   const { onProgress, signal, pageLimit } = opts;
   const total = doc.numPages;
   const store: BookTranslation = (await loadBookTranslation(bookPath)) ?? {
-    version: 1,
+    version: 2,
     bookPath,
     model: MODEL,
     glossaryText: loadGlossaryText(bookPath),
     pages: {},
     donePages: [],
     total,
+    bodyFh: 0,
   };
   store.total = total;
   const done = new Set(store.donePages);
@@ -140,13 +180,16 @@ export async function startBookTranslation(
 
     const t0 = performance.now();
     const out: TrParagraph[] = paras.map((p) => ({ ...p, tr: "" }));
-    if (paras.length) {
+    // kind:"other" (display math / figures / tables) is skipped — tr stays "",
+    // the v2 typesetter crops the original region instead of translating it
+    const todo = out.filter((p) => p.kind === "prose");
+    if (todo.length) {
       let i = 0;
       const worker = async () => {
         for (;;) {
           const k = i++;
-          if (k >= paras.length || signal?.aborted) return;
-          out[k].tr = await translateRetry(paras[k].text, glossary, signal);
+          if (k >= todo.length || signal?.aborted) return;
+          todo[k].tr = await translateRetry(todo[k].text, glossary, signal);
         }
       };
       let aborted = false;
@@ -161,9 +204,10 @@ export async function startBookTranslation(
     store.pages[n] = out;
     done.add(n);
     store.donePages = [...done].sort((a, b) => a - b);
+    store.bodyFh = medianBodyFh(store.pages);
     await writeStore(store);
 
-    if (paras.length) {
+    if (todo.length) {
       durations.push(performance.now() - t0);
       if (durations.length > ETA_WINDOW) durations.shift();
     }

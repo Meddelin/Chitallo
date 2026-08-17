@@ -52,12 +52,19 @@ export function TranslatePopover({
   context,
   bookPath,
   onClose,
+  label,
+  noTranslate,
 }: {
   anchor: Anchor;
   text: string;
   context?: string;
   bookPath: string;
   onClose: () => void;
+  // header caption, default «Перевод»
+  label?: string;
+  // show text as-is, no model call — e.g. the stored original of an
+  // already-translated paragraph on a reflowed page (label «Оригинал»)
+  noTranslate?: boolean;
 }) {
   const ref = useRef<HTMLDivElement>(null);
   const [out, setOut] = useState("");
@@ -65,6 +72,11 @@ export function TranslatePopover({
   const [copied, setCopied] = useState(false);
 
   useEffect(() => {
+    if (noTranslate) {
+      setOut(text);
+      setPhase("done");
+      return;
+    }
     const ctrl = new AbortController();
     setOut("");
     setPhase("stream");
@@ -85,7 +97,7 @@ export function TranslatePopover({
       }
     })();
     return () => ctrl.abort();
-  }, [text, context, bookPath]);
+  }, [text, context, bookPath, noTranslate]);
 
   // position: after first paint and whenever content grows
   useEffect(() => {
@@ -116,7 +128,7 @@ export function TranslatePopover({
       onMouseDown={(e) => e.stopPropagation()}
     >
       <div className="flex items-center gap-2 px-3 pt-2 text-xs text-neutral-400 dark:text-neutral-500 select-none">
-        <span>Перевод</span>
+        <span>{label ?? "Перевод"}</span>
         <span className="flex-1" />
         {(phase === "done" || out) && (
           <button className="hover:opacity-60" onClick={copy}>
@@ -260,7 +272,8 @@ export function GlossaryModal({
                     title="Статистически извлечь термины из всей книги и перевести их локальной моделью; ваши строки не изменяются, добавляются только новые"
                     onClick={runGen}
                   >
-                    Собрать глоссарий
+                    {/* re-run keeps merge semantics: existing lines survive, only new terms are appended */}
+                    {text.trim() ? "Собрать заново" : "Собрать глоссарий"}
                   </button>
                   <span className="opacity-80">
                     {gen === null

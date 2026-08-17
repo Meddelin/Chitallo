@@ -96,32 +96,57 @@
   filter: invert(93%) hue-rotate(180deg);
 }
 
-/* Whole-book translation overlay: sibling of the canvas and .textLayer, so the
-   dark-mode invert filter (canvas-only) never applies here — both theme colors
-   are explicit. Boxes are positioned by Page from stored scale-1 bboxes. */
-.trLayer {
-  position: absolute;
-  inset: 0;
-  z-index: 3; /* above .textLayer (2) */
-}
-.trPara {
-  position: absolute;
-  box-sizing: border-box; /* bbox width/height include the padding */
-  overflow: hidden;
-  padding: 1px 2px; /* slim vertical padding — single-line boxes are tight */
+/* Whole-book translation, v2: a clean re-typeset page. Child of .page (which
+   supplies the shadow and the min-height = original page height); natural flow
+   height — taller than the original is fine. Both theme colors are explicit:
+   the dark invert filter is canvas-only and must never touch this text.
+   ONE uniform body size for the whole book: 15.5px × zoom scale. */
+.trPage {
+  position: relative;
+  box-sizing: border-box;
+  width: 100%;
+  padding: 6% 8.5%; /* of page width; 8.5% mirrors PAGE_PAD_X in App.tsx */
   background: #fff;
   color: #1c1c1c;
   font-family: Georgia, "Iowan Old Style", "Times New Roman", serif;
-  line-height: 1.35;
+  font-size: calc(var(--scale-factor, 1) * 15.5px);
+  line-height: 1.5;
+  text-align: justify;
+  hyphens: auto; /* effective via lang="ru" set by buildTrPage */
+  overflow-wrap: break-word;
   cursor: text;
   user-select: text;
 }
-.dark .trPara {
+.dark .trPage {
   background: #1a1a1a;
   color: #d8d8d8;
 }
-/* while reading the translation only the overlay is selectable — no double
-   selection from the original text layer underneath */
-.page:has(.trLayer) .textLayer {
-  pointer-events: none;
+.trPage p {
+  margin: 0.55em 0 0;
+}
+/* body paragraphs: first-line indent, «красная строка» */
+.trPage .trP {
+  text-indent: 1.5em;
+}
+/* headings: semibold, size set inline from the stored fh/bodyFh ratio */
+.trPage .trHead {
+  font-weight: 600;
+  line-height: 1.25;
+  text-align: left;
+  margin-top: 1.1em;
+}
+/* list items: hanging indent — wrapped lines align past the marker */
+.trPage .trHang {
+  padding-left: 1.4em;
+  text-indent: -1.4em;
+}
+/* inline image crops of non-translated regions (formulas/figures/tables and
+   failed paragraphs) — in flow, centered, natural size (buildTrPage sets px
+   width/height). Overrides the absolute .page canvas rule above; the
+   .dark .page canvas invert filter still matches, so crops invert in dark
+   mode exactly like the original render did. */
+.page canvas.trCrop {
+  position: static;
+  display: block;
+  margin: 0.7em auto;
 }
