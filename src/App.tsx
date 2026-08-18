@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { flushSync } from "react-dom";
 import { open } from "@tauri-apps/plugin-dialog";
 import { readFile } from "@tauri-apps/plugin-fs";
 import { openUrl, revealItemInDir } from "@tauri-apps/plugin-opener";
@@ -53,6 +54,8 @@ const MENU_QUIET =
   "w-full text-left text-neutral-500 dark:text-neutral-400 transition-colors hover:text-neutral-700 dark:hover:text-neutral-200";
 
 type Size = { w: number; h: number };
+// zoom fit presets: «По ширине» / «Страница целиком» — sticky until a manual zoom
+type FitMode = "width" | "page";
 type Cols = 1 | 2 | "auto";
 type ViewMode = "orig" | "tr";
 type TrRequest = { anchor: Anchor; text: string; context?: string; label?: string; noTranslate?: boolean };
@@ -686,6 +689,9 @@ export default function App() {
   const [path, setPath] = useState<string | null>(null);
   const [baseSize, setBaseSize] = useState<Size | null>(null);
   const [scale, setScale] = useState(DEFAULT_SCALE);
+  // active fit preset; kept across resizes/column changes, cleared by any
+  // manual zoom (Ctrl±, колесо, число из меню)
+  const [fitMode, setFitMode] = useState<FitMode | null>(null);
   const [curPage, setCurPage] = useState(1);
   const [dark, setDark] = useState(() => localStorage.getItem("pdfer:dark") === "1");
   const [cols, setCols] = useState<Cols>(() => {
@@ -693,6 +699,7 @@ export default function App() {
     return c === "2" ? 2 : c === "auto" ? "auto" : 1;
   });
   const [viewportW, setViewportW] = useState(() => window.innerWidth);
+  const [viewportH, setViewportH] = useState(() => window.innerHeight);
   const [selBar, setSelBar] = useState<SelBarState | null>(null);
   const [pop, setPop] = useState<TrRequest | null>(null);
   const [glossOpen, setGlossOpen] = useState(false);
@@ -727,6 +734,8 @@ export default function App() {
   });
   // ---- page-navigation flyout (indicator click: go-to-page + оглавление) ----
   const [navOpen, setNavOpen] = useState(false);
+  // ---- zoom-preset flyout (клик по «125%»: По ширине / целиком / числа) ----
+  const [zoomOpen, setZoomOpen] = useState(false);
   // ---- «Перевод» dropdown menu ----
   const [menuOpen, setMenuOpen] = useState(false);
   // inline confirm for «Перезапустить перевод»; reset whenever the menu closes
@@ -792,6 +801,8 @@ export default function App() {
   settingsRef.current = settingsOpen;
   const navOpenRef = useRef(navOpen);
   navOpenRef.current = navOpen;
+  const zoomOpenRef = useRef(zoomOpen);
+  zoomOpenRef.current = zoomOpen;
   const docRef = useRef<PDFDocumentProxy | null>(null);
   docRef.current = doc;
   const curPageRef = useRef(curPage);
@@ -1150,6 +1161,16 @@ export default function App() {
     return () => document.removeEventListener("pointerdown", onDown, true);
   }, [navOpen]);
 
+  // zoom-preset flyout: click outside closes (same pattern as the page-nav)
+  useEffect(() => {
+    if (!zoomOpen) return;
+    const onDown = (e: PointerEvent) => {
+      if (!(e.target as Element | null)?.closest?.("[data-zoommenu]")) setZoomOpen(false);
+    };
+    document.addEventListener("pointerdown", onDown, true);
+    return () => document.removeEventListener("pointerdown", onDown, true);
+  }, [zoomOpen]);
+
   // per-book view mode, persisted; default = original
   const setView = useCallback((m: ViewMode) => {
     setViewMode(m);
@@ -1330,6 +1351,7 @@ export default function App() {
 
     setBaseSize({ w: vp.width, h: vp.height });
     setScale(pos?.scale ?? DEFAULT_SCALE);
+    setFitMode(null); // the saved numeric scale wins over a stale fit preset
     setDoc(d);
     setPath(key);
     setCurPage(1);
@@ -1392,34 +1414,109 @@ export default function App() {
   }, [loadFile, loadBytes, showNotice]);
 
   const zoomTo = useCallback(
-    (next: number) => {
+    (next: number, opts?: { at?: { x: number; y: number }; fit?: FitMode }) => {
+      // a plain zoom leaves fit mode; «По ширине»/«Страница целиком» pass
+      // their mode through to stay sticky across resizes (before the equal-
+      // scale early return: re-picking the preset must still arm the mode)
+      setFitMode(opts?.fit ?? null);
       const clamped = Math.min(4, Math.max(0.5, next));
       const prev = scaleRef.current;
       if (clamped === prev) return;
       const el = scrollRef.current;
-      // anchor by the page row at the viewport top: in "auto" mode the column
-      // count can change with scale, so a linear scrollTop rescale drifts
+      // anchor by the page under `at` (viewport coords — Ctrl+wheel passes the
+      // cursor; default is the container's top-left, i.e. the old row-top
+      // behavior): in "auto" mode the column count can change with scale, so
+      // a linear scrollTop rescale drifts
+      const rect = el?.getBoundingClientRect();
+      const py = opts?.at && rect ? opts.at.y - rect.top : 0;
+      const px = opts?.at && rect ? opts.at.x - rect.left : 0;
+      const contentY = (el?.scrollTop ?? 0) + py;
+      const contentX = (el?.scrollLeft ?? 0) + px;
       let anchor: HTMLElement | null = null;
-      const top = el?.scrollTop ?? 0;
       if (el) {
         for (const c of el.querySelectorAll<HTMLElement>("[data-page]"))
-          if (c.offsetTop <= top && (!anchor || c.offsetTop > anchor.offsetTop)) anchor = c;
+          if (c.offsetTop <= contentY && (!anchor || c.offsetTop > anchor.offsetTop)) anchor = c;
+        if (anchor && opts?.at) {
+          // within that row, the page nearest the cursor horizontally — the
+          // row's first page would anchor X a whole column off
+          let bestD = Infinity;
+          for (const c of el.querySelectorAll<HTMLElement>("[data-page]")) {
+            if (c.offsetTop !== anchor.offsetTop) continue;
+            const d = Math.max(c.offsetLeft - contentX, contentX - c.offsetLeft - c.offsetWidth, 0);
+            if (d < bestD) { bestD = d; anchor = c; }
+          }
+        }
       }
-      const frac = anchor ? (top - anchor.offsetTop) / Math.max(1, anchor.offsetHeight) : 0;
-      setScale(clamped);
+      const a = anchor;
+      const fracY = a ? (contentY - a.offsetTop) / Math.max(1, a.offsetHeight) : 0;
+      const fracX = a ? (contentX - a.offsetLeft) / Math.max(1, a.offsetWidth) : 0;
+      // flushSync: the anchor's fresh offsets must be read from the committed
+      // re-layout — rAF timing is NOT guaranteed to follow the async commit
+      // (a stale read reproduces the old scrollTop and the view drifts)
+      flushSync(() => setScale(clamped));
       if (el) {
-        requestAnimationFrame(() =>
-          requestAnimationFrame(() => {
-            el.scrollTop = anchor
-              ? anchor.offsetTop + frac * anchor.offsetHeight
-              : (top * clamped) / prev;
-            savePos();
-          }),
-        );
+        el.scrollTop = a ? a.offsetTop + fracY * a.offsetHeight - py : (contentY * clamped) / prev - py;
+        // X only matters for cursor-anchored zoom (h-overflow at high zoom);
+        // the browser clamps when the content fits
+        if (a && opts?.at) el.scrollLeft = a.offsetLeft + fracX * a.offsetWidth - px;
+        savePos();
       }
     },
     [savePos],
   );
+
+  // fit scale from the live geometry. Column count: fixed modes as chosen;
+  // «авто» keeps the count it currently shows (the resulting scale re-yields
+  // the same count under the packing rule, so the pair is stable)
+  const fitScaleFor = useCallback(
+    (mode: FitMode): number | null => {
+      if (!baseSize) return null;
+      // live clientWidth/clientHeight, not the memoized viewport state: the
+      // state is re-measured only on resize/sidebar changes, and a transient
+      // horizontal scrollbar (overflow at the pre-fit zoom) would otherwise
+      // keep shaving ~15px off clientHeight long after it's gone.
+      // viewportW/viewportH stay in the deps so the sticky-fit effect still
+      // recomputes on resize/sidebar changes
+      const vw = scrollRef.current?.clientWidth ?? viewportW;
+      const vh = scrollRef.current?.clientHeight ?? viewportH;
+      const n = Math.max(
+        1,
+        Math.min(
+          cols === "auto" ? Math.floor(vw / (baseSize.w * scaleRef.current + PAGE_GAP)) || 1 : cols,
+          docRef.current?.numPages ?? 1,
+        ),
+      );
+      // PAGE_GAP of air on both sides; in «авто» this also keeps
+      // floor(vw / (w·scale + gap)) at exactly n
+      const fitW = (vw - (n + 1) * PAGE_GAP) / (n * baseSize.w);
+      return mode === "width" ? fitW : Math.min(fitW, (vh - 2 * PAGE_GAP) / baseSize.h);
+    },
+    [baseSize, cols, viewportW, viewportH],
+  );
+
+  const applyFit = useCallback(
+    (mode: FitMode) => {
+      const s = fitScaleFor(mode);
+      if (s === null) return;
+      zoomTo(s, { fit: mode });
+      // the fit may have just removed the horizontal scrollbar, growing
+      // clientHeight — zoomTo flushSyncs, so a fresh read sees the final
+      // geometry; re-apply once if the fit moved
+      const s2 = fitScaleFor(mode);
+      if (s2 !== null && Math.abs(s2 - s) > 1e-4) zoomTo(s2, { fit: mode });
+    },
+    [fitScaleFor, zoomTo],
+  );
+
+  // sticky fit: window resizes, the «Спросить» sidebar and column-mode
+  // changes all land in fitScaleFor's inputs — recompute until a manual zoom
+  // clears the mode. Deferred via setTimeout: zoomTo flushSyncs, which React
+  // rejects when this effect is flushed inside another sync render
+  useEffect(() => {
+    if (!fitMode || !doc) return;
+    const id = window.setTimeout(() => applyFit(fitMode), 0);
+    return () => window.clearTimeout(id);
+  }, [fitMode, applyFit, doc]);
 
   const closeBook = useCallback(() => {
     savePos();
@@ -1437,6 +1534,8 @@ export default function App() {
     setPop(null);
     setGlossOpen(false);
     setMenuOpen(false);
+    setZoomOpen(false);
+    setFitMode(null);
     setFindOpen(false);
     setFindSeed(null);
     setNavOpen(false);
@@ -1577,10 +1676,14 @@ export default function App() {
     setCols(c);
   }, []);
 
-  // viewport width for "auto" columns (clientWidth excludes the scrollbar);
-  // askOpen is a dep — the sidebar changes the reading width with no resize event
+  // viewport size for "auto" columns and the fit presets (clientWidth
+  // excludes the scrollbar); askOpen is a dep — the sidebar changes the
+  // reading width with no resize event
   useEffect(() => {
-    const measure = () => setViewportW(scrollRef.current?.clientWidth ?? window.innerWidth);
+    const measure = () => {
+      setViewportW(scrollRef.current?.clientWidth ?? window.innerWidth);
+      setViewportH(scrollRef.current?.clientHeight ?? window.innerHeight);
+    };
     measure();
     let t: number | undefined;
     const onResize = () => { clearTimeout(t); t = window.setTimeout(measure, 150); };
@@ -1598,7 +1701,7 @@ export default function App() {
       else if (ctrl && e.code === "KeyF") { e.preventDefault(); openFind(); }
       else if (ctrl && (e.key === "=" || e.key === "+")) { e.preventDefault(); zoomTo(scaleRef.current + 0.125); }
       else if (ctrl && e.key === "-") { e.preventDefault(); zoomTo(scaleRef.current - 0.125); }
-      else if (ctrl && e.key === "0") { e.preventDefault(); zoomTo(DEFAULT_SCALE); }
+      else if (ctrl && e.key === "0") { e.preventDefault(); applyFit("width"); }
       else if (ctrl && e.code === "Digit1") { e.preventDefault(); setColsMode(1); }
       else if (ctrl && e.code === "Digit2") { e.preventDefault(); setColsMode(2); }
       else if (ctrl && e.code === "Digit3") { e.preventDefault(); setColsMode("auto"); }
@@ -1608,6 +1711,7 @@ export default function App() {
         e.preventDefault();
         setMenuOpen(false);
         setNavOpen(false);
+        setZoomOpen(false);
         setShortcutsOpen(false);
         setPaletteSel(selBarRef.current); // before the input focus kills the bar
         setPaletteOpen((o) => !o);
@@ -1672,7 +1776,7 @@ export default function App() {
       }
       else if (e.key === "Escape") {
         // Esc peels UI layers before closing the book:
-        // палитра → шорткаты → «О pdfer» → настройки → оглавление → меню → модель → глоссарий → перевод → поиск → сайдбар (только при фокусе в нём) → выделение
+        // палитра → шорткаты → «О pdfer» → настройки → оглавление → масштаб → меню → модель → глоссарий → перевод → поиск → сайдбар (только при фокусе в нём) → выделение
         // (Esc typed INSIDE the find/page/palette inputs is handled there and never reaches this chain)
         const ae = document.activeElement as HTMLElement | null;
         if (paletteRef.current) setPaletteOpen(false);
@@ -1680,6 +1784,7 @@ export default function App() {
         else if (aboutRef.current) setAboutOpen(false);
         else if (settingsRef.current) setSettingsOpen(false);
         else if (navOpenRef.current) setNavOpen(false);
+        else if (zoomOpenRef.current) setZoomOpen(false);
         else if (menuRef.current) setMenuOpen(false);
         else if (setupRef.current) setSetupOpen(false);
         else if (glossRef.current) setGlossOpen(false);
@@ -1699,16 +1804,16 @@ export default function App() {
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [openDialog, openFind, zoomTo, toggleDark, closeBook, setColsMode, toggleView, toggleAsk, setAsk, histNav, peekOriginal]);
+  }, [openDialog, openFind, zoomTo, applyFit, toggleDark, closeBook, setColsMode, toggleView, toggleAsk, setAsk, histNav, peekOriginal]);
 
-  // Ctrl+wheel zoom (non-passive, to suppress webview page zoom)
+  // Ctrl+wheel zoom, anchored at the cursor (non-passive, to suppress webview page zoom)
   useEffect(() => {
     const el = scrollRef.current;
     if (!el) return;
     const onWheel = (e: WheelEvent) => {
       if (e.ctrlKey) {
         e.preventDefault();
-        zoomTo(scaleRef.current * (e.deltaY < 0 ? 1.1 : 1 / 1.1));
+        zoomTo(scaleRef.current * (e.deltaY < 0 ? 1.1 : 1 / 1.1), { at: { x: e.clientX, y: e.clientY } });
       }
     };
     el.addEventListener("wheel", onWheel, { passive: false });
@@ -1820,7 +1925,8 @@ export default function App() {
         { id: "ask", label: "Спросить", hint: "Ctrl+J", keywords: "вопрос чат claude ask", run: toggleAsk },
         { id: "zin", label: "Крупнее", hint: "Ctrl +", keywords: "масштаб zoom", run: () => zoomTo(scaleRef.current + 0.125) },
         { id: "zout", label: "Мельче", hint: "Ctrl −", keywords: "масштаб zoom", run: () => zoomTo(scaleRef.current - 0.125) },
-        { id: "zreset", label: "Сбросить масштаб", hint: "Ctrl+0", keywords: "масштаб zoom", run: () => zoomTo(DEFAULT_SCALE) },
+        { id: "zwidth", label: "По ширине", hint: "Ctrl+0", keywords: "масштаб zoom ширина fit width", run: () => applyFit("width") },
+        { id: "zpage", label: "Страница целиком", keywords: "масштаб zoom страница fit page", run: () => applyFit("page") },
         { id: "c1", label: "Одна страница в ряд", hint: "Ctrl+1", keywords: "колонки columns", run: () => setColsMode(1) },
         { id: "c2", label: "Две страницы в ряд", hint: "Ctrl+2", keywords: "колонки columns", run: () => setColsMode(2) },
         { id: "cauto", label: "Автоподбор по ширине", hint: "Ctrl+3", keywords: "колонки columns авто", run: () => setColsMode("auto") },
@@ -1904,9 +2010,46 @@ export default function App() {
             </span>
             <span className="mx-2 h-4 w-px bg-neutral-900/15 dark:bg-neutral-100/20" />
             {/* group «вид»: масштаб · колонки · тема */}
-            <button className={`${TB_BTN} px-1.5`} onClick={() => zoomTo(scale - 0.125)} title="Мельче (Ctrl −)">−</button>
-            <span className="tabular-nums text-neutral-600 dark:text-neutral-300 w-11 text-center">{Math.round(scale * 100)}%</span>
-            <button className={`${TB_BTN} px-1.5`} onClick={() => zoomTo(scale + 0.125)} title="Крупнее (Ctrl +)">+</button>
+            <button className={`${TB_BTN} px-1.5`} onClick={() => zoomTo(scale - 0.125)} title="Мельче (Ctrl −, Ctrl+0 — по ширине)">−</button>
+            <span className="relative" data-zoommenu>
+              <button
+                className={`${TB_BTN} tabular-nums text-neutral-600 dark:text-neutral-300 hover:text-neutral-800 dark:hover:text-neutral-100 w-11 text-center`}
+                onClick={() => setZoomOpen((o) => !o)}
+                title="Масштаб: пресеты (Ctrl+0 — по ширине)"
+              >
+                {Math.round(scale * 100)}%
+              </button>
+              {zoomOpen && (
+                <div className="overlay-pop absolute left-1/2 -translate-x-1/2 top-full mt-2.5 z-20 rounded-xl bg-white/95 dark:bg-neutral-800/95 backdrop-blur shadow-xl p-1.5 text-left">
+                  {(
+                    [
+                      ["width", "По ширине", "Ctrl+0"],
+                      ["page", "Страница целиком", null],
+                    ] as const
+                  ).map(([m, label, hint]) => (
+                    <button
+                      key={m}
+                      className={`${MENU_ROW} flex items-baseline justify-between gap-4${fitMode === m ? " text-accent" : ""}`}
+                      onClick={() => { setZoomOpen(false); applyFit(m); }}
+                    >
+                      {label}
+                      {hint && <span className="text-xs text-neutral-400 dark:text-neutral-500">{hint}</span>}
+                    </button>
+                  ))}
+                  <div className="mx-1 my-1 h-px bg-neutral-900/10 dark:bg-neutral-100/10" />
+                  {[1, 1.25, 1.5, 2].map((s) => (
+                    <button
+                      key={s}
+                      className={`${MENU_ROW} tabular-nums${fitMode === null && Math.round(scale * 100) === s * 100 ? " text-accent" : ""}`}
+                      onClick={() => { setZoomOpen(false); zoomTo(s); }}
+                    >
+                      {s * 100}%
+                    </button>
+                  ))}
+                </div>
+              )}
+            </span>
+            <button className={`${TB_BTN} px-1.5`} onClick={() => zoomTo(scale + 0.125)} title="Крупнее (Ctrl +, Ctrl+0 — по ширине)">+</button>
             <span className="ml-1 flex items-center gap-1">
               {/* active column mode carries the accent — the app's one active color */}
               {([1, 2, "auto"] as const).map((c) => (
@@ -2113,7 +2256,7 @@ export default function App() {
                         setMenuOpen(false);
                         setGlossOpen(true);
                       }}
-                      title="Глоссарий книги (термин = перевод, по строке)"
+                      title="Термины книги и их переводы — используются при переводе"
                     >
                       Глоссарий…
                     </button>

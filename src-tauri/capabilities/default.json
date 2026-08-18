@@ -1,7 +1,7 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
-  "description": "Capability for the main window. NOTE for the wave-3 scope-narrowing agent: $DOWNLOAD/** under fs:allow-write-file is a DELIBERATE exception — one-click «Экспорт перевода» writes the HTML straight to the Downloads folder without a save dialog (src/export.ts exportTranslationToDownloads). Keep it when narrowing the broad ** read scopes.",
+  "description": "Capability for the main window. SCOPE DECISIONS (WP-R, verified 2026-08-18): READ side (read-file/read-dir/stat/watch/unwatch) deliberately stays at ** — the library folder is an arbitrary user-chosen path (localStorage pdfer:libdir) scanned via readDir+watchImmediate on every launch, and pdfer:last auto-reopens the previous book at startup, both WITHOUT a dialog. Dialog-granted paths cannot cover this: tauri-plugin-dialog adds picked paths to the fs scope at runtime (commands.rs allow_file/allow_directory), but that scope is an in-memory Mutex<HashSet<Pattern>> (tauri/src/scope/fs.rs ScopeInner.allowed_patterns) and is lost on restart; persistence would require the tauri-plugin-persisted-scope crate, which this app does not ship. Narrowing read to $APPDATA would break library + last-book reopen after every restart. WRITE side is narrow: $APPDATA/** for stores/glossaries/models/markers, plus $DOWNLOAD/** under fs:allow-write-file as a DELIBERATE exception — one-click «Экспорт перевода» writes the HTML straight to the Downloads folder without a save dialog (src/export.ts exportTranslationToDownloads). mkdir/remove/rename stay $APPDATA-only.",
   "windows": ["main"],
   "permissions": [
     "core:default",

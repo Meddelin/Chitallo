@@ -277,7 +277,7 @@ export function AskSidebar({
           onEvent: ch,
         });
       } else {
-        push(path, { role: "assistant", text: "Вопросы к Claude доступны только в приложении pdfer.", error: true });
+        push(path, { role: "assistant", text: "Вопросы к Claude доступны только в приложении pdfer", error: true });
         return;
       }
       // assertion: TS narrows the ref to its pre-await null, blind to onLine's writes
@@ -358,7 +358,7 @@ export function AskSidebar({
             onClick={newThread}
             title="Начать новую беседу — история и память беседы будут очищены"
           >
-            новая беседа
+            Новая беседа
           </button>
         )}
         <button

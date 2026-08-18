@@ -171,7 +171,7 @@ export function Palette({
           className="border-t border-neutral-200 dark:border-neutral-700 max-h-[45vh] overflow-y-auto overscroll-contain p-1.5"
         >
           {rows.length === 0 ? (
-            <div className="px-2.5 py-1.5 text-neutral-500 dark:text-neutral-400 cursor-default">Ничего не найдено</div>
+            <div className="px-2.5 py-1.5 text-neutral-500 dark:text-neutral-400 cursor-default">Ничего не нашлось</div>
           ) : (
             rows.map((r, i) => (
               <button
@@ -219,7 +219,7 @@ const GROUPS: { name: string; rows: [string, string][] }[] = [
     name: "Вид",
     rows: [
       ["Ctrl + / − / колесо", "Масштаб"],
-      ["Ctrl+0", "Сбросить масштаб"],
+      ["Ctrl+0", "По ширине"],
       ["Ctrl+1 / 2 / 3", "Колонки: одна, две, авто"],
       ["D", "Тёмная тема"],
     ],

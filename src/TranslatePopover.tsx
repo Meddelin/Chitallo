@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
 import type { PDFDocumentProxy } from "pdfjs-dist";
 import { invoke } from "@tauri-apps/api/core";
 import { extractTerms, mergeGlossary, translateTerms } from "./glossarygen";
@@ -40,6 +40,27 @@ function clampToViewport(el: HTMLElement, a: Anchor) {
       : a.y;
   el.style.left = `${x}px`;
   el.style.top = `${y}px`;
+}
+
+// WP-Q: the translate popover's position is computed ONCE per anchor and never
+// again — while the answer streams in, the popover only grows downward and
+// then scrolls inside itself, it never slides around under the cursor.
+// Reservations make the one-shot clamp safe: the full max-w is reserved
+// horizontally (width grows toward it as text streams), and MIN_RESERVE px
+// vertically (instantly-full popovers — «Оригинал» — measure real height
+// instead). maxHeight caps growth at the viewport edge; past it the flex
+// column shrinks the scrollable body.
+const MIN_RESERVE = 160;
+function placePopover(el: HTMLElement, a: Anchor) {
+  const pad = 8;
+  const r = el.getBoundingClientRect();
+  const maxW = Math.min(parseFloat(getComputedStyle(el).maxWidth) || r.width, window.innerWidth - 2 * pad);
+  const x = Math.min(Math.max(pad, a.x), window.innerWidth - maxW - pad);
+  const reserve = Math.max(r.height, MIN_RESERVE);
+  const y = Math.min(a.y, Math.max(pad, window.innerHeight - reserve - pad));
+  el.style.left = `${x}px`;
+  el.style.top = `${y}px`;
+  el.style.maxHeight = `${window.innerHeight - y - pad}px`;
 }
 
 // ---- selection mini-toolbar: «Перевести»/«Оригинал» + «Спросить» -----------
@@ -117,8 +138,12 @@ export function TranslatePopover({
   noTranslate?: boolean;
 }) {
   const ref = useRef<HTMLDivElement>(null);
-  const [out, setOut] = useState("");
-  const [phase, setPhase] = useState<"stream" | "done" | "starting" | "nomodel" | "dead" | "error">("stream");
+  // noTranslate mounts with its full text so the one-shot placement below
+  // measures the real height (no stream will ever grow it)
+  const [out, setOut] = useState(() => (noTranslate ? text : ""));
+  const [phase, setPhase] = useState<"stream" | "done" | "starting" | "nomodel" | "dead" | "error">(
+    noTranslate ? "done" : "stream",
+  );
   const [copied, setCopied] = useState(false);
   // «Повторить» bumps this to re-run the whole effect
   const [attempt, setAttempt] = useState(0);
@@ -174,10 +199,11 @@ export function TranslatePopover({
     return () => ctrl.abort();
   }, [text, context, bookPath, noTranslate, attempt]);
 
-  // position: after first paint and whenever content grows
-  useEffect(() => {
-    if (ref.current) clampToViewport(ref.current, anchor);
-  }, [anchor, out, phase]);
+  // position: once per anchor, before first paint — and never on content
+  // growth (WP-Q: no jumping while the translation streams in)
+  useLayoutEffect(() => {
+    if (ref.current) placePopover(ref.current, anchor);
+  }, [anchor]);
 
   // click outside closes (capture pointerdown so text-layer mousedown doesn't race)
   useEffect(() => {
@@ -199,10 +225,10 @@ export function TranslatePopover({
     <div
       ref={ref}
       data-popover
-      className="overlay-pop fixed z-30 w-max max-w-[26rem] rounded-xl bg-white/95 dark:bg-neutral-800/95 backdrop-blur shadow-xl text-sm text-neutral-800 dark:text-neutral-100"
+      className="overlay-pop fixed z-30 flex w-max max-w-[26rem] flex-col rounded-xl bg-white/95 dark:bg-neutral-800/95 backdrop-blur shadow-xl text-sm text-neutral-800 dark:text-neutral-100"
       onMouseDown={(e) => e.stopPropagation()}
     >
-      <div className="flex items-center gap-2 px-3 pt-2 text-xs text-neutral-500 dark:text-neutral-400 select-none">
+      <div className="flex shrink-0 items-center gap-2 px-3 pt-2 text-xs text-neutral-500 dark:text-neutral-400 select-none">
         <span>{label ?? "Перевод"}</span>
         <span className="flex-1" />
         {(phase === "done" || out) && (
@@ -214,7 +240,7 @@ export function TranslatePopover({
           <IconClose />
         </button>
       </div>
-      <div className="px-3 pb-2.5 pt-1 max-h-[45vh] overflow-y-auto leading-relaxed whitespace-pre-wrap">
+      <div className="min-h-0 px-3 pb-2.5 pt-1 max-h-[45vh] overflow-y-auto leading-relaxed whitespace-pre-wrap">
         {phase === "starting" ? (
           <span className="flex items-center gap-2 text-neutral-500 dark:text-neutral-400">
             <Spinner /> Модель запускается… ≈20 с
@@ -265,7 +291,7 @@ export function TranslatePopover({
         )}
       </div>
       {showAltHint && (
-        <div className="border-t border-neutral-200/70 dark:border-neutral-700/70 px-3 py-1.5 text-xs text-neutral-500 dark:text-neutral-400 select-none">
+        <div className="shrink-0 border-t border-neutral-200/70 dark:border-neutral-700/70 px-3 py-1.5 text-xs text-neutral-500 dark:text-neutral-400 select-none">
           Alt+клик по абзацу — перевод целиком
         </div>
       )}
@@ -330,6 +356,11 @@ async function ensureAux(signal: AbortSignal): Promise<boolean> {
 const GEN_BTN =
   "inline-flex items-center gap-2 rounded-lg bg-neutral-900 px-3 py-1.5 text-[13px] font-medium text-white dark:bg-neutral-100 dark:text-neutral-900";
 const QUIET_LINK = "transition-colors hover:text-neutral-700 dark:hover:text-neutral-200 underline underline-offset-2";
+// the app-wide destructive-confirm idiom (WP-Q, #11/#12): consequence text +
+// red button naming the action + «Отмена» — same classes as App.tsx
+// («Перевести заново») and Settings.tsx (model/store deletes)
+const RED_BTN = "-mx-1 px-1 rounded text-red-600 dark:text-red-400 transition-colors hover:bg-red-500/10";
+const PLAIN_BTN = "-mx-1 px-1 rounded transition-colors hover:bg-neutral-100 dark:hover:bg-neutral-700/70";
 
 export function GlossaryModal({
   bookPath,
@@ -491,7 +522,7 @@ export function GlossaryModal({
                   <>
                     <span>Список будет заменён, ручные правки пропадут</span>
                     <button
-                      className="text-red-600 dark:text-red-400 underline underline-offset-2 transition-colors hover:text-red-700 dark:hover:text-red-300"
+                      className={RED_BTN}
                       onClick={() => {
                         setConfirmRebuild(false);
                         runGen(true); // fresh run — the result replaces the list
@@ -499,7 +530,7 @@ export function GlossaryModal({
                     >
                       Заменить
                     </button>
-                    <button className={QUIET_LINK} onClick={() => setConfirmRebuild(false)}>
+                    <button className={PLAIN_BTN} onClick={() => setConfirmRebuild(false)}>
                       Отмена
                     </button>
                   </>
@@ -510,7 +541,7 @@ export function GlossaryModal({
                       title={
                         text.trim()
                           ? "Пересобрать глоссарий с нуля — текущий список будет заменён (с подтверждением)"
-                          : "Статистически извлечь термины из всей книги и перевести их локальной моделью"
+                          : "Найти термины во всей книге и перевести их локальной моделью"
                       }
                       onClick={() => (text.trim() ? setConfirmRebuild(true) : runGen())}
                     >
@@ -525,7 +556,7 @@ export function GlossaryModal({
                       }
                     >
                       {gen === null
-                        ? "~2–3 мин, термины извлекаются из всей книги"
+                        ? "~2–3 мин, поиск терминов по всей книге"
                         : gen.phase === "done"
                           ? `Добавлено: ${gen.added}` + (gen.skipped ? ` · не переведено: ${gen.skipped}` : "")
                           : gen.msg}
@@ -570,7 +601,7 @@ export function GlossaryModal({
                     onClick={() => genCtrl.current?.abort()}
                     title="Остановить — уже переведённые термины будут добавлены"
                   >
-                    Отмена
+                    Отменить
                   </button>
                 </>
               ))}
@@ -597,7 +628,7 @@ export function GlossaryModal({
           <div className="mt-1.5 flex items-center gap-2 text-xs text-neutral-500 dark:text-neutral-400 select-none">
             {dlBusy(auxDl) ? (
               <>
-                <span className="tabular-nums">Модель терминов: {dlProgressLine(auxDl)}</span>
+                <span className="tabular-nums">Дополнительная модель: {dlProgressLine(auxDl)}</span>
                 <button className={QUIET_LINK} onClick={() => cancelDownload("aux")}>
                   Отменить
                 </button>
