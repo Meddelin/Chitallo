@@ -23,6 +23,8 @@ import { useAskWidth } from "./askwidth";
 import type { AskSeed } from "./AskSidebar";
 import { FIG_CONTAIN, buildFrags, growParagraph, interArea, medianLineH, paraText } from "./paragraphs";
 import type { FigureRegion, Word } from "./paragraphs";
+import { CROP_DPR, CROP_K, blankProbe, blitCrop, cropCanvas, cropSrc, cropViewport, cropWindow, isBlankCrop, releaseCanvas } from "./crops";
+import type { CropWindow } from "./crops";
 import { splitCitations } from "./cite";
 import * as booktranslate from "./booktranslate";
 import type { TrParagraph } from "./booktranslate";
@@ -263,8 +265,20 @@ const CROP_PAD = 3; // scale-1 px of original context kept around a cropped regi
 const PAGE_PAD_X = 0.085; // trPage horizontal padding as a fraction of page width — mirrors App.css
 
 // fig: candidate figure region (geometric detection) — subject to the
-// blank-margin pixel check in drawCrops; para crops are always drawn
-type Crop = { canvas: HTMLCanvasElement; x: number; y: number; w: number; h: number; fig?: boolean }; // scale-1 rect
+// blank-margin pixel check in drawCrops; para crops are always drawn.
+// cssW/cssH: the on-screen size the block already occupies (fixed in addCrop
+// before the raster exists), which is what drawCrops sizes the backing store
+// against — see CROP_DPR.
+type Crop = {
+  canvas: HTMLCanvasElement;
+  x: number;
+  y: number;
+  w: number;
+  h: number;
+  cssW: number;
+  cssH: number;
+  fig?: boolean;
+}; // scale-1 rect
 
 // Translated text → block content. Citation references («[Devlin et al. 2018]»,
 // «[Карпухин и др., 2020]») become <span class="cite">: the original prints
@@ -345,7 +359,7 @@ function buildTrPage(
     if (tridx !== null) c.dataset.tridx = String(tridx);
     c.dataset.crop = `${Math.round(x)},${Math.round(y)},${Math.round(w)},${Math.round(h)}`; // dev/test introspection
     root.append(c);
-    crops.push({ canvas: c, x, y, w, h, fig });
+    crops.push({ canvas: c, x, y, w, h, cssW, cssH, fig });
   };
 
   // figure regions in reading order; a monotonic cursor interleaves them into
@@ -362,6 +376,10 @@ function buildTrPage(
     // running header/footer: never rendered — the reflow replaces the page
     // geometry these navigation aids annotate (see detectFurniture)
     if (p.kind === "furniture") return;
+    // stitched continuation half: this paragraph's text was absorbed by the
+    // paragraph it continues on an EARLIER page and translated whole there
+    // (booktranslate contOf) — rendering it here would duplicate the text
+    if (p.contOf) return;
     // Containment dedup for EVERY kind, prose included: a paragraph mostly
     // inside a figure region (diagram label, table cell, raster-overlapped
     // band) already shows its pixels in the region's crop — flowing it as a
@@ -398,72 +416,30 @@ function buildTrPage(
   return { root, crops };
 }
 
-// Blank-candidate detection: geometric figure candidates are often just tall
-// whitespace (TOC leading, chapter-opener margins). The offscreen page render
-// already exists for cropping, so sample the candidate's area downsampled to
-// ≤32×32 (canvas drawImage area-averages) and measure the luminance spread.
-// Blank = variance < BLANK_VAR AND min-max range < BLANK_RANGE. Tuning math
-// (255-luminance scale, 32×32 = 1024 samples): a pure margin is a constant
-// fill → variance ~0, range 0. One hairline dark rule across the region
-// averages to ≈1 row at ~214 → variance ≈ 48; a single small dark mark ≈ 1
-// sample at 100 → variance ≈ 22, range ≈ 155; a light-gray diagram (strokes
-// ≈ 240 post-averaging, 5% cover) → variance ≈ 10, range ≈ 15+... all pass.
-// False-positive side: only marks fainter than ~8 luminance levels off the
-// background (invisible in practice) or covering <0.1% of the region can be
-// skipped. The check runs on the ORIGINAL render — the dark-mode invert is a
-// CSS filter and never reaches these pixels.
-const BLANK_VAR = 4;
-const BLANK_RANGE = 24;
-const SAMPLE = 32;
-
-// copy each crop's region out of the full-page offscreen render (scale × dpr);
-// the offscreen canvas is discarded by the caller right after. fig-flagged
-// crops (candidate figure regions) that sample as blank are REMOVED from the
-// flow instead of drawn.
-function drawCrops(off: HTMLCanvasElement, crops: Crop[], scale: number, dpr: number) {
-  const k = scale * dpr;
+// Copy each crop's region out of the offscreen WINDOW raster (see crops.ts:
+// the window covers only the page band that holds crops, rendered at
+// CROP_K = 4 device px per PDF point). Each crop's backing store is then
+// area-downsampled to CROP_DPR device px per CSS px — supersampling, so the
+// 4× raster buys real detail instead of a buffer the compositor has to
+// bilinear-crush. The window canvas is released by the caller right after.
+// fig-flagged crops (candidate figure regions) that sample as blank are
+// REMOVED from the flow instead of drawn.
+function drawCrops(off: HTMLCanvasElement, win: CropWindow, crops: Crop[], dpr: number) {
   let probe: CanvasRenderingContext2D | null = null;
   for (const cr of crops) {
-    const sx = Math.min(off.width, Math.round(cr.x * k));
-    const sy = Math.min(off.height, Math.round(cr.y * k));
-    const sw = Math.min(off.width - sx, Math.round(cr.w * k));
-    const sh = Math.min(off.height - sy, Math.round(cr.h * k));
-    if (sw <= 0 || sh <= 0) {
+    const s = cropSrc(win, cr);
+    if (s.sw <= 0 || s.sh <= 0) {
       if (cr.fig) cr.canvas.remove();
       continue;
     }
     if (cr.fig) {
-      if (!probe) {
-        const c = document.createElement("canvas");
-        c.width = SAMPLE;
-        c.height = SAMPLE;
-        probe = c.getContext("2d", { willReadFrequently: true })!;
-      }
-      const pw = Math.min(SAMPLE, sw);
-      const ph = Math.min(SAMPLE, sh);
-      probe.drawImage(off, sx, sy, sw, sh, 0, 0, pw, ph);
-      const d = probe.getImageData(0, 0, pw, ph).data;
-      let s = 0;
-      let s2 = 0;
-      let lo = 255;
-      let hi = 0;
-      const n = pw * ph;
-      for (let i = 0; i < d.length; i += 4) {
-        const y = 0.2126 * d[i] + 0.7152 * d[i + 1] + 0.0722 * d[i + 2];
-        s += y;
-        s2 += y * y;
-        if (y < lo) lo = y;
-        if (y > hi) hi = y;
-      }
-      const mean = s / n;
-      if (s2 / n - mean * mean < BLANK_VAR && hi - lo < BLANK_RANGE) {
+      probe ??= blankProbe();
+      if (isBlankCrop(probe, off, s.sx, s.sy, s.sw, s.sh)) {
         cr.canvas.remove(); // blank margin, not a figure
         continue;
       }
     }
-    cr.canvas.width = sw;
-    cr.canvas.height = sh;
-    cr.canvas.getContext("2d")!.drawImage(off, sx, sy, sw, sh, 0, 0, sw, sh);
+    blitCrop(cr.canvas, off, s, cr.cssW * dpr * CROP_DPR, cr.cssH * dpr * CROP_DPR);
   }
 }
 
@@ -583,13 +559,20 @@ function Page({
                 ? prev
                 : { doc, base: { w: vp1.width, h: vp1.height }, trH: measured },
             );
-            if (crops.length) {
-              const off = document.createElement("canvas");
-              off.width = Math.floor(vp.width * dpr);
-              off.height = Math.floor(vp.height * dpr);
-              renderTask = page.render({ canvas: off, viewport: page.getViewport({ scale: scale * dpr }) });
+            // Crops are rasterized from a WINDOW render (crops.ts) — only the
+            // band of the page that actually holds crops, at 4 device px per
+            // PDF point or the current display density, whichever is higher.
+            // Nothing else on a reflowed page needs the original pixels, so
+            // this is the whole cost of the original render here.
+            const win = crops.length
+              ? cropWindow(crops, vp1.width, vp1.height, Math.max(CROP_K, scale * dpr * CROP_DPR))
+              : null;
+            if (win) {
+              const off = cropCanvas(win);
+              renderTask = page.render({ canvas: off, viewport: cropViewport(page, win) });
               await renderTask.promise.catch(() => {});
-              if (!cancelled && el.dataset.rendered === run) drawCrops(off, crops, scale, dpr);
+              if (!cancelled && el.dataset.rendered === run) drawCrops(off, win, crops, dpr);
+              releaseCanvas(off); // a page-band's worth of RGBA — do not wait for GC
             }
             return;
           }
@@ -1834,6 +1817,13 @@ export default function App() {
     const onCtx = (e: MouseEvent) => {
       const t = e.target as HTMLElement | null;
       if (isTextField(t)) return; // системное меню — не подменяем
+      // правый клик ПО открытому меню: гасим системное и уходим — иначе меню
+      // пересобралось бы под курсором и потеряло пункты (цель вне scrollRef,
+      // т.е. inReader === false)
+      if (t?.closest("[data-ctxmenu]")) {
+        e.preventDefault();
+        return;
+      }
       e.preventDefault();
 
       // Клавиатурный вызов (Shift+F10 / клавиша «Меню») приходит тем же
@@ -2065,6 +2055,9 @@ export default function App() {
         // Esc peels UI layers before closing the book:
         // контекстное меню → палитра → шорткаты → «О pdfer» → настройки → оглавление → масштаб → меню → модель → глоссарий → перевод → поиск → сайдбар (только при фокусе в нём) → выделение
         // (Esc typed INSIDE the find/page/palette inputs is handled there and never reaches this chain)
+        // Контекстное меню снимает себя само (capture на document в
+        // ContextMenu.tsx) — иначе Esc из поля поиска до сюда не дошёл бы;
+        // ветка ниже остаётся страховкой и держит порядок слоёв на виду.
         const ae = document.activeElement as HTMLElement | null;
         if (ctxRef.current) setCtxMenu(null);
         else if (paletteRef.current) setPaletteOpen(false);
@@ -2702,7 +2695,12 @@ export default function App() {
           // opens there) and hear about layout changes it cannot observe
           scrollerRef={scrollRef}
           liveAnchorRef={selAnchorRef}
-          layoutKey={`${scale}|${nColsEff}|${viewMode}|${trFont}|${askOpen ? askW : 0}`}
+          // trVersion belongs here: every page the engine finishes re-typesets
+          // the reflow blocks (replaceChildren), which silently collapses a
+          // selection inside them — Chromium fires no selectionchange for that,
+          // so without this key the bar would hang over dead nodes with a stale
+          // payload while the book translates under the reader.
+          layoutKey={`${scale}|${nColsEff}|${viewMode}|${trFont}|${askOpen ? askW : 0}|${trVersion}`}
           onGone={() => setSelBar(null)}
           // tr-selections swap «Перевести» for «Оригинал» — translating the
           // translation back is nonsense (choice documented in SelectionBar)
@@ -2778,10 +2776,15 @@ export default function App() {
            (TXT-экспорт из Настроек); палитра (z-50) всё равно выше. Сам тост
            клики пропускает, живая только кнопка действия */
         <div
-          className="overlay-pop fixed bottom-6 -translate-x-1/2 z-40 rounded-2xl bg-white/95 dark:bg-neutral-800/95 backdrop-blur px-4 py-2 shadow-xl text-sm text-neutral-700 dark:text-neutral-200 select-none pointer-events-none max-w-[min(90vw,40rem)] text-center"
+          className="overlay-pop fixed bottom-6 -translate-x-1/2 z-40 rounded-2xl bg-white/95 dark:bg-neutral-800/95 backdrop-blur px-4 py-2 shadow-xl text-sm text-neutral-700 dark:text-neutral-200 select-none pointer-events-none text-center"
           // centered over the READING area, like the toolbar: a nowrap pill at
-          // 50% ran under the «Спросить» panel (118 px of it at a 1100 px window)
-          style={{ left: doc && askOpen ? `calc(50% - ${askW / 2}px)` : "50%" }}
+          // 50% ran under the «Спросить» panel (118 px at a 1100 px window). Width
+          // is capped against that same reading area, not the viewport: the panel
+          // is draggable, and a viewport-wide cap let a long message run under it.
+          style={{
+            left: doc && askOpen ? `calc(50% - ${askW / 2}px)` : "50%",
+            maxWidth: `calc(min(40rem, 100vw - ${doc && askOpen ? askW : 0}px - 2rem))`,
+          }}
         >
           {toast.msg}
           {toast.action && (

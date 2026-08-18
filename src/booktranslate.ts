@@ -15,17 +15,35 @@ import { OPS, getDocument } from "pdfjs-dist";
 import type { PDFDocumentProxy, PDFPageProxy } from "pdfjs-dist";
 import {
   FIG_CONTAIN,
-  clusterParagraphs,
+  buildFrags,
+  clusterParagraphsEx,
   detectFigures,
   detectFurniture,
   forgetFurnitureVotes,
+  fragText,
   hash,
+  hyphenKeepSet,
+  hyphenKeeper,
   interArea,
+  itemWords,
+  learnHyphenLine,
+  medianLineH,
   mul,
   newFurnitureMemory,
+  newHyphenLexicon,
   rememberFurniture,
+  stitchModel,
+  stitchPair,
 } from "./paragraphs";
-import type { FigureRegion, FurnitureMemory, Paragraph, ParaKind } from "./paragraphs";
+import type {
+  FigureRegion,
+  FurnitureMemory,
+  HyphenDecider,
+  LineBox,
+  Paragraph,
+  ParaKind,
+  StitchModel,
+} from "./paragraphs";
 import { CITE_MARK } from "./glossarygen";
 import { ModelUnavailableError, hydrateGlossary, isServerUp, parseGlossary, translate } from "./translate";
 import type { GlossaryEntry } from "./translate";
@@ -42,7 +60,21 @@ const ETA_WINDOW = 5; // moving average over the last N text pages
 // v2: paragraphs carry fh (glyph height at scale 1) + kind; only kind:"prose"
 // is ever translated — "other" (display math / tables), "caption" and
 // "furniture" (running headers/footers) keep tr ""
-export type TrParagraph = Paragraph & { tr: string };
+// where a stitched continuation half lives / came from
+export type ContRef = { page: number; idx: number };
+export type TrParagraph = Paragraph & {
+  tr: string;
+  // v2 cross-page stitch (ADDITIVE — stores without these fields render exactly
+  // as before). `contTo`: this paragraph's text absorbed the listed halves from
+  // the following page(s) and was translated whole; `contOf`: this paragraph IS
+  // such a half — it stays in the store so paragraph indices remain stable for
+  // data-tridx and the figure-containment dedup, but it is never translated and
+  // never rendered (buildTrPage / export.ts pageItems skip it). The reflow is a
+  // re-typeset book, so the joined text renders on the page where it STARTED —
+  // page-for-page parity with the original is explicitly not a goal.
+  contTo?: ContRef[];
+  contOf?: ContRef;
+};
 export type BookTranslation = {
   version: 2;
   bookPath: string;
@@ -65,6 +97,13 @@ export type BookTranslation = {
   // median fh across prose paragraphs of completed pages — the v2 typesetter's
   // uniform body size reference; refreshed after every completed page
   bodyFh: number;
+  // Book-wide compound lexicon for the line-break hyphen rule (paragraphs.ts):
+  // the set of hyphenated compounds this book attests INSIDE a line, so a break
+  // at their own hyphen keeps it («graph-based», not «graphbased»). Built once
+  // per book by a text-only prescan (~6.5 s over 838 pages, measured) and then
+  // reused by every resume and every «Обновить перевод». Additive: a store
+  // without it simply re-scans on the next run.
+  hyphens?: string[];
   // «Обновить перевод» watermark, present only mid-update: pages 1..updatedThrough
   // are already re-clustered with the CURRENT engine code (an interrupted update
   // resumes above it); removed when the sweep reaches the last page. Additive —
@@ -319,6 +358,58 @@ export async function pageImageBoxes(page: PDFPageProxy): Promise<FigureRegion[]
     return []; // op-list failure only loses raster candidates; gap detection stands
   }
 }
+
+// ---- book-wide hyphen lexicon prescan ---------------------------------------
+// The line-break hyphen rule needs the WHOLE book's vocabulary before the first
+// paragraph goes on the wire (see paragraphs.ts), so the run opens with a
+// text-only sweep: getTextContent → frags → line texts → token counters. No
+// clustering, no operator lists, no rendering — measured at 6.5 s for the real
+// 838-page book, against hours of translation, and the result is persisted so
+// resumes and «Обновить перевод» never pay it twice.
+//
+// HONEST DEGRADATION: only the engine has this book-wide view. App.tsx's
+// Alt+click popover clusters ONE paragraph from the DOM text layer with no
+// document context, so it keeps the old unconditional dehyphenation — the same
+// asymmetry detectFurniture already documents for its cross-page memory. A
+// popover translation may therefore still show «graphbased» where the reflow
+// shows «graph-based»; nothing is persisted from that path, so the store stays
+// consistent.
+async function scanHyphenLexicon(doc: PDFDocumentProxy, signal?: AbortSignal): Promise<string[] | null> {
+  const lex = newHyphenLexicon();
+  for (let n = 1; n <= doc.numPages; n++) {
+    if (signal?.aborted) return null;
+    const page = await doc.getPage(n);
+    try {
+      const content = await page.getTextContent();
+      const frags = buildFrags(itemWords(content.items, page.getViewport({ scale: 1 })));
+      if (!frags.length) continue;
+      const lineH = medianLineH(frags);
+      for (const f of frags) learnHyphenLine(lex, fragText(f, lineH));
+    } catch {
+      // one unreadable page only costs its own vocabulary
+    } finally {
+      page.cleanup();
+    }
+  }
+  return hyphenKeepSet(lex);
+}
+
+// ---- cross-page stitching (engine side) -------------------------------------
+// The predicate lives in paragraphs.ts; the engine owns page order. Page N's
+// decision needs page N+1's paragraphs, so classification runs ONE PAGE AHEAD
+// of translation and is cached — the same total work, done a page early, with
+// detectFurniture still called exactly once per page in ascending order.
+const STITCH_MAX_HOPS = 4; // a logical paragraph may span this many pages
+const STITCH_BLANK_SKIP = 2; // consecutive text-less pages walked over
+
+type PageModel = {
+  n: number;
+  paras: Paragraph[];
+  lines: LineBox[][];
+  figures: FigureRegion[];
+  refPage: boolean;
+  model: StitchModel | null;
+};
 
 // ---- bibliography pages (refPage) -------------------------------------------
 // Reference lists come out mangled by translation (author names "translated",
@@ -628,25 +719,34 @@ export async function startBookTranslation(
   const durations: number[] = [];
   const last = Math.min(total, Math.max(1, pageLimit ?? total));
 
-  for (let n = 1; n <= last; n++) {
-    if (signal?.aborted) break;
-    // update mode revisits done pages above the watermark; a page the update
-    // has never completed (partial store) is translated in full either way
-    if (done.has(n) && (!update || n <= updatedFrom)) continue;
+  // book-wide compound lexicon: reuse the stored one, otherwise prescan once
+  let keepHyphen: HyphenDecider | undefined;
+  if (!store.hyphens) {
+    const keep = await scanHyphenLexicon(doc, signal);
+    if (keep) store.hyphens = keep; // persisted with this run's first page
+  }
+  if (store.hyphens) keepHyphen = hyphenKeeper(store.hyphens);
 
+  // ---- classification with a one-page lookahead (see PageModel above) -------
+  const models = new Map<number, PageModel>();
+  const willSweep = (n: number) => n >= 1 && n <= last && (!done.has(n) || (update && n > updatedFrom));
+  const classifyPage = async (n: number): Promise<PageModel | null> => {
+    const hit = models.get(n);
+    if (hit) return hit;
+    if (n < 1 || n > total) return null;
     const page = await doc.getPage(n);
     const content = await page.getTextContent();
     const vp1 = page.getViewport({ scale: 1 });
-    const paras = clusterParagraphs(content.items, vp1);
+    const { paras, lines, lineH } = clusterParagraphsEx(content.items, vp1, { keepHyphen });
     // running headers/footers → kind:"furniture", BEFORE figure detection
     // (the caption pass only reclassifies prose — a marked header can no
     // longer be claimed) and BEFORE the refPage gate (reference pages carry
     // headers too and must keep feeding the cross-page memory).
-    // Update revisit: this page seeded the memory at run start (its votes fed
-    // the quorum for the pages before it) — withdraw its own stored votes now
-    // so detectFurniture's re-vote of the live candidates doesn't double-count
-    if (update && n > updatedFrom)
-      for (const p of store.pages[n] ?? []) if (p.kind === "furniture") forgetFurnitureVotes(furn, n, p);
+    // A stored classification of this page seeded the memory at run start (its
+    // votes fed the quorum for the pages before it) and is about to be
+    // replaced — withdraw those votes so detectFurniture's re-vote of the live
+    // candidates doesn't double-count them.
+    for (const p of store.pages[n] ?? []) if (p.kind === "furniture") forgetFurnitureVotes(furn, n, p);
     detectFurniture(paras, n, furn);
     // bibliography page: completes untranslated below (todo stays empty) and
     // skips the figure pass — the viewer shows the original page wholesale,
@@ -655,9 +755,105 @@ export async function startBookTranslation(
     // candidate figure regions; reclassifies adjacent "Figure N:" prose
     // paragraphs to kind:"caption" (mutates paras) and merges their bboxes
     const figures = refPage ? [] : detectFigures(paras, vp1.width, vp1.height, await pageImageBoxes(page));
+    const m: PageModel = { n, paras, lines, figures, refPage, model: stitchModel(paras, lines, lineH, figures) };
+    models.set(n, m);
+    return m;
+  };
+  // next page carrying text — blank / figure-only pages are walked over (18 in
+  // the real book); never past `last`, since a head this run will not sweep
+  // must not be absorbed
+  const nextTextPage = async (from: number): Promise<PageModel | null> => {
+    for (let m = from + 1, blank = 0; m <= last && blank <= STITCH_BLANK_SKIP; m++) {
+      const pm = await classifyPage(m);
+      if (!pm) return null;
+      if (pm.paras.some((p) => p.kind === "prose")) return pm;
+      blank++;
+    }
+    return null;
+  };
+  type StitchHead = { page: number; idx: number; text: string };
+  // Does this page's last body paragraph run over onto the next page(s)?
+  const stitchFrom = async (cur: PageModel): Promise<{ tail: number; heads: StitchHead[] }> => {
+    const heads: StitchHead[] = [];
+    let tail = -1;
+    if (!cur.model?.body.length || cur.refPage) return { tail, heads };
+    for (let hop = 0, src = cur; hop < STITCH_MAX_HOPS; hop++) {
+      const nxt = await nextTextPage(src.n);
+      // the head's page must still be swept by this run, or its stored half
+      // would keep rendering beside the joined text
+      if (!nxt || !willSweep(nxt.n)) break;
+      const j = stitchPair(src, nxt);
+      if (!j) break;
+      if (hop === 0) tail = j.tail;
+      heads.push({ page: nxt.n, idx: j.head, text: nxt.paras[j.head].text });
+      // chain only while the head IS the next page's own tail (a page holding a
+      // single body paragraph) — otherwise the run ends there
+      if (nxt.model?.body.length !== 1) break;
+      src = nxt;
+    }
+    return { tail, heads };
+  };
+  // heads claimed by an earlier page, consumed when their own page is swept
+  const pendingHeads = new Map<number, { idx: number; of: ContRef }>();
+
+  // Resume boundary. The page before the first one this run sweeps was finished
+  // by an EARLIER run, so its tail never got the chance to absorb this page's
+  // head; without this repair every pause would leave one paragraph torn. It is
+  // done before any other classification so page order stays ascending, and the
+  // stored tail is found by TEXT (stored indices come from an older clustering).
+  let boundaryTail: TrParagraph | null = null;
+  let p0 = 0;
+  for (let n = 1; n <= last && !p0; n++) if (willSweep(n)) p0 = n;
+  if (p0 > 1 && store.pages[p0 - 1]?.length) {
+    const prev = await classifyPage(p0 - 1);
+    const st = prev ? await stitchFrom(prev) : null;
+    if (prev && st && st.tail >= 0 && st.heads.length) {
+      const stored = store.pages[p0 - 1];
+      const joined = [prev.paras[st.tail].text, ...st.heads.map((h) => h.text)].join(" ");
+      const of = (idx: number): ContRef => ({ page: p0 - 1, idx });
+      // an interrupted earlier run may have stitched the tail already and died
+      // before the head's page completed — then only the head marks are missing
+      let j = stored.findIndex((p) => carryKey(p.text) === carryKey(joined));
+      if (j < 0) {
+        j = stored.findIndex((p) => carryKey(p.text) === carryKey(prev.paras[st.tail].text));
+        if (j >= 0) {
+          stored[j].text = joined;
+          stored[j].tr = "";
+          stored[j].contTo = st.heads.map((h) => ({ page: h.page, idx: h.idx }));
+          boundaryTail = stored[j]; // joins the first swept page's wire batch
+        }
+      }
+      if (j >= 0) for (const h of st.heads) pendingHeads.set(h.page, { idx: h.idx, of: of(j) });
+    }
+  }
+
+  for (let n = 1; n <= last; n++) {
+    if (signal?.aborted) break;
+    for (const k of models.keys()) if (k < n) models.delete(k); // one page of lookahead is kept
+    // update mode revisits done pages above the watermark; a page the update
+    // has never completed (partial store) is translated in full either way
+    if (done.has(n) && (!update || n <= updatedFrom)) continue;
+
+    const cur = await classifyPage(n);
+    if (!cur) continue;
+    const { paras, figures, refPage } = cur;
 
     const t0 = performance.now();
     const out: TrParagraph[] = paras.map((p) => ({ ...p, tr: "" }));
+    // a continuation half absorbed by an earlier page: kept in the store so
+    // paragraph indices stay stable, but never translated and never rendered
+    const ph = pendingHeads.get(n);
+    if (ph) {
+      pendingHeads.delete(n);
+      if (out[ph.idx]) out[ph.idx].contOf = ph.of;
+    }
+    // …and does this page's own tail run over onto the next one?
+    const st = await stitchFrom(cur);
+    if (st.tail >= 0 && st.heads.length) {
+      out[st.tail].text = [paras[st.tail].text, ...st.heads.map((h) => h.text)].join(" ");
+      out[st.tail].contTo = st.heads.map((h) => ({ page: h.page, idx: h.idx }));
+      for (const h of st.heads) pendingHeads.set(h.page, { idx: h.idx, of: { page: n, idx: st.tail } });
+    }
     // Only kind:"prose" is translated: kind:"other" (display math / tables)
     // and kind:"caption" get image crops instead, kind:"furniture" (running
     // headers/footers) is dropped from the reflow entirely — tr stays "".
@@ -665,14 +861,24 @@ export async function startBookTranslation(
     // are already in the region's crop and the typesetter excludes it from
     // the flow (FIG_CONTAIN) — translating diagram labels only wastes wire
     // requests and invites hallucinated sentence expansions
+    // …and a stitched continuation half is skipped as well: its text already
+    // travelled with the paragraph that absorbed it
     let todo = refPage
       ? []
-      : out.filter((p) => p.kind === "prose" && !figures.some((r) => interArea(p, r) >= FIG_CONTAIN * p.w * p.h));
+      : out.filter(
+          (p) => p.kind === "prose" && !p.contOf && !figures.some((r) => interArea(p, r) >= FIG_CONTAIN * p.w * p.h),
+        );
     // update: pull translations over from the old clustering of this page —
     // only genuinely new/changed paragraphs (and ones whose stored translation
     // fails the staleness audit) stay on the wire list
     const old = update ? store.pages[n] : undefined;
     if (old) todo = carryOver(todo, old, total);
+    // the repaired resume-boundary tail rides this page's batch (it belongs to
+    // page p0-1 and must NOT be matched against this page's old clustering)
+    if (boundaryTail) {
+      todo = [boundaryTail, ...todo];
+      boundaryTail = null;
+    }
     if (todo.length) {
       let i = 0;
       const worker = async () => {

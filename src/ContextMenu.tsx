@@ -72,20 +72,30 @@ export function ContextMenu({
     [onClose],
   );
 
-  // dismissal: outside pointerdown, ANY scroll, resize, window blur. Esc is not
-  // handled here — App's Esc chain owns it and lists the menu as its first
-  // layer, so one place decides what Escape peels next.
+  // dismissal: outside pointerdown, ANY scroll, resize, window blur — and Esc.
+  // The menu owns its own Escape, capture-phase on document, because it is the
+  // topmost layer and the focused element may swallow the key before window
+  // ever sees it (the find input stops propagation on its own Escape, and
+  // Ctrl+F → right-click leaves focus right there). App's Esc chain keeps the
+  // menu as its first branch for the no-focus case; this one just wins first.
   useEffect(() => {
     const onDown = (e: PointerEvent) => {
       if (!(e.target as Element | null)?.closest?.("[data-ctxmenu]")) onClose();
     };
+    const onEsc = (e: KeyboardEvent) => {
+      if (e.key !== "Escape") return;
+      e.stopPropagation();
+      onClose();
+    };
     const shut = () => onClose();
     document.addEventListener("pointerdown", onDown, true);
+    document.addEventListener("keydown", onEsc, true);
     document.addEventListener("scroll", shut, { capture: true, passive: true });
     window.addEventListener("resize", shut);
     window.addEventListener("blur", shut);
     return () => {
       document.removeEventListener("pointerdown", onDown, true);
+      document.removeEventListener("keydown", onEsc, true);
       document.removeEventListener("scroll", shut, true);
       window.removeEventListener("resize", shut);
       window.removeEventListener("blur", shut);

@@ -24,6 +24,13 @@ export type ParaKind = "prose" | "other" | "caption" | "furniture";
 // fh: median glyph (font) height of the paragraph's items, in the units of the
 // viewport passed to clusterParagraphs (the book engine passes scale 1)
 export type Paragraph = { x: number; y: number; w: number; h: number; text: string; fh: number; kind: ParaKind };
+// One typeset LINE of a paragraph (frags on the same baseline band unioned).
+// Kept OUT of Paragraph on purpose: it is engine-only working geometry (the
+// cross-page stitch below needs first/last line edges, the store must not grow
+// four numbers per line per paragraph). clusterParagraphsEx returns it parallel
+// to the paragraph list; clusterParagraphs drops it, so every existing caller
+// and the persisted store shape are untouched.
+export type LineBox = { top: number; left: number; right: number };
 
 // djb2 — same scheme as Library.tsx's cover-cache keys, so every per-book file
 // under appDataDir is named by the same hash of the book path
@@ -209,39 +216,56 @@ export function growParagraph(frags: Frag[], home: Frag, lineH: number, claimed?
 const SUP_DIGITS = /^\d{1,2}$/;
 const SUP_TAIL = /(?:[A-Za-zÀ-ÖØ-öø-ÿА-Яа-яЁё]{3}|[.,;:!?])$/;
 
-// assemble: words left→right per line (a space where rects show a word gap —
-// whitespace-only words are filtered before clustering), lines joined dehyphenated
-export function paraText(para: Frag[], lineH: number): string {
+// one fragment's text: words left→right, a space where rects show a word gap
+// (whitespace-only words are filtered before clustering). Exported because the
+// hyphen lexicon below is learned from SOURCE LINES — the pre-join view, where
+// a line-broken compound is still two tokens and cannot pollute its own counts.
+export function fragText(f: Frag, lineH: number): string {
+  const ws = f.words.slice().sort((a, b) => a.rect.left - b.rect.left);
+  // frag-local metrics for the superscript-marker rule: median glyph height
+  // ≈ the line's font size, median bottom ≈ the line's text baseline
+  const hs = ws.map((w) => w.rect.bottom - w.rect.top).sort((a, b) => a - b);
+  const medH = hs[hs.length >> 1] || 0;
+  const bots = ws.map((w) => w.rect.bottom).sort((a, b) => a - b);
+  const medBot = bots[bots.length >> 1] || 0;
+  let t = "";
+  for (let i = 0; i < ws.length; i++) {
+    const w = ws[i];
+    const spaced = i > 0 && w.rect.left - ws[i - 1].rect.right > 0.12 * lineH;
+    if (
+      i > 0 &&
+      !spaced && // glued to the previous word…
+      SUP_DIGITS.test(w.text.trim()) &&
+      w.rect.bottom - w.rect.top <= 0.85 * medH && // …smaller (markers run 0.8×)…
+      medBot - w.rect.bottom >= 0.25 * medH && // …raised clear off the baseline…
+      SUP_TAIL.test(t) && // …after a real word or sentence punctuation…
+      (i === ws.length - 1 || /^\s/.test(ws[i + 1].text) || ws[i + 1].rect.left - w.rect.right > 0.12 * lineH) // …at a word break
+    )
+      continue; // superscript footnote marker — dropped (see above)
+    if (spaced) t += " ";
+    t += w.text;
+  }
+  return t.replace(/\s+/g, " ").trim();
+}
+
+// verdict for one line-break hyphen: `a` is the word half before it, `b` the
+// half after — true keeps the hyphen (see the lexicon further down)
+export type HyphenDecider = (a: string, b: string) => boolean;
+
+// assemble: words left→right per line, lines joined dehyphenated.
+// `keepHyphen` (engine only — see the lexicon below) decides the ONE case
+// plain dehyphenation gets wrong: a compound that was ALREADY hyphenated and
+// merely happens to break at its own hyphen («graph-based» → «graphbased»).
+export function paraText(para: Frag[], lineH: number, keepHyphen?: HyphenDecider): string {
   let text = "";
   for (const f of para) {
-    const ws = f.words.slice().sort((a, b) => a.rect.left - b.rect.left);
-    // frag-local metrics for the superscript-marker rule: median glyph height
-    // ≈ the line's font size, median bottom ≈ the line's text baseline
-    const hs = ws.map((w) => w.rect.bottom - w.rect.top).sort((a, b) => a - b);
-    const medH = hs[hs.length >> 1] || 0;
-    const bots = ws.map((w) => w.rect.bottom).sort((a, b) => a - b);
-    const medBot = bots[bots.length >> 1] || 0;
-    let t = "";
-    for (let i = 0; i < ws.length; i++) {
-      const w = ws[i];
-      const spaced = i > 0 && w.rect.left - ws[i - 1].rect.right > 0.12 * lineH;
-      if (
-        i > 0 &&
-        !spaced && // glued to the previous word…
-        SUP_DIGITS.test(w.text.trim()) &&
-        w.rect.bottom - w.rect.top <= 0.85 * medH && // …smaller (markers run 0.8×)…
-        medBot - w.rect.bottom >= 0.25 * medH && // …raised clear off the baseline…
-        SUP_TAIL.test(t) && // …after a real word or sentence punctuation…
-        (i === ws.length - 1 || /^\s/.test(ws[i + 1].text) || ws[i + 1].rect.left - w.rect.right > 0.12 * lineH) // …at a word break
-      )
-        continue; // superscript footnote marker — dropped (see above)
-      if (spaced) t += " ";
-      t += w.text;
-    }
-    t = t.replace(/\s+/g, " ").trim();
+    const t = fragText(f, lineH);
     if (!t) continue;
-    if (/[-­]$/.test(text)) text = text.slice(0, -1) + t;
-    else text += (text ? " " : "") + t;
+    if (/[-­]$/.test(text)) {
+      const a = text.slice(0, -1).split(" ").pop() ?? "";
+      const b = t.split(" ")[0] ?? "";
+      text = text.slice(0, -1) + (keepHyphen?.(a, b) ? "-" : "") + t;
+    } else text += (text ? " " : "") + t;
   }
   return text;
 }
@@ -281,6 +305,62 @@ const LETTER = "A-Za-zÀ-ÖØ-öø-ÿА-Яа-яЁё";
 const WORDISH = new RegExp(`[${LETTER}]{2,}`);
 const PURE = new RegExp(`^[${LETTER}][${LETTER}'’-]*[${LETTER}]$`);
 const EDGE_PUNCT = /^[([{"'«]+|[)\]}"'».,;:!?…]+$/g;
+
+// ---- line-break hyphenation lexicon -----------------------------------------
+// paraText must decide, per line break, whether the trailing hyphen is
+// TYPESETTING (the word was split to fit: «docu-ment») or LEXICAL (a compound
+// that happens to break at its own hyphen: «graph-based»). No local signal
+// separates them — the evidence is the DOCUMENT'S OWN VOCABULARY, so the rule
+// is a two-pass one: count the book's tokens first, decide at assembly time.
+//
+// Measured on the real 838-page book (2 686 line-break joins, 1 510 distinct
+// half-pairs): keeping the hyphen when the hyphenated form is attested inside a
+// line AND outnumbers the solid form restores 107 joins (86 compounds —
+// «graph-based», «pre-trained», «re-ranking», «cross-language»…) with ≤2 false
+// positives. The looser "both halves are words elsewhere" rule was measured
+// too and REJECTED: it fires on 520 joins and is wrong on 429 of them
+// («exam-ple» 23×, «dif-ferent» 20×, «docu-ments» 18×).
+//
+// Counts come from SOURCE LINES, never from assembled paragraphs: a line ending
+// «graph-» yields the token «graph», so a join can never vote for its own solid
+// form (the analysis had to subtract that self-pollution; here it cannot occur).
+export type HyphenLexicon = {
+  hy: Map<string, number>; // lowercase tokens with an INTERNAL hyphen
+  sol: Map<string, number>; // lowercase tokens with none
+};
+export const newHyphenLexicon = (): HyphenLexicon => ({ hy: new Map(), sol: new Map() });
+
+// letter runs, hyphens/apostrophes allowed inside — digits break tokens, so
+// «COVID-19» contributes «covid», never a spurious compound
+const HY_TOKEN = new RegExp(`[${LETTER}][${LETTER}'’-]*[${LETTER}]|[${LETTER}]`, "g");
+const HY_EDGE = new RegExp(`^[^${LETTER}]+|[^${LETTER}]+$`, "g");
+const hyClean = (s: string): string => s.replace(HY_EDGE, "").toLowerCase();
+
+export function learnHyphenLine(lex: HyphenLexicon, line: string): void {
+  for (const raw of line.match(HY_TOKEN) ?? []) {
+    const w = raw.toLowerCase().replace(/^['’]+|['’]+$/g, "");
+    if (w.length < 2) continue;
+    const m = w.slice(1, -1).includes("-") ? lex.hy : lex.sol;
+    m.set(w, (m.get(w) ?? 0) + 1);
+  }
+}
+
+// compounds whose hyphen survives a line break, sorted (a compact, diffable
+// store field — the raw counters are not worth persisting)
+export function hyphenKeepSet(lex: HyphenLexicon): string[] {
+  const keep: string[] = [];
+  for (const [w, n] of lex.hy) if (n > (lex.sol.get(w.replace(/-/g, "")) ?? 0)) keep.push(w);
+  return keep.sort();
+}
+
+export function hyphenKeeper(keep: Iterable<string>): HyphenDecider {
+  const set = keep instanceof Set ? (keep as Set<string>) : new Set(keep);
+  return (a, b) => {
+    const l = hyClean(a);
+    const r = hyClean(b);
+    return !!l && !!r && set.has(`${l}-${r}`);
+  };
+}
 
 export function paraMetrics(text: string, words: readonly Word[], fh: number): ParaMetrics {
   // collapse TOC dot leaders ("Intro . . . . 25") so such lines classify by their words
@@ -613,13 +693,10 @@ export const mul = (m: readonly number[], n: readonly number[]): number[] => [
 // imports; TextMarkedContent entries lack `str` and are skipped by the guard)
 export type PdfTextItem = { str?: unknown; transform?: unknown; width?: unknown };
 
-// Whole-page clustering over pdfjs getTextContent() items — DOM-free twin of
-// App.tsx's Alt+click path. Rects are derived the way the official text layer
-// positions its spans: tr = viewport.transform × item.transform, font height =
-// hypot(tr[2], tr[3]), baseline at tr[5]. Returns paragraphs in page CSS px at
-// the given viewport's scale, ordered top-to-bottom (left-first within a band;
-// columns interleave, which is fine — the overlay places them by coordinates).
-export function clusterParagraphs(items: readonly unknown[], viewport: { transform: number[] }): Paragraph[] {
+// Word rects of one page's pdfjs TextContent items, derived the way the
+// official text layer positions its spans: tr = viewport.transform ×
+// item.transform, font height = hypot(tr[2], tr[3]), baseline at tr[5].
+export function itemWords(items: readonly unknown[], viewport: { transform: number[] }): Word[] {
   const vt = viewport.transform;
   const sc = Math.hypot(vt[0], vt[1]) || 1; // viewport scale (rotation-safe)
   const words: Word[] = [];
@@ -631,22 +708,80 @@ export function clusterParagraphs(items: readonly unknown[], viewport: { transfo
     const w = (typeof it.width === "number" ? it.width : 0) * sc;
     words.push({ rect: { left: tr[4], top: tr[5] - fontH, right: tr[4] + w, bottom: tr[5] }, text: it.str });
   }
+  return words;
+}
+
+// frags of one paragraph → its typeset lines (frags sharing a baseline band —
+// a gutter-split line is one LineBox), top to bottom
+function paraLines(para: readonly Frag[], lineH: number): LineBox[] {
+  const out: LineBox[] = [];
+  for (const f of para.slice().sort((a, b) => a.top - b.top || a.left - b.left)) {
+    const last = out[out.length - 1];
+    if (last && Math.abs(f.top - last.top) < 0.5 * lineH) {
+      last.left = Math.min(last.left, f.left);
+      last.right = Math.max(last.right, f.right);
+    } else out.push({ top: f.top, left: f.left, right: f.right });
+  }
+  return out;
+}
+
+const mergeLines = (a: LineBox[], b: readonly LineBox[], lineH: number): LineBox[] => {
+  const out = a.concat(b.map((l) => ({ ...l }))).sort((p, q) => p.top - q.top || p.left - q.left);
+  const res: LineBox[] = [];
+  for (const l of out) {
+    const last = res[res.length - 1];
+    if (last && Math.abs(l.top - last.top) < 0.5 * lineH) {
+      last.left = Math.min(last.left, l.left);
+      last.right = Math.max(last.right, l.right);
+    } else res.push(l);
+  }
+  return res;
+};
+
+export type PageParagraphs = {
+  paras: Paragraph[];
+  lines: LineBox[][]; // parallel to paras
+  lineH: number; // the page's line-height unit (median frag height)
+};
+
+// Whole-page clustering over pdfjs getTextContent() items — DOM-free twin of
+// App.tsx's Alt+click path. Returns paragraphs in page CSS px at the given
+// viewport's scale, ordered top-to-bottom (left-first within a band; columns
+// interleave, which is fine — the overlay places them by coordinates).
+export function clusterParagraphs(
+  items: readonly unknown[],
+  viewport: { transform: number[] },
+  opts?: { keepHyphen?: HyphenDecider },
+): Paragraph[] {
+  return clusterParagraphsEx(items, viewport, opts).paras;
+}
+
+// Same clustering, plus the per-line geometry the cross-page stitch needs
+// (kept off Paragraph so nothing extra reaches the store — see LineBox).
+export function clusterParagraphsEx(
+  items: readonly unknown[],
+  viewport: { transform: number[] },
+  opts?: { keepHyphen?: HyphenDecider },
+): PageParagraphs {
+  const words = itemWords(items, viewport);
 
   const frags = buildFrags(words);
-  if (!frags.length) return [];
+  if (!frags.length) return { paras: [], lines: [], lineH: 0 };
   const lineH = medianLineH(frags);
   const band = Math.max(1, lineH / 2);
   const seeds = frags.slice().sort((a, b) => Math.round(a.top / band) - Math.round(b.top / band) || a.left - b.left);
 
   const claimed = new Set<Frag>();
   const out: Paragraph[] = [];
+  const lines: LineBox[][] = [];
   const giant: boolean[] = []; // out[i] is a lone giant-glyph frag (split off by buildFrags)
   for (const seed of seeds) {
     if (claimed.has(seed)) continue;
     const para = growParagraph(frags, seed, lineH, claimed);
     for (const f of para) claimed.add(f);
-    const text = paraText(para, lineH);
+    const text = paraText(para, lineH, opts?.keepHyphen);
     if (!text) continue;
+    lines.push(paraLines(para, lineH));
     const x = Math.min(...para.map((f) => f.left));
     const y = Math.min(...para.map((f) => f.top));
     const ws = para.flatMap((f) => f.words);
@@ -701,10 +836,12 @@ export function clusterParagraphs(items: readonly unknown[], viewport: { transfo
     p.h = Math.max(p.y + p.h, g.y + g.h) - y;
     p.x = x;
     p.y = y;
+    lines[best] = mergeLines(lines[best], lines[i], lineH);
     out.splice(i, 1);
+    lines.splice(i, 1);
     giant.splice(i, 1);
   }
-  return out;
+  return { paras: out, lines, lineH };
 }
 
 // ---- v2 figure regions ------------------------------------------------------
@@ -1055,4 +1192,217 @@ export function detectFigures(
   const fin = mergeRegions(out, 0);
   fin.sort((a, b) => a.y - b.y || a.x - b.x);
   return fin;
+}
+
+// ---- v2 cross-page paragraph stitching --------------------------------------
+// A paragraph that runs past the bottom of a page is TWO paragraphs to a
+// per-page clusterer, and translating each half separately is the single worst
+// artifact of the reflow: the model closes the first half with an invented
+// sentence ending and opens the second as a new sentence. Measured on the real
+// 838-page book: 379 of 638 page transitions (59%) tear a paragraph, producing
+// 758 halves = 17% of every translated paragraph, and 272 of the 379 tails got
+// a hallucinated ending in Russian.
+//
+// The decisive signals are GEOMETRIC, not linguistic, and live only here — the
+// store keeps a paragraph's bbox, never its per-line edges. Two facts from the
+// data drove the design:
+//   * This book does not indent the first paragraph on a page (143 of 638
+//     breaks show an unindented head after a FINISHED paragraph), so a
+//     first-line-indent test carries almost no information — it is not used.
+//   * Justified setting means a paragraph that continues always has its last
+//     line flush to its own measure: 565 of 1 891 open paragraphs are flush
+//     against 58 of 2 017 terminated ones.
+//
+// Tests (all must hold; thresholds × the page's lineH ≈ 3 pt at body size):
+//   G1 flush right — the tail's LAST line reaches the tail's OWN measure
+//      (x+w for multi-line tails, the column margin for one-liners), so block
+//      quotes and bullets pass on their own inset rather than the page's;
+//   G2 same line offset MEASURED FROM THE RIGHT MARGIN — the verso/recto
+//      mirror shift cancels exactly, and hanging indents match. Measuring from
+//      the left margin instead costs 7 true positives and adds 10 false ones;
+//   L1 the tail does not end in a sentence terminator (this alone rejects all
+//      20 "flush + unindented but finished" pairs in the book);
+//   S1 no heading between the halves (figure-contained heading-sized labels are
+//      excluded — without that, one figure label falsely blocks a real tear);
+//   S2 identical glyph size; S3 the head is not a list item; S4 an
+//      uppercase-starting head needs ≥4 tokens (kills the only 3 errors found,
+//      all table cells); S5 neither page is a bibliography page;
+//   M1 no wide display-math block between the halves — joining across a formula
+//      that is grammatically part of the sentence would emit the formula crop
+//      AFTER the joined text (10 such pairs in the book, deliberately skipped).
+// Hand-check: 52 adjudicated cases, 0 errors (precision ≈ 100%); recall ≈ 98%,
+// the misses being ragged-right blocks where G1 cannot fire.
+//
+// ACCEPTED LIMITS. G1 assumes justified setting: in a ragged-right book every
+// last line is short, the predicate never fires, and nothing is joined — the
+// safe direction. stitchModel refuses pages whose body paragraphs form two
+// side-by-side x-groups (STITCH_COL_CHARS), so a genuinely multi-column book is
+// left un-stitched rather than stitched wrongly; generalising means running
+// this per column (detectFigures already forms columns) with tail = last
+// paragraph of the last column and head = first of the first — G2's
+// right-margin cancellation still holds, since each column has its own margin.
+
+const STITCH_FH_TOL = 0.02; // tail/head glyph-size match, and the body-size band
+const STITCH_FLUSH = 0.3; // G1 slack, × lineH
+const STITCH_OFFSET = 0.35; // G2 slack, × lineH
+const STITCH_HEAD_FH = 1.12; // heading-sized, × the page's dominant prose size
+const STITCH_HEAD_LINES = 3; // …and short: a "heading" longer than this is prose
+const STITCH_MATH_W = 0.15; // display-math block width, × the column's right edge
+const STITCH_MATH_FH = 0.9; // …and set at body size: measured, every display formula
+// in the book is exactly 1.000× the dominant prose size while the bottom-of-page
+// footnote/URL blocks that classify as "other" too run 0.85× — without this floor
+// a footnote block masquerades as a formula and blocks a real tear (p. 591)
+const STITCH_COL_CHARS = 0.15; // multi-column guard: a real column's share of body chars
+const STITCH_MIN_TOKENS = 4; // S4: minimum head length when it starts uppercase
+
+// sentence terminator, optionally behind a closing quote/bracket
+const STITCH_TERM = /[.!?…]["'”’)\]]?$/;
+// a continuation opens lowercase…
+const STITCH_LOWER = /^[a-zà-öø-ÿа-яё]/;
+// …or with a math/continuation glyph (Greek, letterlike, arrows/operators, and
+// the Mathematical Alphanumeric Symbols block — «𝜓 ∈ Ψ is represented as…»)
+const STITCH_SYM = /^(?:[Ͱ-Ͽ℀-⅏←-⋿]|[\u{1d400}-\u{1d7ff}])/u;
+// list markers: a head that opens one is a new item, never a continuation
+const STITCH_LIST = /^\s*(?:[•●▪‣∗*–—]|\(?\d{1,2}[.)]\s|[a-z]\)\s)/;
+
+export type StitchModel = {
+  lineH: number;
+  domFh: number; // dominant prose glyph height (char-weighted mode)
+  colR: number; // justified right margin
+  colL: number; // measure's left edge
+  body: number[]; // in-column body paragraphs, reading order (indices into paras)
+  blockers: Set<number>; // heading-sized prose — S1
+  math: Set<number>; // wide display-math blocks — M1
+};
+
+// One page's stitching geometry, or null when the page offers no single text
+// measure to reason about (no prose at all, or two side-by-side columns).
+export function stitchModel(
+  paras: readonly Paragraph[],
+  lines: readonly (readonly LineBox[])[],
+  lineH: number,
+  figures: readonly FigureRegion[],
+): StitchModel | null {
+  if (!paras.length || lineH <= 0) return null;
+  // dominant prose size: mode of fh WEIGHTED BY CHARACTER COUNT — characters
+  // concentrate in body paragraphs, so figure labels and headings cannot win
+  const wt = new Map<string, number>();
+  for (const p of paras)
+    if (p.kind === "prose" && p.fh > 0) {
+      const k = p.fh.toFixed(2);
+      wt.set(k, (wt.get(k) ?? 0) + p.text.length);
+    }
+  if (!wt.size) return null;
+  let domFh = 0;
+  let bw = -1;
+  for (const [k, n] of wt)
+    if (n > bw || (n === bw && Number(k) > domFh)) {
+      bw = n;
+      domFh = Number(k);
+    }
+  if (domFh <= 0) return null;
+
+  const body: number[] = [];
+  for (let i = 0; i < paras.length; i++) {
+    const p = paras[i];
+    if (p.kind === "prose" && p.fh > 0 && Math.abs(p.fh - domFh) <= STITCH_FH_TOL * domFh) body.push(i);
+  }
+  if (!body.length) return null;
+
+  // Multi-column refusal. Every threshold below assumes ONE text measure, so a
+  // page whose body paragraphs fall into two side-by-side x-groups (each with a
+  // wrapped paragraph and a real share of the page's text) is not stitched at
+  // all — the safe direction. A block quote or a hanging list keeps its
+  // x-interval INSIDE the body measure and therefore stays one group.
+  const chars = body.reduce((a, i) => a + paras[i].text.length, 0);
+  const groups: { r: number; multi: boolean; chars: number }[] = [];
+  for (const i of body.slice().sort((p, q) => paras[p].x - paras[q].x)) {
+    const g = groups[groups.length - 1];
+    const p = paras[i];
+    if (g && p.x <= g.r) {
+      g.r = Math.max(g.r, p.x + p.w);
+      g.multi ||= lines[i].length >= 2;
+      g.chars += p.text.length;
+    } else groups.push({ r: p.x + p.w, multi: lines[i].length >= 2, chars: p.text.length });
+  }
+  if (groups.filter((g) => g.multi && g.chars >= STITCH_COL_CHARS * chars).length >= 2) return null;
+
+  // the justified right margin: weighted mode of the FIRST line's right edge
+  // over multi-line body paragraphs (weight = the count of full-measure lines)
+  const multi = body.filter((i) => lines[i].length >= 2);
+  let colR = 0;
+  if (multi.length) {
+    let best = -1;
+    for (const i of multi) {
+      const v = lines[i][0].right;
+      let s = 0;
+      for (const j of multi) if (Math.abs(lines[j][0].right - v) <= STITCH_FLUSH * lineH) s += lines[j].length - 1;
+      if (s > best || (s === best && v > colR)) {
+        best = s;
+        colR = v;
+      }
+    }
+  } else colR = Math.max(...body.map((i) => paras[i].x + paras[i].w));
+  const colL = Math.min(...body.map((i) => paras[i].x));
+
+  // in-column body: inside the measure, and with a last line long enough to be
+  // running text (this is what drops equation numbers and narrow table cells)
+  const inCol = body.filter((i) => {
+    const p = paras[i];
+    const last = lines[i][lines[i].length - 1];
+    return p.x + p.w <= colR + STITCH_FLUSH * lineH && colR - last.left >= 0.35 * (colR - colL);
+  });
+
+  const inFig = (p: Paragraph) => figures.some((r) => interArea(p, r) >= FIG_CONTAIN * p.w * p.h);
+  const blockers = new Set<number>();
+  const math = new Set<number>();
+  for (let i = 0; i < paras.length; i++) {
+    const p = paras[i];
+    if (inFig(p)) continue; // its pixels are in a figure crop — not a structural break
+    if (p.kind === "prose" && p.fh >= STITCH_HEAD_FH * domFh && lines[i].length <= STITCH_HEAD_LINES) blockers.add(i);
+    if (p.kind === "other" && p.w > STITCH_MATH_W * colR && p.fh >= STITCH_MATH_FH * domFh) math.add(i);
+  }
+  return { lineH, domFh, colR, colL, body: inCol, blockers, math };
+}
+
+export type StitchPage = {
+  paras: readonly Paragraph[];
+  lines: readonly (readonly LineBox[])[];
+  model: StitchModel | null;
+  refPage: boolean;
+};
+
+// Does page `a`'s last body paragraph continue as page `b`'s first one?
+// Returns the two paragraph indices, or null. Pure — the caller owns page
+// order, blank-page skipping and multi-page chaining.
+export function stitchPair(a: StitchPage, b: StitchPage): { tail: number; head: number } | null {
+  if (a.refPage || b.refPage) return null; // S5
+  const A = a.model;
+  const B = b.model;
+  if (!A?.body.length || !B?.body.length) return null;
+  const ti = A.body[A.body.length - 1];
+  const hi = B.body[0];
+  const tail = a.paras[ti];
+  const head = b.paras[hi];
+  const tl = a.lines[ti];
+  const hl = b.lines[hi];
+  if (!tl?.length || !hl?.length) return null;
+  // S1 + M1: nothing structural between the halves, on either page
+  for (let i = ti + 1; i < a.paras.length; i++) if (A.blockers.has(i) || A.math.has(i)) return null;
+  for (let i = 0; i < hi; i++) if (B.blockers.has(i) || B.math.has(i)) return null;
+  // G1 — the tail's last line is flush to the tail's own measure
+  const measureR = tl.length >= 2 ? tail.x + tail.w : A.colR;
+  if (measureR - tl[tl.length - 1].right > STITCH_FLUSH * A.lineH) return null;
+  // G2 — both lines sit at the same offset, measured from the right margin
+  const off = A.colR - tl[tl.length - 1].left - (B.colR - hl[0].left);
+  if (Math.abs(off) > STITCH_OFFSET * A.lineH) return null;
+  // L1 — the tail is an unfinished sentence
+  if (STITCH_TERM.test(tail.text.replace(/\s+$/, ""))) return null;
+  // S2 — same type size
+  if (Math.abs(tail.fh - head.fh) > STITCH_FH_TOL * Math.max(tail.fh, head.fh)) return null;
+  // S3 / S4 — the head reads like a continuation
+  if (STITCH_LIST.test(head.text)) return null;
+  const ht = head.text.replace(/^\s+/, "");
+  if (!STITCH_LOWER.test(ht) && !STITCH_SYM.test(ht) && ht.split(/\s+/).length < STITCH_MIN_TOKENS) return null;
+  return { tail: ti, head: hi };
 }

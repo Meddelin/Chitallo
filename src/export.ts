@@ -42,6 +42,8 @@ import type { BookTranslation, TrParagraph } from "./booktranslate";
 import { splitCitations } from "./cite";
 import { FIG_CONTAIN, interArea } from "./paragraphs";
 import type { FigureRegion } from "./paragraphs";
+import { CROP_K, blankProbe, blitCrop, cropCanvas, cropSrc, cropViewport, cropWindow, isBlankCrop, releaseCanvas } from "./crops";
+import type { CropWindow } from "./crops";
 
 // ---- constants mirrored from App.tsx (private there; keep values in sync) ---
 const LIST_RE = /^\s*(?:\(\d{1,3}\)|\d{1,3}[.)]|\(?[a-zа-яё]\)|[•◦▪‣–—])\s/i;
@@ -53,11 +55,17 @@ const FOOT_RE = /^(?:\d{1,3}[.)]\s|[†‡])/;
 const FOOT_LBL = /^\d{1,3}[.)]\s/;
 const FOOT_FH = 0.92; // fh/bodyFh cap
 const FOOT_ZONE = 0.55; // paragraph must START below this fraction of the page height
-// blank-candidate pixel check — same tuning as App.tsx drawCrops
-const BLANK_VAR = 4;
-const BLANK_RANGE = 24;
-const SAMPLE = 32;
-const EXPORT_SCALE = 2; // offscreen render scale for crops (2× display size)
+// Кропы рисуются оконным рендером из crops.ts (CROP_K = 4 device px на пункт
+// PDF), а затем передискретизируются под НОСИТЕЛЬ — суперсэмплинг: растр вчетверо
+// плотнее, чем нужно выходному пикселю, поэтому мелкий шрифт формул и штрихи
+// диаграмм не рассыпаются. Отдавать в документ все 4× бессмысленно: на 838
+// страницах это сотни мегабайт data-URI, которые ни экран, ни принтер не
+// покажут.
+//   печать — 300 dpi на листе A4 (210 мм минус поля 12 мм = 186 мм ширины);
+//   экран  — 2 device px на CSS-пиксель кропа (ширина в HTML задана в px).
+const PRINT_DPI = 300;
+const PRINT_W_IN = 186 / 25.4; // печатная ширина A4-полосы в дюймах
+const SCREEN_DPR = 2;
 const REF_SCALE = 1.5; // full-page render scale for refPages in the print (PDF) export
 
 type TextItem = { kind: "text"; cls: "p" | "head" | "hang" | "foot"; em?: number; text: string };
@@ -93,6 +101,7 @@ function pageItems(paras: TrParagraph[], figures: readonly FigureRegion[], bodyF
   };
   for (const p of paras) {
     if (p.kind === "furniture") continue; // колонтитулы — не контент (зеркалит buildTrPage)
+    if (p.contOf) continue; // stitched continuation half — flowed on an earlier page
     if (p.kind === "caption") continue; // lives inside its figure region
     if (figures.some((r) => interArea(p, r) >= FIG_CONTAIN * p.w * p.h)) continue; // pixels already in the region
     flushAbove(p.y, p.x);
@@ -267,45 +276,31 @@ async function openDoc(bookPath: string): Promise<PDFDocumentProxy> {
   }).promise;
 }
 
-// crop the region out of the page render; fig candidates that sample blank
-// (same variance check as drawCrops) return null and leave the flow entirely
+// crop the region out of the window render (crops.ts); fig candidates that
+// sample blank (same variance check as drawCrops) return null and leave the
+// flow entirely. `frac` — доля ширины исходной страницы, которую занимает кроп:
+// в печати из неё получается ширина в процентах полосы, на экране — px.
 function cropDataUrl(
   off: HTMLCanvasElement,
+  win: CropWindow,
   it: CropItem,
+  pageW: number,
   probe: CanvasRenderingContext2D,
   png: boolean, // print wants lossless PNG; the screen HTML keeps lighter JPEG
-): { url: string; w: number } | null {
-  const k = EXPORT_SCALE;
-  const sx = Math.min(off.width, Math.round(Math.max(0, it.x) * k));
-  const sy = Math.min(off.height, Math.round(Math.max(0, it.y) * k));
-  const sw = Math.min(off.width - sx, Math.round(it.w * k));
-  const sh = Math.min(off.height - sy, Math.round(it.h * k));
-  if (sw <= 0 || sh <= 0) return null;
-  if (it.fig) {
-    const pw = Math.min(SAMPLE, sw);
-    const ph = Math.min(SAMPLE, sh);
-    probe.drawImage(off, sx, sy, sw, sh, 0, 0, pw, ph);
-    const d = probe.getImageData(0, 0, pw, ph).data;
-    let s = 0;
-    let s2 = 0;
-    let lo = 255;
-    let hi = 0;
-    const n = pw * ph;
-    for (let i = 0; i < d.length; i += 4) {
-      const y = 0.2126 * d[i] + 0.7152 * d[i + 1] + 0.0722 * d[i + 2];
-      s += y;
-      s2 += y * y;
-      if (y < lo) lo = y;
-      if (y > hi) hi = y;
-    }
-    const mean = s / n;
-    if (s2 / n - mean * mean < BLANK_VAR && hi - lo < BLANK_RANGE) return null; // blank margin
-  }
+): { url: string; frac: number; w: number; px: number } | null {
+  const s = cropSrc(win, { x: Math.max(0, it.x), y: Math.max(0, it.y), w: it.w, h: it.h });
+  if (s.sw <= 0 || s.sh <= 0) return null;
+  if (it.fig && isBlankCrop(probe, off, s.sx, s.sy, s.sw, s.sh)) return null; // blank margin
+  const frac = Math.min(1, s.sw / win.k / pageW);
+  // целевая ширина в пикселях выходной картинки (blitCrop не даст выйти за
+  // разрешение растра — вверх не интерполируем)
+  const dstW = png ? frac * PRINT_W_IN * PRINT_DPI : (s.sw / win.k) * SCREEN_DPR;
   const c = document.createElement("canvas");
-  c.width = sw;
-  c.height = sh;
-  c.getContext("2d")!.drawImage(off, sx, sy, sw, sh, 0, 0, sw, sh);
-  return { url: png ? c.toDataURL("image/png") : c.toDataURL("image/jpeg", 0.87), w: Math.round(sw / k) };
+  blitCrop(c, off, s, dstW, (dstW * s.sh) / s.sw);
+  const px = c.width;
+  const url = png ? c.toDataURL("image/png") : c.toDataURL("image/jpeg", 0.87);
+  releaseCanvas(c);
+  return { url, frac, w: Math.round(s.sw / win.k), px };
 }
 
 // refPage в печати: оригинальная страница целиком, картинкой (1.5×). JPEG, не
@@ -389,16 +384,29 @@ async function assembleDoc(
         continue;
       }
       const items = perPage.get(n) ?? [];
-      // page render only when this page actually needs pixels
+      // page render only when this page actually needs pixels, and only over
+      // the band that holds them (crops.ts cropWindow) — на этой книге окно в
+      // среднем занимает пятую часть страницы, так что растр вчетверо плотнее
+      // прежнего стоит меньше памяти, чем стоил полностраничный 2×
       let off: HTMLCanvasElement | null = null;
-      if (doc && items.some((i) => i.kind === "crop")) {
+      let win: CropWindow | null = null;
+      let pageW = 0;
+      const cropRects = items.filter((i): i is CropItem => i.kind === "crop");
+      if (doc && cropRects.length) {
         try {
           const page = await doc.getPage(n);
-          const vp = page.getViewport({ scale: EXPORT_SCALE });
-          off = document.createElement("canvas");
-          off.width = Math.floor(vp.width);
-          off.height = Math.floor(vp.height);
-          await page.render({ canvas: off, viewport: vp }).promise;
+          const vp1 = page.getViewport({ scale: 1 });
+          pageW = vp1.width;
+          win = cropWindow(
+            cropRects.map((i) => ({ x: Math.max(0, i.x), y: Math.max(0, i.y), w: i.w, h: i.h })),
+            vp1.width,
+            vp1.height,
+            CROP_K,
+          );
+          if (win) {
+            off = cropCanvas(win);
+            await page.render({ canvas: off, viewport: cropViewport(page, win) }).promise;
+          }
           page.cleanup();
         } catch {
           off = null; // damaged page — fall back to text markers
@@ -410,21 +418,14 @@ async function assembleDoc(
           const cls = it.cls === "p" ? "" : ` class="${it.cls}"`;
           const style = it.cls === "head" && it.em ? ` style="font-size:${it.em.toFixed(3)}em"` : "";
           pageChunks.push(`<p${cls}${style}>${escCites(it.text)}</p>`);
-        } else if (off) {
-          if (!probe) {
-            const c = document.createElement("canvas");
-            c.width = SAMPLE;
-            c.height = SAMPLE;
-            probe = c.getContext("2d", { willReadFrequently: true })!;
-          }
-          const crop = cropDataUrl(off, it, probe, print);
+        } else if (off && win) {
+          probe ??= blankProbe();
+          const crop = cropDataUrl(off, win, it, pageW, probe, print);
           if (crop) {
             const alt = it.fig ? (it.caption ? esc(it.caption) : "Рисунок") : "Фрагмент оригинала";
             // печать: ширина в % от исходной страницы — пропорции оригинала
             // сохраняются на любом листе; экран: прежние px
-            const wStyle = print
-              ? `width:${Math.min(100, (100 * crop.w * EXPORT_SCALE) / off.width).toFixed(2)}%`
-              : `width:${crop.w}px`;
+            const wStyle = print ? `width:${(100 * crop.frac).toFixed(2)}%` : `width:${crop.w}px`;
             pageChunks.push(`<img class="crop" style="${wStyle}" alt="${alt}" src="${crop.url}">`);
           }
           // blank fig candidate: dropped, like in the app
@@ -433,6 +434,7 @@ async function assembleDoc(
           if (fb) pageChunks.push(fb);
         }
       }
+      if (off) releaseCanvas(off); // окно страницы — десятки МБ RGBA, не ждём GC
       if (pageChunks.length) chunks.push(`<div class="pg">${n}</div>`, ...pageChunks);
       onProgress?.(++processed, store.donePages.length);
     }

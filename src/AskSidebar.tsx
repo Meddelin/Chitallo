@@ -140,6 +140,12 @@ const NEED_ANSWER = "Сначала задайте вопрос";
 // consequence + a red button that names the action + «Отмена»)
 const HDR_BTN =
   "rounded-md p-1 text-neutral-500 dark:text-neutral-400 transition-colors hover:bg-neutral-900/5 hover:text-neutral-700 dark:hover:bg-neutral-100/10 dark:hover:text-neutral-200";
+// dimmed, inert — but NOT pointer-events-none: the browser draws no `title`
+// tooltip over such an element, and these buttons carry their reason («Беседа
+// уже пустая») in exactly that tooltip. `disabled` already blocks the click, so
+// only the hover paint has to be taken back.
+const HDR_BTN_OFF =
+  "disabled:text-neutral-300 disabled:cursor-default disabled:hover:bg-transparent disabled:hover:text-neutral-300 dark:disabled:text-neutral-600 dark:disabled:hover:bg-transparent dark:disabled:hover:text-neutral-600";
 const RED_BTN = "-mx-1 px-1 rounded text-red-600 dark:text-red-400 transition-colors hover:bg-red-500/10";
 const PLAIN_BTN = "-mx-1 px-1 rounded transition-colors hover:bg-neutral-100 dark:hover:bg-neutral-700/70";
 
@@ -319,7 +325,11 @@ function ResizeHandle({ width, onWidth }: { width: number; onWidth: (w: number) 
     else if (e.key === "ArrowRight") onWidth(width - step);
     else if (e.key === "Home") onWidth(ASK_W_DEFAULT);
     else return;
+    // the keys the handle claims are ITS keys: without stopPropagation the app's
+    // window-level reading-keys listener also acts on them (Home scrolled the
+    // book back to page 1 while the handle only resized the panel)
     e.preventDefault();
+    e.stopPropagation();
   };
 
   useEffect(() => () => cancelAnimationFrame(raf.current), []);
@@ -379,7 +389,7 @@ export function AskSidebar({
   const [confirmDel, setConfirmDel] = useState<string | null>(null); // thread id armed for delete
   const [cmdOpen, setCmdOpen] = useState(false);
   const [cmdSel, setCmdSel] = useState(0);
-  const [sugHideAt, setSugHideAt] = useState(-1); // msgs.length at which the chips were dismissed
+  const [sugHideAt, setSugHideAt] = useState(-1); // turn number at which the chips were dismissed
 
   const msgsRef = useRef(msgs);
   const busyRef = useRef(false);
@@ -391,11 +401,16 @@ export function AskSidebar({
   pathRef.current = bookPath;
   const tidRef = useRef(index.active);
   tidRef.current = index.active;
+  // monotonic turn counter — the identity «which answer is on screen». msgs.length
+  // stops moving once a thread hits HIST_LIMIT, and a dismissal keyed to it would
+  // then match every later answer, silencing the chips in that thread forever.
+  const turn = useRef(0);
 
   // append + persist; a book/thread switched mid-flight still gets its answer
   // stored in the thread that asked for it
   const push = (path: string, tid: string, m: Msg) => {
     if (pathRef.current === path && tidRef.current === tid) {
+      turn.current += 1;
       msgsRef.current = [...msgsRef.current, m].slice(-HIST_LIMIT);
       saveMsgs(path, tid, msgsRef.current);
       setMsgs(msgsRef.current);
@@ -691,7 +706,7 @@ export function AskSidebar({
   const sendable = !!input.trim() || !!pending;
   const last = msgs[msgs.length - 1];
   const showSuggestions =
-    !busy && canAsk && !!last && last.role === "assistant" && !last.error && sugHideAt !== msgs.length;
+    !busy && canAsk && !!last && last.role === "assistant" && !last.error && sugHideAt !== turn.current;
 
   // ---- quick commands ----
   const hasAnswer = msgs.some((m) => m.role === "assistant" && !m.error);
@@ -806,10 +821,11 @@ export function AskSidebar({
           <span className="sr-only">Беседы по книге</span>
         </button>
         <button
-          className={`${HDR_BTN} disabled:pointer-events-none disabled:text-neutral-300 dark:disabled:text-neutral-600`}
+          aria-disabled={busy || msgs.length === 0}
+          className={`${HDR_BTN} ${HDR_BTN_OFF}`}
           disabled={busy || msgs.length === 0}
           onClick={newThread}
-          title={msgs.length === 0 ? "Беседа уже пустая" : "Новая беседа"}
+          title={msgs.length === 0 ? "Новая беседа — эта беседа уже пустая" : "Новая беседа"}
         >
           <SquarePenIcon className="size-3.5" />
           <span className="sr-only">Новая беседа</span>
@@ -994,7 +1010,7 @@ export function AskSidebar({
             ))}
             <button
               className="rounded-md p-1 text-neutral-400 transition-colors hover:text-neutral-700 dark:hover:text-neutral-200"
-              onClick={() => setSugHideAt(msgs.length)}
+              onClick={() => setSugHideAt(turn.current)}
               title="Скрыть подсказки"
             >
               <IconClose size={12} />
@@ -1033,7 +1049,7 @@ export function AskSidebar({
               const sel = !why && i === Math.min(cmdSel, cmdEnabled.length - 1);
               return (
                 <button
-                  className={`flex w-full items-center gap-2.5 px-3 py-1.5 text-left transition-colors ${
+                  className={`flex w-full items-start gap-2.5 px-3 py-1.5 text-left transition-colors ${
                     why
                       ? "cursor-default text-neutral-400 dark:text-neutral-500"
                       : `hover:bg-neutral-100 dark:hover:bg-neutral-700/60 ${sel ? "bg-neutral-100 dark:bg-neutral-700/60" : ""}`
@@ -1042,11 +1058,17 @@ export function AskSidebar({
                   key={c.id}
                   onClick={() => runCmd(c)}
                   onMouseEnter={() => !why && setCmdSel(i)}
+                  title={c.label}
                   type="button"
                 >
-                  <c.icon className="size-3.5 shrink-0" />
-                  <span className="min-w-0 flex-1 truncate text-[13px]">{c.label}</span>
-                  {why && <span className="shrink-0 text-[11px]">{why}</span>}
+                  <c.icon className="mt-0.5 size-3.5 shrink-0" />
+                  {/* the precondition goes on its OWN line: sharing the row with
+                      the label ate it («Объя…») at narrow panel widths, and the
+                      command name is the one thing that must always be readable */}
+                  <span className="min-w-0 flex-1">
+                    <span className="block truncate text-[13px]">{c.label}</span>
+                    {why && <span className="block truncate text-[11px] opacity-80">{why}</span>}
+                  </span>
                 </button>
               );
             })}
@@ -1064,8 +1086,9 @@ export function AskSidebar({
           <PromptInputToolbar>
             <PromptInputTools>
               <button
+                aria-disabled={busy || !canAsk}
                 aria-expanded={cmdOpen}
-                className={`${HDR_BTN} disabled:pointer-events-none disabled:text-neutral-300 dark:disabled:text-neutral-600 ${
+                className={`${HDR_BTN} ${HDR_BTN_OFF} ${
                   cmdOpen ? "bg-neutral-900/5 dark:bg-neutral-100/10" : ""
                 }`}
                 data-askcmdbtn
