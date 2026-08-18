@@ -243,6 +243,9 @@ const GROUPS: { name: string; rows: [string, string][] }[] = [
       ["O", "Оригинал выделенного"],
       ["Enter", "Перевести выделенное"],
       ["Ctrl+J", "Спросить"],
+      // composer-local, not a global binding — listed here because the panel
+      // it belongs to is opened by Ctrl+J right above
+      ["/", "Быстрые команды в «Спросить»"],
     ],
   },
 ];

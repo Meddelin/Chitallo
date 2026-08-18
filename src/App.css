@@ -384,6 +384,21 @@
   padding-top: 0;
   border-top: 0;
 }
+/* Citation references inside translated text («[Devlin et al. 2018]»,
+   «[Карпухин и др., 2020]» — buildTrPage wraps them, see cite.ts). The
+   original prints them in the ACM template's link color; the reflow gives them
+   the app accent muted INTO the page — mixed toward the ink on paper, toward
+   the paper on ink. Distinguishable at a glance, far below a link's
+   saturation: a paragraph with six references still reads as prose, and both
+   mixes clear 6:1 against their background. Color only — no underline, no
+   weight change: the cue must not add texture to justified body type. */
+.trPage .cite {
+  color: color-mix(in srgb, var(--color-accent) 62%, #1c1c1c);
+}
+.dark .trPage .cite {
+  color: color-mix(in srgb, var(--color-accent) 70%, #d8d8d8);
+}
+
 /* inline image crops of non-translated regions (formulas/figures/tables and
    failed paragraphs) — in flow, centered, natural size (buildTrPage sets px
    width/height). Overrides the absolute .page canvas rule above; the

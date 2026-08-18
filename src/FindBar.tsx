@@ -159,15 +159,16 @@ export default function FindBar({
         const pm = pagesRef.current.get(Number(pageEl?.dataset.page));
         if (!pm?.length) continue;
         if (layer.classList.contains("trPage")) {
-          // hits live inside single-text-node <p> blocks, addressed by tridx
+          // hits live inside <p> blocks addressed by tridx; offsets index the
+          // stored tr string, and the block's text nodes concatenate back to
+          // exactly that (buildTrPage may split it around <span class="cite">
+          // citation runs — see cite.ts), so the same walk/offset mapping the
+          // text layer uses applies here
           for (const m of pm) {
             const block = layer.querySelector(`[data-tridx="${m.tridx}"]`);
-            const tn = block?.tagName === "P" ? block.firstChild : null;
-            if (!(tn instanceof Text)) continue; // crop canvas / re-typeset race
-            const r = new Range();
-            r.setStart(tn, Math.min(m.start, tn.data.length));
-            r.setEnd(tn, Math.min(m.end, tn.data.length));
-            if (r.collapsed) continue;
+            if (block?.tagName !== "P") continue; // crop canvas / re-typeset race
+            const r = toRange(walkLayer(block).segs, m.start, m.end);
+            if (!r) continue;
             all.push(r);
             if (m === curRef.current) curRange = r;
           }

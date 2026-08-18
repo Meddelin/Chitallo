@@ -8,20 +8,39 @@ import {
 import { cn } from "@/lib/utils";
 import type { ComponentProps } from "react";
 
-export type SuggestionsProps = ComponentProps<typeof ScrollArea>;
+export type SuggestionsProps = ComponentProps<typeof ScrollArea> & {
+  /** Wrap onto extra rows instead of scrolling sideways. Required in a narrow
+   *  container: the scroll variant below hides its scrollbar (Radix
+   *  `scrollbar-width:none` + `<ScrollBar className="hidden">`), so anything
+   *  past the right edge is silently unreachable with a mouse. */
+  wrap?: boolean;
+};
 
 export const Suggestions = ({
   className,
   children,
+  wrap,
   ...props
-}: SuggestionsProps) => (
-  <ScrollArea className="w-full overflow-x-auto whitespace-nowrap" {...props}>
-    <div className={cn("flex w-max flex-nowrap items-center gap-2", className)}>
-      {children}
-    </div>
-    <ScrollBar className="hidden" orientation="horizontal" />
-  </ScrollArea>
-);
+}: SuggestionsProps) => {
+  if (wrap) {
+    return (
+      <div
+        className={cn("flex flex-wrap items-center gap-1.5", className)}
+        {...(props as unknown as ComponentProps<"div">)}
+      >
+        {children}
+      </div>
+    );
+  }
+  return (
+    <ScrollArea className="w-full overflow-x-auto whitespace-nowrap" {...props}>
+      <div className={cn("flex w-max flex-nowrap items-center gap-2", className)}>
+        {children}
+      </div>
+      <ScrollBar className="hidden" orientation="horizontal" />
+    </ScrollArea>
+  );
+};
 
 export type SuggestionProps = Omit<ComponentProps<typeof Button>, "onClick"> & {
   suggestion: string;

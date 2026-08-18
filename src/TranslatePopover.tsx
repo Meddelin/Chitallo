@@ -30,16 +30,14 @@ const LINK_HOVER = "transition-colors hover:text-neutral-800 dark:hover:text-neu
 // popover-openings counter for the Alt+click footer hint (Н6, first 3 opens)
 const ALT_HINT_KEY = "pdfer:hint:altclick";
 
-function clampToViewport(el: HTMLElement, a: Anchor) {
-  const pad = 8;
-  const r = el.getBoundingClientRect();
-  const x = Math.min(Math.max(pad, a.x), window.innerWidth - r.width - pad);
-  const y =
-    a.y + r.height + pad > window.innerHeight
-      ? Math.max(pad, window.innerHeight - r.height - pad)
-      : a.y;
-  el.style.left = `${x}px`;
-  el.style.top = `${y}px`;
+const PAD = 8;
+
+// The anchor rule, in one place: the bar hangs off the END of the selection —
+// «Перевести»/«Оригинал» belong to the text the user just finished dragging
+// over. Kept identical to the value the App captures at pointerup so a
+// re-anchor never visibly moves the bar.
+function anchorOf(last: DOMRect): Anchor {
+  return { x: last.right + 4, y: last.bottom + 6 };
 }
 
 // WP-Q: the translate popover's position is computed ONCE per anchor and never
@@ -67,11 +65,30 @@ function placePopover(el: HTMLElement, a: Anchor) {
 
 export function SelectionBar({
   anchor,
+  scrollerRef,
+  liveAnchorRef,
+  layoutKey,
+  onGone,
   onTranslate,
   onOriginal,
   onAsk,
 }: {
   anchor: Anchor;
+  // the reading scroller. It — not the window — is the bar's world: it is the
+  // clipping box the hide rule tests against, and the box the bar is clamped
+  // into, so an open «Спросить» sidebar never gets the bar parked on top of it.
+  scrollerRef?: React.RefObject<HTMLElement | null>;
+  // out-param: where the bar actually sits at this instant. The popover opens
+  // at the bar's live spot, not at the point the selection had when it was made
+  // — otherwise «Перевести» after a scroll answers off-screen.
+  liveAnchorRef?: React.MutableRefObject<Anchor>;
+  // any value that changes page layout (масштаб, колонки, режим, кегль): the
+  // bar re-anchors once the new layout has settled
+  layoutKey?: string | number;
+  // the selection the bar points at is gone — it collapsed, or a zoom/mode
+  // re-render replaced the very nodes it covered (which fires NO
+  // selectionchange, so this callback is the only signal)
+  onGone?: () => void;
   // original-text selections: translate them (absent on translated pages)
   onTranslate?: () => void;
   // selections inside the reflowed translation: peek at the stored original
@@ -83,13 +100,105 @@ export function SelectionBar({
   onAsk: () => void;
 }) {
   const ref = useRef<HTMLDivElement>(null);
+  const rafRef = useRef<number>(undefined);
+  const goneRef = useRef(onGone);
+  goneRef.current = onGone;
+
+  // Re-anchor from the LIVE selection, every time. The bar is position:fixed,
+  // so an anchor captured once in viewport coordinates drifts 1:1 with every
+  // scrolled pixel — the bug this exists to kill. Reading the selection afresh
+  // also makes keyboard-extended selections (Shift+→/↓) track, and makes an
+  // empty rect list the collapse/teardown detector.
+  const place = useCallback(() => {
+    const el = ref.current;
+    if (!el) return;
+    const s = document.getSelection();
+    const range = s && s.rangeCount > 0 && !s.isCollapsed ? s.getRangeAt(0) : null;
+    const rects = range ? range.getClientRects() : null;
+    if (!rects || rects.length === 0) return void goneRef.current?.();
+    const first = rects[0];
+    const last = rects[rects.length - 1];
+    const r = el.getBoundingClientRect();
+
+    const sc = scrollerRef?.current?.getBoundingClientRect();
+    const minX = Math.max(PAD, sc ? sc.left + PAD : PAD);
+    const maxX = Math.min(window.innerWidth - PAD, sc ? sc.right - PAD : window.innerWidth - PAD);
+    const minY = Math.max(PAD, sc ? sc.top + PAD : PAD);
+    const maxY = Math.min(window.innerHeight - PAD, sc ? sc.bottom - PAD : window.innerHeight - PAD);
+
+    // Floating UI's referenceHidden rule: once the anchored end of the
+    // selection is fully outside the reading area, hide — but stay MOUNTED, so
+    // scrolling back brings the same bar, with its captured payload, back.
+    if (sc && (last.top > sc.bottom - PAD || last.bottom < sc.top + PAD || last.left > sc.right || last.right < sc.left)) {
+      el.style.visibility = "hidden";
+      el.style.pointerEvents = "none";
+      return;
+    }
+    el.style.visibility = "";
+    el.style.pointerEvents = "";
+
+    // Below the selection normally; above it when the line sits too close to
+    // the bottom edge. The old clamp pinned the bar to the viewport bottom
+    // instead, which parked it right on top of the text it belongs to.
+    const below = anchorOf(last);
+    const flip = below.y + r.height > maxY;
+    const y = flip ? Math.max(minY, first.top - r.height - 6) : below.y;
+    // flipped-up bars align with the selection's START — hugging the first
+    // line's left edge, the way every bubble menu does it
+    const x = Math.min(Math.max(minX, flip ? first.left : below.x), Math.max(minX, maxX - r.width));
+    el.style.left = `${x}px`;
+    el.style.top = `${y}px`;
+    if (liveAnchorRef) liveAnchorRef.current = { x, y };
+  }, [scrollerRef, liveAnchorRef]);
+
+  // one shared rAF token for every trigger: a scroll storm re-anchors once per
+  // frame, and the writes are imperative — no setState, no re-render, no thrash
+  const schedule = useCallback(() => {
+    if (rafRef.current !== undefined) return;
+    rafRef.current = requestAnimationFrame(() => {
+      rafRef.current = undefined;
+      place();
+    });
+  }, [place]);
+
+  useLayoutEffect(() => {
+    place();
+  }, [place, anchor]);
+
+  // a zoom / column / view-mode / font change re-lays the page out
+  // asynchronously — measure after it has settled (the double-rAF the App
+  // already uses for its own post-layout scroll fixes)
+  useLayoutEffect(() => {
+    place();
+    let inner = 0;
+    const outer = requestAnimationFrame(() => {
+      inner = requestAnimationFrame(place);
+    });
+    return () => {
+      cancelAnimationFrame(outer);
+      cancelAnimationFrame(inner);
+    };
+  }, [layoutKey, place]);
+
   useEffect(() => {
-    if (ref.current) clampToViewport(ref.current, anchor);
-  }, [anchor]);
+    // capture + document: catches the reading scroller AND any other scroller
+    // an ancestor might introduce; selectionchange covers Shift+arrow edits
+    document.addEventListener("scroll", schedule, { capture: true, passive: true });
+    document.addEventListener("selectionchange", schedule);
+    window.addEventListener("resize", schedule);
+    return () => {
+      document.removeEventListener("scroll", schedule, true);
+      document.removeEventListener("selectionchange", schedule);
+      window.removeEventListener("resize", schedule);
+      if (rafRef.current !== undefined) cancelAnimationFrame(rafRef.current);
+    };
+  }, [schedule]);
+
   return (
     <div
       ref={ref}
       data-selbar
+      style={{ left: anchor.x, top: anchor.y }}
       className="overlay-pop fixed z-20 flex items-center gap-1 rounded-full bg-white/90 dark:bg-neutral-800/90 backdrop-blur px-2 py-1 shadow-lg text-sm text-neutral-700 dark:text-neutral-200 select-none"
       // preserve the text selection: never let the bar steal focus/collapse it
       onMouseDown={(e) => e.preventDefault()}

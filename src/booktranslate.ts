@@ -379,56 +379,100 @@ function medianBodyFh(pages: Record<number, TrParagraph[]>, refPages: readonly n
 // After engine improvements (better clustering, furniture/refPage detection)
 // the stored page structure is stale, but most paragraph TEXT is unchanged —
 // a full re-translation would spend hours re-doing identical work. carryOver
-// moves existing translations onto the freshly-clustered paragraphs: exact
-// normalized-text match first, then a high-overlap prefix match (a superscript
-// marker dropped near the paragraph tail, a re-joined hyphenation). A changed
-// opening (split/merged paragraphs, an early in-text change) deliberately
-// fails both matches — those paragraphs are re-translated, which is the whole
-// point of the update. Old paragraphs are consumed at most once; old tr:""
-// entries carry nothing, so soft-failed paragraphs are re-requested for free.
+// moves existing translations onto the freshly-clustered paragraphs.
+//
+// The match is EXACT (whitespace-normalized, case-folded) and nothing else.
+// An earlier build also accepted a ≥90% common prefix, meaning to absorb a
+// dropped superscript or a re-joined hyphenation. That fuzziness is what made
+// the running-header bug outlive its own fix: the clusterer used to weld the
+// running header into the heading below it, so page 34 stored
+// «2.2 Text Representations for Ranking 13» translated as «2.2 Текстовые
+// представления для ранжирования 13». After the weld fix the paragraph's text
+// is the bare heading — a 90% prefix of the welded string — so the update
+// carried the page number straight back onto the repaired paragraph and the
+// user kept seeing «… для ранжирования 13». A translation whose source text no
+// longer matches is not a translation of this paragraph; it goes back on the
+// wire. Old paragraphs are consumed at most once; old tr:"" entries carry
+// nothing, so soft-failed paragraphs are re-requested for free.
 
 const normText = (s: string): string => s.replace(/\s+/g, " ").trim();
+// carry key: whitespace + case folded. Text comes from the same extractor on
+// both sides, so folding never merges genuinely different paragraphs — it only
+// absorbs glyph-mapping noise (small caps, ligature fallbacks).
+const carryKey = (s: string): string => normText(s).toLowerCase();
 
-function lcpLen(a: string, b: string): number {
-  const n = Math.min(a.length, b.length);
-  let i = 0;
-  while (i < n && a.charCodeAt(i) === b.charCodeAt(i)) i++;
-  return i;
+// ---- one-shot repair of already-poisoned stores ------------------------------
+// Exact matching alone cannot heal a store the old fuzzy matcher already
+// poisoned: the repaired paragraph text is stable from now on, so its bad tr
+// would match itself exactly and be carried forever. So every stored pair
+// (text, tr) is audited before it may enter the carry pool — a pair that fails
+// is dropped and the paragraph re-translates on the next «Обновить перевод».
+//
+// Three signals were measured against the real 838-page store (4514 translated
+// paragraphs); each hit was read by hand:
+//   - length / word-count ratio: REJECTED. Russian legitimately runs 2–3x the
+//     word count of a terse English heading («2.7 Retrieval-augmented
+//     Generation» → 7 words). A 0.8–1.6 char-length band flags 451 of the 4514
+//     on short blocks alone; even a strict "≥2.2x AND ≥4 extra words" word cut
+//     still flags 61, nearly all of them good translations.
+//   - ANY digit run in tr absent from text: REJECTED. 65 hits, ~40% wrong —
+//     «COVID» → «COVID-19», «(1k works) + 2k songs» → «1000 … 2000 … 3000»,
+//     list items the model renumbers, year ranges it completes from a garbled
+//     table column («2013–15» → «2013–2015»), and — before the digit-group
+//     flattening below — «3, 423 pairs» → «3 423 пары».
+//   - DANGLING EDGE NUMBER: PICKED. tr begins or ends with a bare number that
+//     occurs nowhere in the source text. That is precisely the residue a welded
+//     running head leaves, and translation does not invent a naked number at a
+//     string edge. Two guards keep it conservative: the number must be
+//     plausibly a printed page number (1..pageCount), and only heading-sized
+//     blocks are audited — a long paragraph opening with «1)» is a list the
+//     model renumbered, not a weld.
+// On the real store the picked rule flags 22 of 4514 paragraphs (0.49%), and
+// for all 22 the dangling number is verbatim the page's own running-head page
+// number (page 34's heading among them). No false positive, and no weld
+// residue found by a furniture cross-check that the rule misses.
+const STALE_MAX_LEN = 200; // heading-sized blocks only, chars
+// digit-group separators differ between the languages («3,423» / «3 423»)
+function flatNum(s: string): string {
+  let t = s.replace(/[\u00A0\u202F\u2009]/g, " "); // nbsp / narrow nbsp / thin space
+  for (let i = 0; i < 4; i++) t = t.replace(/(\d)[ ,]+(\d{3})(?!\d)/g, "$1$2");
+  return t;
 }
 
-const CARRY_PREFIX = 0.9; // common prefix must cover ≥90% of the LONGER text
-const CARRY_MIN = 12; // both texts non-trivial, chars
+export function looksStaleTr(text: string, tr: string, pageCount: number): boolean {
+  const t = normText(text);
+  const r = flatNum(normText(tr));
+  if (!r || t.length > STALE_MAX_LEN) return false;
+  const src = new Set(flatNum(t).match(/\d+/g) ?? []);
+  // a bare number the source never mentions, small enough to be a page number
+  const dangling = (d: string) => !src.has(d) && Number(d) >= 1 && Number(d) <= Math.max(pageCount, 1);
+  // tail: «… для ранжирования 13» — the separator class deliberately excludes
+  // "." so a trailing formula tag «(2.1)» or a glued footnote marker «…текста.15»
+  // is left alone
+  const tail = r.match(/(?:^|[\s(\[«"])(\d{1,4})\s*[.)\]»"]?$/);
+  if (tail && dangling(tail[1])) return true;
+  // head: «13 2.2 Текстовые …» — the verso running head («14 Chapter 2 …»)
+  const head = r.match(/^[(\[«"]?(\d{1,4})[\s.)\]]/);
+  return !!head && dangling(head[1]);
+}
 
 type CarryEntry = { tr: string; k: string; used: boolean };
 
-// mutates matched paragraphs' tr in place; returns those still needing the wire
-function carryOver(todo: TrParagraph[], old: readonly TrParagraph[]): TrParagraph[] {
-  const pool: CarryEntry[] = old
-    .filter((o) => o.tr !== "")
-    .map((o) => ({ tr: o.tr, k: normText(o.text), used: false }));
+// Mutates matched paragraphs' tr in place; returns those still needing the
+// wire. Exported for the same reason pageImageBoxes is: __pdferDev spreads this
+// module, so the matcher can be exercised on a seeded store from the console.
+export function carryOver(todo: TrParagraph[], old: readonly TrParagraph[], pageCount: number): TrParagraph[] {
   const byText = new Map<string, CarryEntry[]>();
-  for (const e of pool) {
+  for (const o of old) {
+    if (o.tr === "" || looksStaleTr(o.text, o.tr, pageCount)) continue;
+    const e: CarryEntry = { tr: o.tr, k: carryKey(o.text), used: false };
     const l = byText.get(e.k);
     if (l) l.push(e);
     else byText.set(e.k, [e]);
   }
-  const rest: TrParagraph[] = [];
-  for (const p of todo) {
-    const e = byText.get(normText(p.text))?.find((c) => !c.used);
-    if (e) {
-      e.used = true;
-      p.tr = e.tr;
-    } else rest.push(p);
-  }
   const wire: TrParagraph[] = [];
-  for (const p of rest) {
-    const k = normText(p.text);
-    const e = pool.find(
-      (c) =>
-        !c.used &&
-        Math.min(k.length, c.k.length) >= CARRY_MIN &&
-        lcpLen(k, c.k) >= CARRY_PREFIX * Math.max(k.length, c.k.length),
-    );
+  for (const p of todo) {
+    const e = byText.get(carryKey(p.text))?.find((c) => !c.used);
     if (e) {
       e.used = true;
       p.tr = e.tr;
@@ -625,9 +669,10 @@ export async function startBookTranslation(
       ? []
       : out.filter((p) => p.kind === "prose" && !figures.some((r) => interArea(p, r) >= FIG_CONTAIN * p.w * p.h));
     // update: pull translations over from the old clustering of this page —
-    // only genuinely new/changed paragraphs stay on the wire list
+    // only genuinely new/changed paragraphs (and ones whose stored translation
+    // fails the staleness audit) stay on the wire list
     const old = update ? store.pages[n] : undefined;
-    if (old) todo = carryOver(todo, old);
+    if (old) todo = carryOver(todo, old, total);
     if (todo.length) {
       let i = 0;
       const worker = async () => {
@@ -828,8 +873,10 @@ export function startRun(bookPath: string): Promise<void> {
 // «Обновить перевод» — incremental re-translation after engine improvements:
 // sweep EVERY stored page through the CURRENT clustering/classification code
 // (furniture, refPages and figures are recomputed), carry translations over by
-// paragraph-text match and send only new/changed paragraphs to the model —
-// unchanged pages complete instantly, with zero requests. Runs through the
+// EXACT paragraph-text match and send only new/changed paragraphs to the model
+// — unchanged pages complete instantly, with zero requests. Stored pairs whose
+// translation no longer fits their text (looksStaleTr — the running-header weld
+// residue) are dropped from the carry pool and re-translated. Runs through the
 // same run manager as a normal translation: progress/pause (stopRun)/
 // background semantics are identical, resume via store.updatedThrough.
 // opts.pageLimit is the same dev/test hook startBookTranslation has.

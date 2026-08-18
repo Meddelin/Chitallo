@@ -534,6 +534,8 @@ export default function Library({
                 )}
                 <button
                   data-book
+                  // the app's context menu reads the card's book off the DOM
+                  data-path={b.path}
                   tabIndex={i === fi ? 0 : -1}
                   onFocus={() => setFocusIdx(i)}
                   onClick={() => openBook(b.path)}

@@ -39,6 +39,7 @@ import { getDocument } from "pdfjs-dist";
 import type { PDFDocumentProxy } from "pdfjs-dist";
 import { loadBookTranslation } from "./booktranslate";
 import type { BookTranslation, TrParagraph } from "./booktranslate";
+import { splitCitations } from "./cite";
 import { FIG_CONTAIN, interArea } from "./paragraphs";
 import type { FigureRegion } from "./paragraphs";
 
@@ -176,6 +177,14 @@ export function assembleTxt(store: BookTranslation, title: string): string {
 const esc = (s: string) =>
   s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
 
+// перевод абзаца → HTML: ссылки на источники в <span class="cite">, как в
+// переверстке на экране (App.tsx setTrText, разбор в cite.ts). Класс один и
+// тот же в обоих документах — экранном и печатном; цвет задаёт их CSS.
+const escCites = (s: string) =>
+  splitCitations(s)
+    .map((r) => (r.cite ? `<span class="cite">${esc(r.text)}</span>` : esc(r.text)))
+    .join("");
+
 // same document voice as .trPage: Georgia serif, justified, hyphenated Russian
 const HTML_CSS = `
 :root { color-scheme: light dark; }
@@ -192,12 +201,17 @@ p { margin: 0.55em 0 0; text-indent: 1.5em; }
 .foot { font-size: 0.85em; text-indent: 0; margin-top: 1.3em; padding-top: 0.6em;
   border-top: 1px solid color-mix(in srgb, currentColor 30%, transparent); }
 .foot + .foot { margin-top: 0.45em; padding-top: 0; border-top: 0; }
+/* ссылки на источники — тот же приглушённый акцент, что в приложении
+   (App.css .trPage .cite): смесь акцента #3b82f6 с цветом текста страницы,
+   посчитанная в hex, — документ автономный, переменных темы в нём нет */
+.cite { color: #2f5ba3; }
 .crop { display: block; margin: 0.9em auto; max-width: 100%; height: auto; }
 .pg { margin: 2.4em 0 0; text-align: center; color: #a8a29e; font-size: 0.75em; letter-spacing: 0.08em; user-select: none; }
 .gap, .ph { color: #78716c; font-style: italic; text-align: center; text-indent: 0; margin-top: 1.6em; }
 @media (prefers-color-scheme: dark) {
   body { background: #1c1917; color: #d8d8d8; }
   .meta, .gap, .ph { color: #a8a29e; }
+  .cite { color: #6a9ced; }
   .pg { color: #78716c; }
   .crop { background: #fff; } /* crops are light-page pixels — keep them on white */
 }
@@ -224,6 +238,10 @@ p { margin: 0.55em 0 0; text-indent: 1.5em; }
 .foot { font-size: 0.85em; text-indent: 0; margin-top: 1.3em; padding-top: 0.6em;
   border-top: 1px solid #999; break-inside: avoid; page-break-inside: avoid; }
 .foot + .foot { margin-top: 0.45em; padding-top: 0; border-top: 0; }
+/* ссылки на источники: тот же цвет, что в светлой теме экранных документов;
+   print-color-adjust — чтобы печать не «сэкономила» краску на тексте (на
+   чёрно-белом принтере цвет ляжет серым, как в оригинальном PDF) */
+.cite { color: #2f5ba3; -webkit-print-color-adjust: exact; print-color-adjust: exact; }
 .crop { display: block; margin: 0.9em auto; max-width: 100%; height: auto;
   break-inside: avoid; page-break-inside: avoid; }
 .refpg { display: block; width: 100%; margin: 0.9em 0;
@@ -391,7 +409,7 @@ async function assembleDoc(
         if (it.kind === "text") {
           const cls = it.cls === "p" ? "" : ` class="${it.cls}"`;
           const style = it.cls === "head" && it.em ? ` style="font-size:${it.em.toFixed(3)}em"` : "";
-          pageChunks.push(`<p${cls}${style}>${esc(it.text)}</p>`);
+          pageChunks.push(`<p${cls}${style}>${escCites(it.text)}</p>`);
         } else if (off) {
           if (!probe) {
             const c = document.createElement("canvas");

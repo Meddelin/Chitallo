@@ -16,13 +16,17 @@ import { Palette, ShortcutsOverlay } from "./Palette";
 import type { PaletteCommand } from "./Palette";
 import { GlossaryModal, SelectionBar, TranslatePopover } from "./TranslatePopover";
 import type { Anchor } from "./TranslatePopover";
+import { ContextMenu } from "./ContextMenu";
+import type { CtxItem } from "./ContextMenu";
 import { AskSidebar } from "./AskSidebar";
+import { useAskWidth } from "./askwidth";
 import type { AskSeed } from "./AskSidebar";
 import { FIG_CONTAIN, buildFrags, growParagraph, interArea, medianLineH, paraText } from "./paragraphs";
 import type { FigureRegion, Word } from "./paragraphs";
+import { splitCitations } from "./cite";
 import * as booktranslate from "./booktranslate";
 import type { TrParagraph } from "./booktranslate";
-import { hydrateGlossary } from "./translate";
+import { hydrateGlossary, loadGlossaryText, saveGlossaryText } from "./translate";
 import * as glossarygen from "./glossarygen";
 import { ModelSetupModal, Spinner, dlBusy, dlPct, fetchModelStatus, restartModel, statusUp, useDownload } from "./ModelSetup";
 import { AboutModal } from "./About";
@@ -38,9 +42,9 @@ const DEFAULT_SCALE = 1.25;
 // Н4: every open path (обложка, Ctrl+O, палитра, pdfer:last) fails into the same toast
 const OPEN_FAIL_MSG = "Не удалось открыть файл — он перемещён или повреждён";
 const PAGE_GAP = 16;
-// «Спросить» sidebar width: the reading area shrinks by this (flex row, no
-// overlay), the fixed toolbar shifts left by half to stay centered over it
-const ASK_W = 400;
+// «Спросить» sidebar width: the reading area shrinks by it (flex row, no
+// overlay), the fixed toolbar shifts left by half to stay centered over it.
+// Live value + drag/persist live in AskSidebar (useAskWidth, pdfer:askw).
 
 // full-width action row of the «Перевод» dropdown menu
 const MENU_ROW =
@@ -174,6 +178,17 @@ function extractAskContext(selText: string): { page?: number; pageText?: string 
   return { page, pageText: txt };
 }
 
+// Поле ввода текста — там системное меню незаменимо: вставка требует прав на
+// буфер, а отмену, проверку орфографии и подсказки IME из JS не воспроизвести.
+// Чекбоксы и ползунки полями ввода не считаются: в них системное меню — это
+// «Обновить» и «Проверить код», которым в читалке не место.
+const TEXT_INPUT_TYPES = /^(text|search|url|email|password|tel|number)$/i;
+function isTextField(el: Element | null): boolean {
+  const f = el?.closest("input, textarea, [contenteditable]:not([contenteditable='false'])");
+  if (!f) return false;
+  return f.tagName !== "INPUT" || TEXT_INPUT_TYPES.test((f as HTMLInputElement).type);
+}
+
 // Alt+click paragraph detection, DOM entry point: the clicked span's text
 // layer supplies span client rects, the clustering math itself lives in
 // paragraphs.ts (shared with the whole-book translation engine)
@@ -250,6 +265,31 @@ const PAGE_PAD_X = 0.085; // trPage horizontal padding as a fraction of page wid
 // fig: candidate figure region (geometric detection) — subject to the
 // blank-margin pixel check in drawCrops; para crops are always drawn
 type Crop = { canvas: HTMLCanvasElement; x: number; y: number; w: number; h: number; fig?: boolean }; // scale-1 rect
+
+// Translated text → block content. Citation references («[Devlin et al. 2018]»,
+// «[Карпухин и др., 2020]») become <span class="cite">: the original prints
+// them in the template's link color, the reflow otherwise flattens them into
+// the sentence (see cite.ts for what counts as a reference). Everything else
+// stays a plain text node, and the runs concatenate BACK to the stored string
+// character for character — FindBar addresses tr-mode matches by offsets into
+// it, and «Оригинал»/«Спросить» read the block's textContent.
+function setTrText(el: HTMLElement, s: string) {
+  const runs = splitCitations(s);
+  if (runs.length === 1) {
+    el.textContent = s;
+    return;
+  }
+  for (const r of runs) {
+    if (!r.cite) {
+      el.append(r.text);
+      continue;
+    }
+    const sp = document.createElement("span");
+    sp.className = "cite";
+    sp.textContent = r.text;
+    el.append(sp);
+  }
+}
 
 // Clean re-typeset page replacing the original render in translation mode.
 // Prose paragraphs flow as <p> at ONE uniform body size for the whole book
@@ -347,7 +387,7 @@ function buildTrPage(
       } else {
         d.className = LIST_RE.test(p.tr) || LIST_RE.test(p.text) ? "trHang" : "trP";
       }
-      d.textContent = tr;
+      setTrText(d, tr);
       d.dataset.tridx = String(i);
       root.append(d);
     } else {
@@ -701,12 +741,21 @@ export default function App() {
   const [viewportW, setViewportW] = useState(() => window.innerWidth);
   const [viewportH, setViewportH] = useState(() => window.innerHeight);
   const [selBar, setSelBar] = useState<SelBarState | null>(null);
+  // where the selection bar actually sits right now — SelectionBar keeps this
+  // current as the page scrolls. Everything that opens the popover "from the
+  // bar" reads it, so the answer appears where the button was, not where the
+  // selection happened to be when it was made.
+  const selAnchorRef = useRef<Anchor>({ x: 0, y: 0 });
   const [pop, setPop] = useState<TrRequest | null>(null);
+  // pdfer's right-click menu (см. ContextMenu.tsx): items are built per event
+  const [ctxMenu, setCtxMenu] = useState<{ at: Anchor; items: CtxItem[]; keyboard?: boolean } | null>(null);
   const [glossOpen, setGlossOpen] = useState(false);
   // ---- «Спросить» sidebar ----
   // open state is per SESSION (sessionStorage), not per book; the thread
   // itself is per book (AskSidebar persists it in localStorage)
   const [askOpen, setAskOpen] = useState(() => sessionStorage.getItem("pdfer:ask:open") === "1");
+  // width is a workspace preference (pdfer:askw) — the panel owns the drag
+  const [askW, setAskW] = useAskWidth();
   const [askSeed, setAskSeed] = useState<AskSeed | null>(null);
   const askSeedIdRef = useRef(0);
   // ---- Ctrl+F find bar ----
@@ -783,6 +832,8 @@ export default function App() {
   trAvailRef.current = trInfo !== null;
   const selBarRef = useRef(selBar);
   selBarRef.current = selBar;
+  const ctxRef = useRef(ctxMenu);
+  ctxRef.current = ctxMenu;
   const popRef = useRef(pop);
   popRef.current = pop;
   const glossRef = useRef(glossOpen);
@@ -934,19 +985,38 @@ export default function App() {
       const last = rects[rects.length - 1] ?? range.getBoundingClientRect();
       const context = text.split(" ").length <= 2 ? sentenceAround(range, text) : undefined;
       const orig = trOriginalsFromSelection(getTrPage) ?? undefined;
-      setSelBar({ anchor: { x: last.right + 4, y: last.bottom + 6 }, text, context, orig });
+      const anchor = { x: last.right + 4, y: last.bottom + 6 };
+      selAnchorRef.current = anchor; // SelectionBar keeps it live from here on
+      setSelBar({ anchor, text, context, orig });
+    };
+    let down = false;
+    let reeval: number | undefined;
+    const onDown = () => {
+      down = true;
     };
     const onUp = (e: PointerEvent) => {
-      if ((e.target as Element | null)?.closest?.("[data-selbar],[data-popover]")) return;
+      down = false;
+      if ((e.target as Element | null)?.closest?.("[data-selbar],[data-popover],[data-ctxmenu]")) return;
       setTimeout(evaluate, 0); // let the browser settle the selection first
     };
     const onSelChange = () => {
       const s = document.getSelection();
-      if (!s || s.isCollapsed) setSelBar(null);
+      if (!s || s.isCollapsed) return setSelBar(null);
+      // Shift+→/↓ extends a selection without ever firing pointerup. The bar
+      // itself follows the rects on its own; the captured payload has to catch
+      // up too, or «Перевести» would act on the text the selection used to be.
+      // Only refreshes a bar that already exists, only once the extension has
+      // settled, and never mid-drag — the payload walk re-reads the store.
+      if (!selBarRef.current || down) return;
+      clearTimeout(reeval);
+      reeval = window.setTimeout(evaluate, 180);
     };
+    document.addEventListener("pointerdown", onDown);
     document.addEventListener("pointerup", onUp);
     document.addEventListener("selectionchange", onSelChange);
     return () => {
+      clearTimeout(reeval);
+      document.removeEventListener("pointerdown", onDown);
       document.removeEventListener("pointerup", onUp);
       document.removeEventListener("selectionchange", onSelChange);
     };
@@ -1016,30 +1086,38 @@ export default function App() {
   // Alt+click on text → translate the whole visual paragraph; on a reflowed
   // translated block the translation is already on screen, so show the stored
   // ORIGINAL paragraph instead (matched by store index via data-tridx)
-  const onAltClick = useCallback(
-    (e: React.MouseEvent) => {
-      if (!e.altKey) return;
-      const target = e.target as HTMLElement;
+  // The paragraph under a point, as a popover — shared by Alt+click and the
+  // context menu's «Перевести абзац» / «Оригинал абзаца», so both gestures
+  // resolve the paragraph the same way. Returns false when there is none.
+  const paragraphPopover = useCallback(
+    (target: HTMLElement): boolean => {
       const block = target.closest?.(".trPage [data-tridx]") as HTMLElement | null;
       if (block) {
         const pageEl = block.closest("[data-page]") as HTMLElement | null;
         const orig = getTrPage(Number(pageEl?.dataset.page))?.[Number(block.dataset.tridx)]?.text;
-        if (!orig) return;
-        e.preventDefault();
+        if (!orig) return false;
         const r = block.getBoundingClientRect();
         setSelBar(null);
         setPop({ anchor: { x: r.left, y: r.bottom + 6 }, text: orig, label: "Оригинал", noTranslate: true });
-        return;
+        return true;
       }
       const span = target.closest?.(".textLayer span") as HTMLElement | null;
-      if (!span) return;
-      e.preventDefault();
+      if (!span) return false;
       const para = paragraphAround(span);
-      if (!para?.text) return;
+      if (!para?.text) return false;
       setSelBar(null);
       setPop({ anchor: { x: para.left, y: para.bottom + 6 }, text: para.text });
+      return true;
     },
     [getTrPage],
+  );
+
+  const onAltClick = useCallback(
+    (e: React.MouseEvent) => {
+      if (!e.altKey) return;
+      if (paragraphPopover(e.target as HTMLElement)) e.preventDefault();
+    },
+    [paragraphPopover],
   );
 
   // «Спросить» sidebar open/close (session-persisted)
@@ -1071,14 +1149,33 @@ export default function App() {
   const peekOriginal = useCallback((bar?: SelBarState | null) => {
     const b = bar ?? selBarRef.current;
     if (!b?.orig) return;
+    // the LIVE bar has travelled with the page since the selection was made —
+    // answer where the bar is now; the palette's dead snapshot keeps its own
     setSelBar(null);
-    setPop({ anchor: b.anchor, text: b.orig, label: "Оригинал", noTranslate: true });
+    setPop({ anchor: bar ? b.anchor : selAnchorRef.current, text: b.orig, label: "Оригинал", noTranslate: true });
+  }, []);
+
+  // «Перевести» off the live selection bar — its button, ⏎ and the context menu
+  // all land here, so one place decides where the popover opens
+  const translateSelection = useCallback(() => {
+    const b = selBarRef.current;
+    if (!b || b.orig) return;
+    setSelBar(null);
+    setPop({ ...b, anchor: selAnchorRef.current });
   }, []);
 
   // Ctrl+F: open (or refocus) the find bar — books only
   const openFind = useCallback(() => {
     if (!pathRef.current) return;
     setFindSeed(null); // plain open never re-applies a stale palette seed
+    setFindOpen(true);
+    setFindNonce((n) => n + 1);
+  }, []);
+
+  // Ctrl+F with a query already in hand — палитра и контекстное меню
+  const findSeeded = useCallback((q: string) => {
+    if (!pathRef.current) return;
+    setFindSeed({ q, n: ++findSeedRef.current });
     setFindOpen(true);
     setFindNonce((n) => n + 1);
   }, []);
@@ -1387,14 +1484,22 @@ export default function App() {
     }
   }, [loadBytes]);
 
-  const openDialog = useCallback(async () => {
-    const p = await open({ multiple: false, filters: [{ name: "PDF", extensions: ["pdf"] }] });
-    if (typeof p === "string")
+  // every «открыть эту книгу» path (обложка, Ctrl+O, палитра, контекстное
+  // меню) fails into the same toast (Н4); returns the promise so the library
+  // card can hold its spinner until the load settles
+  const openPath = useCallback(
+    (p: string) =>
       loadFile(p).catch((e) => {
         console.error("open failed", e);
         showNotice(OPEN_FAIL_MSG);
-      });
-  }, [loadFile, showNotice]);
+      }),
+    [loadFile, showNotice],
+  );
+
+  const openDialog = useCallback(async () => {
+    const p = await open({ multiple: false, filters: [{ name: "PDF", extensions: ["pdf"] }] });
+    if (typeof p === "string") void openPath(p);
+  }, [openPath]);
 
   // reopen last book on start; ?test=<url> loads a PDF over HTTP (browser-based UI debugging)
   useEffect(() => {
@@ -1689,7 +1794,185 @@ export default function App() {
     const onResize = () => { clearTimeout(t); t = window.setTimeout(measure, 150); };
     window.addEventListener("resize", onResize);
     return () => { clearTimeout(t); window.removeEventListener("resize", onResize); };
-  }, [doc, askOpen]);
+  }, [doc, askOpen, askW]);
+
+  // «Добавить в глоссарий»: the term lands in the book's list with the «?»
+  // placeholder the auto-builder uses — visible in the modal, never fed into a
+  // prompt until a translation is typed (parseGlossary) — and the modal opens
+  // on it. Re-adding an existing term is a no-op, it just reopens the list.
+  const addToGlossary = useCallback((term: string) => {
+    const p = pathRef.current;
+    const t = term.replace(/\s+/g, " ").trim();
+    if (!p || !t) return;
+    const cur = loadGlossaryText(p);
+    const dup = cur
+      .split(/\r?\n/)
+      .some((l) => l.split(/=|->|→|—/)[0].trim().toLowerCase() === t.toLowerCase());
+    if (!dup) saveGlossaryText(p, `${cur.trimEnd() ? `${cur.trimEnd()}\n` : ""}${t} = ?`);
+    setGlossOpen(true);
+  }, []);
+
+  const copyText = useCallback(
+    (text: string) => {
+      navigator.clipboard?.writeText(text).then(
+        () => showNotice("Скопировано"),
+        () => showNotice("Не удалось скопировать"),
+      );
+    },
+    [showNotice],
+  );
+
+  // ---- правый клик: собственное меню вместо системного WebView2 -------------
+  //
+  // One document-level listener, three outcomes (см. таблицу в ContextMenu.tsx):
+  //  - в поле ввода — НЕ вмешиваемся: вырезать/вставить, отмена, проверка
+  //    орфографии и подсказки IME честно живут только в системном меню;
+  //  - в книге, на карточке библиотеки или на любом выделении — своё меню;
+  //  - в остальном хроме — preventDefault и НИЧЕГО: «Обновить», «Сохранить
+  //    как…» и «Проверить код» в читалке смысла не имеют.
+  useEffect(() => {
+    const onCtx = (e: MouseEvent) => {
+      const t = e.target as HTMLElement | null;
+      if (isTextField(t)) return; // системное меню — не подменяем
+      e.preventDefault();
+
+      // Клавиатурный вызов (Shift+F10 / клавиша «Меню») приходит тем же
+      // событием, но с button 0 и без осмысленных координат — целимся в конец
+      // выделения, иначе в сфокусированный элемент.
+      const byKey = e.button !== 2;
+      // «в книге» — единственная область, где уместны пункты страницы и поиск
+      // по выделению: цитата из ответа «Спросить» — пересказ, искать её в книге
+      // значит обещать заведомо пустой результат
+      const inReader = !!(t && scrollRef.current?.contains(t));
+      const s = document.getSelection();
+      const selText = s && !s.isCollapsed ? normalizeSelText(s.toString()) : "";
+      const rects = s && !s.isCollapsed && s.rangeCount ? s.getRangeAt(0).getClientRects() : null;
+      const lastRect = rects?.length ? rects[rects.length - 1] : null;
+      let at: Anchor = { x: e.clientX, y: e.clientY };
+      if (byKey) {
+        const fb = (document.activeElement as HTMLElement | null)?.getBoundingClientRect();
+        at = lastRect
+          ? { x: lastRect.right, y: lastRect.bottom + 4 }
+          : fb && (fb.width || fb.height)
+            ? { x: fb.left, y: fb.bottom + 4 }
+            : { x: Math.round(window.innerWidth / 2), y: Math.round(window.innerHeight / 2) };
+      }
+
+      const items: CtxItem[] = [];
+
+      // ---- карточка библиотеки ----
+      const card = t?.closest<HTMLElement>("[data-book][data-path]");
+      if (card) {
+        const p = card.dataset.path!;
+        items.push(
+          { id: "open", label: "Открыть", run: () => void openPath(p) },
+          {
+            id: "reveal",
+            label: "Показать в папке",
+            run: () => void revealItemInDir(p).catch(() => showNotice("Не удалось открыть папку")),
+          },
+        );
+        // Экспорта здесь нет намеренно: готов ли перевод у ЭТОЙ книги, видно
+        // только после асинхронного чтения хранилища — пункт либо лгал бы,
+        // либо всплывал под курсором уже после открытия меню.
+        setCtxMenu({ at, items, keyboard: byKey });
+        return;
+      }
+
+      // ---- выделение ----
+      // Правый клик мимо выделения схлопывает его ещё до этого события, так
+      // что живое выделение здесь — уже правильный ответ; панель выделения
+      // (её payload с оригиналами) годится, только пока текст на месте.
+      const bar = selText ? selBarRef.current : null;
+      if (bar) {
+        if (bar.orig) items.push({ id: "orig", label: "Оригинал", hint: "O", run: () => peekOriginal() });
+        // «Перевести» и «Добавить в глоссарий» отсутствуют в переводе не по
+        // недосмотру: выделен русский текст, а глоссарий — EN=RU (тот же
+        // честный выбор, что и у панели выделения)
+        else items.push({ id: "tr", label: "Перевести", hint: "⏎", run: translateSelection });
+        items.push({ id: "ask", label: "Спросить", run: askFromSelection });
+      }
+      if (selText) {
+        items.push({ id: "copy", label: "Копировать", hint: "Ctrl+C", run: () => copyText(selText) });
+        if (inReader && path)
+          items.push({ id: "find", label: "Найти в книге", hint: "Ctrl+F", run: () => findSeeded(selText) });
+        // термин, а не абзац: глоссарий — это пары слов, строка на пол-страницы
+        // в нём бессмысленна
+        if (bar && !bar.orig && selText.length <= 60 && selText.split(" ").length <= 6)
+          items.push({ id: "gloss", label: "Добавить в глоссарий", run: () => addToGlossary(selText) });
+      }
+
+      // ---- ссылка под курсором ----
+      const link = t?.closest<HTMLAnchorElement>("a[href]");
+      const href = link?.href ?? "";
+      if (!selText && /^https?:/i.test(href)) {
+        items.push(
+          { id: "openurl", label: "Открыть в браузере", run: () => void openUrl(href).catch(() => {}) },
+          { id: "copyurl", label: "Копировать ссылку", run: () => copyText(href) },
+        );
+      }
+
+      // ---- абзац под курсором (без выделения) ----
+      if (!selText && !byKey && t) {
+        const block = t.closest(".trPage [data-tridx]");
+        const span = !block && t.closest(".textLayer span");
+        if (block || span)
+          items.push({
+            id: "para",
+            label: block ? "Оригинал абзаца" : "Перевести абзац",
+            hint: "Alt+клик",
+            run: () => paragraphPopover(t),
+          });
+      }
+
+      // ---- страница: отдельной группой, но только в области чтения ----
+      // Клик по хрому (тулбар, сайдбар, пустое поле вокруг) не получает НИЧЕГО:
+      // системное меню подавлено, своего нет — «Обновить» и «Проверить код» в
+      // читалке не нужны, а пункты страницы там не к месту. Выделение в ответе
+      // «Спросить» — это тоже не книга: там остаётся одно «Копировать».
+      if (doc && inReader) {
+        const page: CtxItem[] = [];
+        if (trInfo !== null)
+          page.push({
+            id: "view",
+            label: viewMode === "tr" ? "Показать оригинал" : "Показать перевод",
+            hint: "T",
+            run: toggleView,
+          });
+        page.push({ id: "toc", label: "Оглавление", run: () => setNavOpen(true) });
+        if (!selText) page.push({ id: "findplain", label: "Найти в книге", hint: "Ctrl+F", run: openFind });
+        if (page.length) {
+          if (items.length) items.push({ sep: true });
+          items.push(...page);
+        }
+      }
+
+      // одно всплывающее над книгой за раз — как делает Ctrl+K
+      if (!items.length) return void setCtxMenu(null);
+      setMenuOpen(false);
+      setNavOpen(false);
+      setZoomOpen(false);
+      setCtxMenu({ at, items, keyboard: byKey });
+    };
+    document.addEventListener("contextmenu", onCtx);
+    return () => document.removeEventListener("contextmenu", onCtx);
+  }, [
+    doc,
+    path,
+    trInfo,
+    viewMode,
+    openPath,
+    showNotice,
+    peekOriginal,
+    translateSelection,
+    askFromSelection,
+    copyText,
+    findSeeded,
+    addToGlossary,
+    paragraphPopover,
+    toggleView,
+    openFind,
+  ]);
 
   // keyboard: Ctrl+O open, Ctrl +/-/0 zoom, D dark (e.code = layout-independent)
   useEffect(() => {
@@ -1697,6 +1980,10 @@ export default function App() {
       const ctrl = e.ctrlKey || e.metaKey;
       const t = e.target as HTMLElement | null;
       const typing = !!t && (t.tagName === "TEXTAREA" || t.tagName === "INPUT" || t.isContentEditable);
+      // the context menu is the topmost transient layer: while it is up it owns
+      // ↑/↓/Home/End/⏎ (ContextMenu's own listener), and only Escape gets
+      // through — to the chain below, which peels the menu first
+      if (ctxRef.current && e.key !== "Escape") return;
       if (ctrl && e.code === "KeyO") { e.preventDefault(); openDialog(); }
       else if (ctrl && e.code === "KeyF") { e.preventDefault(); openFind(); }
       else if (ctrl && (e.key === "=" || e.key === "+")) { e.preventDefault(); zoomTo(scaleRef.current + 0.125); }
@@ -1776,10 +2063,11 @@ export default function App() {
       }
       else if (e.key === "Escape") {
         // Esc peels UI layers before closing the book:
-        // палитра → шорткаты → «О pdfer» → настройки → оглавление → масштаб → меню → модель → глоссарий → перевод → поиск → сайдбар (только при фокусе в нём) → выделение
+        // контекстное меню → палитра → шорткаты → «О pdfer» → настройки → оглавление → масштаб → меню → модель → глоссарий → перевод → поиск → сайдбар (только при фокусе в нём) → выделение
         // (Esc typed INSIDE the find/page/palette inputs is handled there and never reaches this chain)
         const ae = document.activeElement as HTMLElement | null;
-        if (paletteRef.current) setPaletteOpen(false);
+        if (ctxRef.current) setCtxMenu(null);
+        else if (paletteRef.current) setPaletteOpen(false);
         else if (shortcutsRef.current) setShortcutsOpen(false);
         else if (aboutRef.current) setAboutOpen(false);
         else if (settingsRef.current) setSettingsOpen(false);
@@ -1964,7 +2252,7 @@ export default function App() {
       <div
         className="toolbar fixed top-3 -translate-x-1/2 z-10 flex items-center gap-1 rounded-full bg-white/85 dark:bg-neutral-800/85 backdrop-blur px-3 py-1.5 shadow-lg text-sm text-neutral-700 dark:text-neutral-200 select-none transition-[left] duration-150"
         // stay centered over the READING area: shift by half the sidebar width
-        style={{ left: doc && askOpen ? `calc(50% - ${ASK_W / 2}px)` : "50%" }}
+        style={{ left: doc && askOpen ? `calc(50% - ${askW / 2}px)` : "50%" }}
       >
         {/* run progress — 2px band along the pill's bottom edge; the trigger
             label stays constant so the pill never resizes mid-run (WP-H).
@@ -2355,7 +2643,7 @@ export default function App() {
           curPage={curPage}
           focusNonce={findNonce}
           seed={findSeed}
-          leftShift={askOpen ? ASK_W / 2 : 0}
+          leftShift={askOpen ? askW / 2 : 0}
           onClose={() => setFindOpen(false)}
         />
       )}
@@ -2388,15 +2676,7 @@ export default function App() {
           </div>
         ) : (
           <div className="flex-1 min-w-0 h-full">
-            <Library
-              onOpen={(p) =>
-                loadFile(p).catch((e) => {
-                  console.error("open failed", e);
-                  showNotice(OPEN_FAIL_MSG);
-                })
-              }
-              onAbout={() => setAboutOpen(true)}
-            />
+            <Library onOpen={openPath} onAbout={() => setAboutOpen(true)} />
           </div>
         )}
         {/* mounted (hidden) while a book is open so an in-flight ask streams on across toggles */}
@@ -2407,6 +2687,8 @@ export default function App() {
             bookTitle={path.split(/[\\/]/).pop()?.replace(/\.pdf$/i, "") ?? "книга"}
             page={curPage}
             seed={askSeed}
+            width={askW}
+            onWidth={setAskW}
             onClose={() => setAsk(false)}
           />
         )}
@@ -2415,16 +2697,16 @@ export default function App() {
       {selBar && !pop && (
         <SelectionBar
           anchor={selBar.anchor}
+          // the bar re-anchors itself off the live selection: it must know the
+          // reading area (clip + clamp), report where it ended up (the popover
+          // opens there) and hear about layout changes it cannot observe
+          scrollerRef={scrollRef}
+          liveAnchorRef={selAnchorRef}
+          layoutKey={`${scale}|${nColsEff}|${viewMode}|${trFont}|${askOpen ? askW : 0}`}
+          onGone={() => setSelBar(null)}
           // tr-selections swap «Перевести» for «Оригинал» — translating the
           // translation back is nonsense (choice documented in SelectionBar)
-          onTranslate={
-            selBar.orig
-              ? undefined
-              : () => {
-                  setPop(selBar);
-                  setSelBar(null);
-                }
-          }
+          onTranslate={selBar.orig ? undefined : translateSelection}
           // wrapped: the button's onClick MouseEvent must not land in the
           // optional bar-snapshot parameter
           onOriginal={selBar.orig ? () => peekOriginal() : undefined}
@@ -2476,31 +2758,31 @@ export default function App() {
           commands={paletteCommands}
           numPages={doc?.numPages}
           currentPath={path}
-          onOpenBook={(p) =>
-            loadFile(p).catch((e) => {
-              console.error("open failed", e);
-              showNotice(OPEN_FAIL_MSG);
-            })
-          }
+          onOpenBook={openPath}
           onGoToPage={goToPage}
-          onFind={
-            doc
-              ? (q) => {
-                  setFindSeed({ q, n: ++findSeedRef.current });
-                  setFindOpen(true);
-                  setFindNonce((n) => n + 1);
-                }
-              : undefined
-          }
+          onFind={doc ? findSeeded : undefined}
           onClose={() => setPaletteOpen(false)}
         />
       )}
       {shortcutsOpen && <ShortcutsOverlay onClose={() => setShortcutsOpen(false)} />}
+      {ctxMenu && (
+        <ContextMenu
+          at={ctxMenu.at}
+          items={ctxMenu.items}
+          keyboard={ctxMenu.keyboard}
+          onClose={() => setCtxMenu(null)}
+        />
+      )}
       {toast && (
         /* z-40 + последний в DOM: тост читается и поверх дым-слоя модалок
            (TXT-экспорт из Настроек); палитра (z-50) всё равно выше. Сам тост
            клики пропускает, живая только кнопка действия */
-        <div className="overlay-pop fixed bottom-6 left-1/2 -translate-x-1/2 z-40 rounded-full bg-white/95 dark:bg-neutral-800/95 backdrop-blur px-4 py-2 shadow-xl text-sm text-neutral-700 dark:text-neutral-200 select-none pointer-events-none whitespace-nowrap">
+        <div
+          className="overlay-pop fixed bottom-6 -translate-x-1/2 z-40 rounded-2xl bg-white/95 dark:bg-neutral-800/95 backdrop-blur px-4 py-2 shadow-xl text-sm text-neutral-700 dark:text-neutral-200 select-none pointer-events-none max-w-[min(90vw,40rem)] text-center"
+          // centered over the READING area, like the toolbar: a nowrap pill at
+          // 50% ran under the «Спросить» panel (118 px of it at a 1100 px window)
+          style={{ left: doc && askOpen ? `calc(50% - ${askW / 2}px)` : "50%" }}
+        >
           {toast.msg}
           {toast.action && (
             <button
