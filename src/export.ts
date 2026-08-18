@@ -42,7 +42,8 @@ import type { BookTranslation, TrParagraph } from "./booktranslate";
 import { splitCitations } from "./cite";
 import { FIG_CONTAIN, interArea } from "./paragraphs";
 import type { FigureRegion } from "./paragraphs";
-import { CROP_K, blankProbe, blitCrop, cropCanvas, cropSrc, cropViewport, cropWindow, isBlankCrop, releaseCanvas } from "./crops";
+import type { Src } from "./crops";
+import { CROP_K, blankProbe, blitCrop, cropCanvas, cropSrc, cropViewport, cropWindow, inkProbe, isBlankCrop, releaseCanvas, snapToInk } from "./crops";
 import type { CropWindow } from "./crops";
 
 // ---- constants mirrored from App.tsx (private there; keep values in sync) ---
@@ -287,10 +288,15 @@ function cropDataUrl(
   pageW: number,
   probe: CanvasRenderingContext2D,
   png: boolean, // print wants lossless PNG; the screen HTML keeps lighter JPEG
+  ink: CanvasRenderingContext2D,
+  others: readonly Src[], // the page's other crop rects — see crops.ts snapToInk
 ): { url: string; frac: number; w: number; px: number } | null {
-  const s = cropSrc(win, { x: Math.max(0, it.x), y: Math.max(0, it.y), w: it.w, h: it.h });
+  let s = cropSrc(win, { x: Math.max(0, it.x), y: Math.max(0, it.y), w: it.w, h: it.h });
   if (s.sw <= 0 || s.sh <= 0) return null;
   if (it.fig && isBlankCrop(probe, off, s.sx, s.sy, s.sw, s.sh)) return null; // blank margin
+  // figure rects are geometry and clip the ink that overhangs them — the same
+  // snap the app applies on screen, so the two documents stay the same document
+  if (it.fig) s = snapToInk(ink, off, win, s, others);
   const frac = Math.min(1, s.sw / win.k / pageW);
   // целевая ширина в пикселях выходной картинки (blitCrop не даст выйти за
   // разрешение растра — вверх не интерполируем)
@@ -356,6 +362,7 @@ async function assembleDoc(
   if (needDoc) doc = await openDoc(bookPath).catch(() => null); // без документа кропы деградируют в пометки
 
   let probe: CanvasRenderingContext2D | null = null;
+  let ink: CanvasRenderingContext2D | null = null;
   const chunks: string[] = [];
   let processed = 0;
   const gapHtml = (a: number, b: number) => {
@@ -412,6 +419,11 @@ async function assembleDoc(
           off = null; // damaged page — fall back to text markers
         }
       }
+      // source rects of every crop on the page, so a figure snapping out to its
+      // ink stops at pixels a neighbouring crop already carries (crops.ts)
+      const srcs: Src[] = win
+        ? cropRects.map((i) => cropSrc(win!, { x: Math.max(0, i.x), y: Math.max(0, i.y), w: i.w, h: i.h }))
+        : [];
       const pageChunks: string[] = [];
       for (const it of items) {
         if (it.kind === "text") {
@@ -420,7 +432,9 @@ async function assembleDoc(
           pageChunks.push(`<p${cls}${style}>${escCites(it.text)}</p>`);
         } else if (off && win) {
           probe ??= blankProbe();
-          const crop = cropDataUrl(off, win, it, pageW, probe, print);
+          ink ??= inkProbe();
+          const k = cropRects.indexOf(it);
+          const crop = cropDataUrl(off, win, it, pageW, probe, print, ink, srcs.slice(0, k).concat(srcs.slice(k + 1)));
           if (crop) {
             const alt = it.fig ? (it.caption ? esc(it.caption) : "Рисунок") : "Фрагмент оригинала";
             // печать: ширина в % от исходной страницы — пропорции оригинала

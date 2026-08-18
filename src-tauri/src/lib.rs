@@ -1363,6 +1363,110 @@ fn start_print_to_pdf(
         .map_err(|e| format!("PrintToPdf call: {e}"))
 }
 
+/// Kill only the children we spawned ourselves. An llama-server we merely
+/// *reused* (external instance, already listening when we started) is not in
+/// state.child and is deliberately left running. Idempotent: every kill takes
+/// its child out of the state first, so calling this twice is a no-op.
+fn kill_children(app: &tauri::AppHandle) {
+    kill_spawned::<TranslationState>(app);
+    kill_spawned::<AuxState>(app);
+    kill_ask_child(app);
+}
+
+/// Why the titlebar X cannot be left to Tauri's default path.
+///
+/// The frontend registers `onCloseRequested` (App.tsx) to flush the reading
+/// position. That one listener changes who owns the close: tauri's core
+/// (manager/window.rs `on_window_event`) sees a JS listener for
+/// `tauri://close-requested`, calls `api.prevent_close()`, and from then on the
+/// window only ever goes away when the JS wrapper reaches its
+/// `await this.destroy()`. Two independent defects were measured on that route
+/// (release build, WM_CLOSE posted to the main window):
+///
+///  1. `core:window:allow-destroy` was not granted — it is NOT part of
+///     `core:window:default`, so the ACL answered destroy() with
+///     "Command plugin:window|destroy not allowed by ACL". The rejection landed
+///     in the api wrapper's own promise where nothing reports it, the window
+///     never got a Destroyed event and the app stayed up indefinitely: the X
+///     did literally nothing. Granting the permission alone fixed that run
+///     (still alive after 15s -> exits in 1.25s), which is what pins this as
+///     the root cause of «крестик не работает».
+///  2. Even with destroy() working, it closes only the *main* window. With a
+///     PDF export in flight the hidden `pdf-print-N` window survives, so the
+///     window vanishes but pdfer.exe (and the llama-server it owns) linger with
+///     nothing on screen — measured at 20s+ before the run was killed.
+///
+/// A busy webview is a third way to strand the same route: the JS handler
+/// cannot run at all while the renderer is blocked.
+///
+/// So the X is owned here instead. Hide at once (the close looks instant), give
+/// the frontend a short grace period to persist its position, then exit the app
+/// — not just the window — whatever the webview is doing. If even the event
+/// loop cannot service that exit, reap our children directly and leave, so no
+/// orphan pdfer.exe / llama-server.exe survives. destroy() stays permitted as
+/// the fast path: when the webview is responsive it wins the race and the
+/// process is gone in well under the grace period.
+fn own_shutdown(window: &tauri::Window) {
+    /// Long enough for the webview to deliver the event and write localStorage,
+    /// short enough that the app is gone before the user looks twice.
+    const FLUSH_GRACE: Duration = Duration::from_millis(400);
+    /// If RunEvent::Exit has not landed by then, the event loop is wedged.
+    const HARD_DEADLINE: Duration = Duration::from_millis(2000);
+
+    static CLOSING: AtomicBool = AtomicBool::new(false);
+    if CLOSING.swap(true, Ordering::SeqCst) {
+        return; // impatient second click on the X — one shutdown is enough
+    }
+
+    eprintln!("[exit] close requested -> hiding window, exiting in {FLUSH_GRACE:?}");
+    let _ = window.hide();
+    let app = window.app_handle().clone();
+    std::thread::spawn(move || {
+        std::thread::sleep(FLUSH_GRACE);
+        app.exit(0);
+        std::thread::sleep(HARD_DEADLINE);
+        eprintln!("[exit] graceful exit did not complete -> forcing");
+        kill_children(&app);
+        std::process::exit(0);
+    });
+}
+
+/// Drop `pdf-export-*.html` files that no export can still be using.
+///
+/// exportTranslationPdf (src/export.ts) writes the print source into appData
+/// and removes it in a `finally`. That `finally` cannot run when the X closes
+/// the app mid-export — own_shutdown exits the process, by design — so every
+/// interrupted export used to strand its temp file forever. Measured on the
+/// release build: one interrupted export of an 838-page book left a 137 MB
+/// pdf-export-1787082279628.html behind, in *roaming* appData.
+///
+/// Age guard, not a blanket wipe: a second instance starting while this one is
+/// mid-export must not delete the file the export is reading. A live export's
+/// temp is seconds old; anything older than an hour belongs to a dead process.
+fn sweep_stale_export_temps(app: &tauri::AppHandle) {
+    const MAX_AGE: Duration = Duration::from_secs(60 * 60);
+    let Ok(dir) = app.path().app_data_dir() else { return };
+    let Ok(entries) = std::fs::read_dir(&dir) else { return };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if !(name.starts_with("pdf-export-") && name.ends_with(".html")) {
+            continue;
+        }
+        let stale = entry
+            .metadata()
+            .and_then(|m| m.modified())
+            .map(|t| t.elapsed().map(|age| age > MAX_AGE).unwrap_or(false))
+            .unwrap_or(false);
+        if stale {
+            match std::fs::remove_file(entry.path()) {
+                Ok(()) => eprintln!("[export] swept stale temp {name}"),
+                Err(e) => eprintln!("[export] cannot sweep {name}: {e}"),
+            }
+        }
+    }
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -1388,17 +1492,22 @@ pub fn run() {
             print_html_to_pdf
         ])
         .setup(|app| {
+            sweep_stale_export_temps(app.handle());
             let handle = app.handle().clone();
             std::thread::spawn(move || init_llama_server::<TranslationState>(handle));
             Ok(())
+        })
+        .on_window_event(|window, event| {
+            if window.label() == "main" && matches!(event, tauri::WindowEvent::CloseRequested { .. })
+            {
+                own_shutdown(window);
+            }
         })
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
         .run(|app_handle, event| {
             if let tauri::RunEvent::Exit = event {
-                kill_spawned::<TranslationState>(app_handle);
-                kill_spawned::<AuxState>(app_handle);
-                kill_ask_child(app_handle);
+                kill_children(app_handle);
             }
         });
 }

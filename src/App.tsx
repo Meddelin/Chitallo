@@ -23,7 +23,7 @@ import { useAskWidth } from "./askwidth";
 import type { AskSeed } from "./AskSidebar";
 import { FIG_CONTAIN, buildFrags, growParagraph, interArea, medianLineH, paraText } from "./paragraphs";
 import type { FigureRegion, Word } from "./paragraphs";
-import { CROP_DPR, CROP_K, blankProbe, blitCrop, cropCanvas, cropSrc, cropViewport, cropWindow, isBlankCrop, releaseCanvas } from "./crops";
+import { CROP_DPR, CROP_K, blankProbe, blitCrop, cropCanvas, cropSrc, cropViewport, cropWindow, inkProbe, isBlankCrop, releaseCanvas, snapToInk } from "./crops";
 import type { CropWindow } from "./crops";
 import { splitCitations } from "./cite";
 import * as booktranslate from "./booktranslate";
@@ -426,21 +426,28 @@ function buildTrPage(
 // REMOVED from the flow instead of drawn.
 function drawCrops(off: HTMLCanvasElement, win: CropWindow, crops: Crop[], dpr: number) {
   let probe: CanvasRenderingContext2D | null = null;
-  for (const cr of crops) {
-    const s = cropSrc(win, cr);
+  let ink: CanvasRenderingContext2D | null = null;
+  const srcs = crops.map((cr) => cropSrc(win, cr));
+  crops.forEach((cr, i) => {
+    let s = srcs[i];
     if (s.sw <= 0 || s.sh <= 0) {
       if (cr.fig) cr.canvas.remove();
-      continue;
+      return;
     }
     if (cr.fig) {
       probe ??= blankProbe();
       if (isBlankCrop(probe, off, s.sx, s.sy, s.sw, s.sh)) {
         cr.canvas.remove(); // blank margin, not a figure
-        continue;
+        return;
       }
+      // the stored rect is geometry and clips the ink that overhangs it
+      // (crops.ts snapToInk); the CSS box stays as laid out, so the recovered
+      // strip costs a ≤1% anisotropic scale instead of a jump in the flow
+      ink ??= inkProbe();
+      s = snapToInk(ink, off, win, s, srcs.slice(0, i).concat(srcs.slice(i + 1)));
     }
     blitCrop(cr.canvas, off, s, cr.cssW * dpr * CROP_DPR, cr.cssH * dpr * CROP_DPR);
-  }
+  });
 }
 
 // ---- translated outline -----------------------------------------------------
@@ -1451,7 +1458,16 @@ export default function App() {
   useEffect(() => {
     let un: Promise<() => void> | null = null;
     try {
-      un = getCurrentWindow().onCloseRequested(() => savePos());
+      // never let this throw: Tauri prevents the native close while a
+      // close-requested listener exists and only closes the window from this
+      // handler's continuation, so a rejection here would strand the X
+      un = getCurrentWindow().onCloseRequested(() => {
+        try {
+          savePos();
+        } catch {
+          // full localStorage quota — losing the last scroll beats not closing
+        }
+      });
     } catch {
       // plain browser (vite dev) — no Tauri
     }

@@ -63,9 +63,14 @@ export type CropWindow = {
 };
 
 /**
- * Bounding window of `rects`, clamped to the page box, at density `minK` (or
- * lower if CROP_BUDGET_PX would be exceeded). Returns null when there is
- * nothing to raster.
+ * Bounding window of `rects` GROWN BY `INK_SNAP` on every side, clamped to the
+ * page box, at density `minK` (or lower if CROP_BUDGET_PX would be exceeded).
+ * Returns null when there is nothing to raster.
+ *
+ * The margin is what snapToInk walks into: without it a figure sitting on the
+ * window's own edge would have no pixels to look at and could never recover the
+ * ink it clips. It costs ~13% of a typical window (8 pt of 200×300) and nothing
+ * at all in output size — the extra band is rasterized, never cut.
  */
 export function cropWindow(
   rects: readonly Rect[],
@@ -84,10 +89,10 @@ export function cropWindow(
     if (r.x + r.w > x1) x1 = r.x + r.w;
     if (r.y + r.h > y1) y1 = r.y + r.h;
   }
-  x0 = Math.max(0, x0);
-  y0 = Math.max(0, y0);
-  x1 = Math.min(pageW, x1);
-  y1 = Math.min(pageH, y1);
+  x0 = Math.max(0, x0 - INK_SNAP);
+  y0 = Math.max(0, y0 - INK_SNAP);
+  x1 = Math.min(pageW, x1 + INK_SNAP);
+  y1 = Math.min(pageH, y1 + INK_SNAP);
   const w = x1 - x0;
   const h = y1 - y0;
   if (!(w > 0) || !(h > 0)) return null;
@@ -124,12 +129,123 @@ export function releaseCanvas(c: HTMLCanvasElement) {
  * figure rules. Clamped to the canvas, so a rect the window could not fully
  * cover degrades to its visible part rather than reading out of bounds.
  */
-export function cropSrc(win: CropWindow, r: Rect) {
+export function cropSrc(win: CropWindow, r: Rect): Src {
   const sx = Math.max(0, Math.floor((r.x - win.x) * win.k));
   const sy = Math.max(0, Math.floor((r.y - win.y) * win.k));
   const sw = Math.min(win.cw, Math.ceil((r.x + r.w - win.x) * win.k)) - sx;
   const sh = Math.min(win.ch, Math.ceil((r.y + r.h - win.y) * win.k)) - sy;
   return { sx, sy, sw, sh };
+}
+
+// ---- snapping a figure edge out to its ink ----------------------------------
+// A stored figure region is GEOMETRY, not ink: the detector's box lands on the
+// last baseline of a table, on the bounding box of a plotted path, on a
+// diagram's frame — while the descenders, the axis labels and the arrowheads
+// live a few points OUTSIDE it. Cutting the crop on that box shaves them off,
+// and nothing else on the reflowed page shows those pixels. Measured on the
+// user's 838-page book: 126 of 278 stored figure regions clip ink that is
+// reproduced nowhere else, up to 16 pt past the edge.
+//
+// A CONSTANT pad does not fix this — measured on the same book, padding every
+// region by 1/2/3 pt takes the straddling count from 132 to 201/155/159,
+// because a fixed pad walks the edge into the NEXT text line about as often as
+// it rescues the current one.
+//
+// So each edge is snapped to the ink itself. An edge only moves where ink
+// actually CROSSES it (a dark pixel on both sides at the same column/row), and
+// it then moves exactly as far as that ink continues — stopping at the first
+// clear line, at INK_SNAP points, at the window, or at pixels another crop on
+// the page already reproduces.
+export type Src = { sx: number; sy: number; sw: number; sh: number };
+
+/** Farthest a figure edge may travel while snapping to ink, in scale-1 pt. */
+export const INK_SNAP = 4;
+/** Luminance below which a pixel counts as ink (the straddle audit's threshold). */
+const INK_DARK = 160;
+
+/**
+ * Reusable strip context for snapToInk. Deliberately NOT the window canvas:
+ * keeping the readback on a small willReadFrequently scratch (the same trick
+ * blankProbe uses) leaves the page raster itself GPU-backed — only four thin
+ * edge strips per figure ever come back across the bus.
+ */
+export function inkProbe(): CanvasRenderingContext2D {
+  const c = document.createElement("canvas");
+  return c.getContext("2d", { willReadFrequently: true })!;
+}
+
+type Side = "t" | "b" | "l" | "r";
+
+/** Device px one edge of `s` must travel outward to stop cutting ink. */
+function edgeGrow(
+  probe: CanvasRenderingContext2D,
+  off: CanvasImageSource,
+  win: CropWindow,
+  s: Src,
+  side: Side,
+  max: number,
+  others: readonly Src[],
+): number {
+  const vert = side === "t" || side === "b";
+  // room left outside this edge inside the window raster
+  const n = Math.min(
+    max,
+    side === "t" ? s.sy : side === "l" ? s.sx : side === "b" ? win.ch - (s.sy + s.sh) : win.cw - (s.sx + s.sw),
+  );
+  if (n <= 0) return 0;
+  // strip = the last line INSIDE the crop plus the n lines outside it
+  const sw = vert ? s.sw : n + 1;
+  const sh = vert ? n + 1 : s.sh;
+  if (sw <= 0 || sh <= 0) return 0;
+  const sx = side === "l" ? s.sx - n : side === "r" ? s.sx + s.sw - 1 : s.sx;
+  const sy = side === "t" ? s.sy - n : side === "b" ? s.sy + s.sh - 1 : s.sy;
+  probe.canvas.width = sw;
+  probe.canvas.height = sh;
+  probe.drawImage(off, sx, sy, sw, sh, 0, 0, sw, sh);
+  const d = probe.getImageData(0, 0, sw, sh).data;
+  // line 0 is the inside line, line k is k px outside it; j runs along the edge
+  const dark = (line: number, j: number) => {
+    const col = vert ? j : side === "l" ? n - line : line;
+    const row = side === "t" ? n - line : side === "b" ? line : j;
+    const p = (row * sw + col) * 4;
+    return 0.2126 * d[p] + 0.7152 * d[p + 1] + 0.0722 * d[p + 2] < INK_DARK;
+  };
+  // ink already reproduced by another crop of this page is not lost, and
+  // reaching for it would only duplicate it in two images
+  const covered = (line: number, j: number) => {
+    const px = side === "l" ? s.sx - line : side === "r" ? s.sx + s.sw - 1 + line : s.sx + j;
+    const py = side === "t" ? s.sy - line : side === "b" ? s.sy + s.sh - 1 + line : s.sy + j;
+    return others.some((o) => px >= o.sx && px < o.sx + o.sw && py >= o.sy && py < o.sy + o.sh);
+  };
+  let grow = 0;
+  for (let j = 0; j < (vert ? sw : sh); j++) {
+    if (!dark(0, j) || !dark(1, j) || covered(1, j)) continue; // no ink crosses here
+    let k = 1;
+    while (k < n && dark(k + 1, j) && !covered(k + 1, j)) k++;
+    if (k > grow) grow = k;
+  }
+  return grow;
+}
+
+/**
+ * `s` grown outward on each side until it stops cutting ink. Cheap when there
+ * is nothing to fix: the four strips are ≤ INK_SNAP px deep and the common case
+ * exits on the first (inside-line) test of every column.
+ */
+export function snapToInk(
+  probe: CanvasRenderingContext2D,
+  off: CanvasImageSource,
+  win: CropWindow,
+  s: Src,
+  others: readonly Src[],
+): Src {
+  const max = Math.max(1, Math.round(INK_SNAP * win.k));
+  const t = edgeGrow(probe, off, win, s, "t", max, others);
+  const b = edgeGrow(probe, off, win, s, "b", max, others);
+  const l = edgeGrow(probe, off, win, s, "l", max, others);
+  const r = edgeGrow(probe, off, win, s, "r", max, others);
+  if (!(t || b || l || r)) return s;
+  return { sx: s.sx - l, sy: s.sy - t, sw: s.sw + l + r, sh: s.sh + t + b };
 }
 
 // ---- blank-candidate detection ---------------------------------------------
