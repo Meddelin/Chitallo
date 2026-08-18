@@ -23,6 +23,7 @@ import { useAskWidth } from "./askwidth";
 import type { AskSeed } from "./AskSidebar";
 import { FIG_CONTAIN, buildFrags, growParagraph, interArea, medianLineH, paraText } from "./paragraphs";
 import type { FigureRegion, Word } from "./paragraphs";
+import type { Rect } from "./crops";
 import { CROP_DPR, CROP_K, blankProbe, blitCrop, cropCanvas, cropSrc, cropViewport, cropWindow, inkProbe, isBlankCrop, releaseCanvas, snapToInk } from "./crops";
 import type { CropWindow } from "./crops";
 import { splitCitations } from "./cite";
@@ -277,6 +278,8 @@ type Crop = {
   h: number;
   cssW: number;
   cssH: number;
+  /** widest the display box may get — the reflow's text column */
+  maxW: number;
   fig?: boolean;
 }; // scale-1 rect
 
@@ -359,8 +362,13 @@ function buildTrPage(
     if (tridx !== null) c.dataset.tridx = String(tridx);
     c.dataset.crop = `${Math.round(x)},${Math.round(y)},${Math.round(w)},${Math.round(h)}`; // dev/test introspection
     root.append(c);
-    crops.push({ canvas: c, x, y, w, h, cssW, cssH, fig });
+    crops.push({ canvas: c, x, y, w, h, cssW, cssH, maxW, fig });
   };
+  // rects of the paragraphs this page prints as translated TEXT: a figure
+  // snapping out to its ink must not reach into them (crops.ts snapToInk) —
+  // whatever ink is there already reaches the reader in Russian, and pulling
+  // a sliver of the English original into the figure would print it twice
+  const flowedText: Rect[] = [];
 
   // figure regions in reading order; a monotonic cursor interleaves them into
   // the paragraph flow (paras arrive band-ordered from clusterParagraphs)
@@ -408,12 +416,13 @@ function buildTrPage(
       setTrText(d, tr);
       d.dataset.tridx = String(i);
       root.append(d);
+      flowedText.push({ x: p.x, y: p.y, w: p.w, h: p.h });
     } else {
       addCrop(p.x - CROP_PAD, p.y - CROP_PAD, p.w + 2 * CROP_PAD, p.h + 2 * CROP_PAD, i, false);
     }
   });
   flushFigsAbove(Infinity, Infinity);
-  return { root, crops };
+  return { root, crops, flowedText };
 }
 
 // Copy each crop's region out of the offscreen WINDOW raster (see crops.ts:
@@ -424,10 +433,11 @@ function buildTrPage(
 // bilinear-crush. The window canvas is released by the caller right after.
 // fig-flagged crops (candidate figure regions) that sample as blank are
 // REMOVED from the flow instead of drawn.
-function drawCrops(off: HTMLCanvasElement, win: CropWindow, crops: Crop[], dpr: number) {
+function drawCrops(off: HTMLCanvasElement, win: CropWindow, crops: Crop[], flowedText: readonly Rect[], dpr: number) {
   let probe: CanvasRenderingContext2D | null = null;
   let ink: CanvasRenderingContext2D | null = null;
   const srcs = crops.map((cr) => cropSrc(win, cr));
+  const text = flowedText.map((r) => cropSrc(win, r));
   crops.forEach((cr, i) => {
     let s = srcs[i];
     if (s.sw <= 0 || s.sh <= 0) {
@@ -441,10 +451,26 @@ function drawCrops(off: HTMLCanvasElement, win: CropWindow, crops: Crop[], dpr: 
         return;
       }
       // the stored rect is geometry and clips the ink that overhangs it
-      // (crops.ts snapToInk); the CSS box stays as laid out, so the recovered
-      // strip costs a ≤1% anisotropic scale instead of a jump in the flow
+      // (crops.ts snapToInk). The display box follows the rect it recovers —
+      // squeezing a taller crop into the box laid out for the shorter one
+      // distorted short table bands by up to 20%. The box only ever grows by
+      // the strip the snap found (≤ INK_SNAP pt a side), and the page's
+      // remembered reflow height is refreshed right after.
       ink ??= inkProbe();
-      s = snapToInk(ink, off, win, s, srcs.slice(0, i).concat(srcs.slice(i + 1)));
+      const s0 = s;
+      s = snapToInk(ink, off, win, s0, srcs.slice(0, i).concat(srcs.slice(i + 1), text));
+      if (s.sw !== s0.sw || s.sh !== s0.sh) {
+        let cssW = (cr.cssW * s.sw) / s0.sw;
+        let cssH = (cr.cssH * s.sh) / s0.sh;
+        if (cssW > cr.maxW) {
+          cssH *= cr.maxW / cssW;
+          cssW = cr.maxW;
+        }
+        cr.cssW = cssW;
+        cr.cssH = cssH;
+        cr.canvas.style.width = `${cssW}px`;
+        cr.canvas.style.height = `${cssH}px`;
+      }
     }
     blitCrop(cr.canvas, off, s, cr.cssW * dpr * CROP_DPR, cr.cssH * dpr * CROP_DPR);
   });
@@ -637,7 +663,7 @@ function Page({
             // reflowed translated page: NO canvas and NO text layer — the
             // original is rasterized only offscreen (once, if any non-prose
             // region needs an image crop) and discarded after cropping
-            const { root, crops } = buildTrPage(paras, getTrFigs(num), getBodyFh(), scale, vp1.width, vp1.height);
+            const { root, crops, flowedText } = buildTrPage(paras, getTrFigs(num), getBodyFh(), scale, vp1.width, vp1.height);
             el.replaceChildren(root); // swap-in: any stale render leaves only now
             // Scroll hardening, secondary to .page:empty{overflow-anchor:none}:
             // persist the measured natural reflow height (scale-independent).
@@ -666,7 +692,18 @@ function Page({
               const off = cropCanvas(win);
               renderTask = page.render({ canvas: off, viewport: cropViewport(page, win) });
               await renderTask.promise.catch(() => {});
-              if (!cancelled && el.dataset.rendered === run) drawCrops(off, win, crops, dpr);
+              if (!cancelled && el.dataset.rendered === run) {
+                drawCrops(off, win, crops, flowedText, dpr);
+                // a figure that snapped out to its ink (crops.ts) is a few
+                // points taller than the box measured above — re-persist the
+                // reflow height so the placeholder still matches
+                const grown = el.offsetHeight / scale;
+                setRendered((prev) =>
+                  prev && prev.doc === doc && prev.trH !== undefined && Math.abs(prev.trH - grown) < 1
+                    ? prev
+                    : { doc, base: { w: vp1.width, h: vp1.height }, trH: grown },
+                );
+              }
               releaseCanvas(off); // a page-band's worth of RGBA — do not wait for GC
             }
             return;

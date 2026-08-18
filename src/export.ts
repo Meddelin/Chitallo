@@ -42,7 +42,7 @@ import type { BookTranslation, TrParagraph } from "./booktranslate";
 import { splitCitations } from "./cite";
 import { FIG_CONTAIN, interArea } from "./paragraphs";
 import type { FigureRegion } from "./paragraphs";
-import type { Src } from "./crops";
+import type { Rect, Src } from "./crops";
 import { CROP_K, blankProbe, blitCrop, cropCanvas, cropSrc, cropViewport, cropWindow, inkProbe, isBlankCrop, releaseCanvas, snapToInk } from "./crops";
 import type { CropWindow } from "./crops";
 
@@ -69,7 +69,10 @@ const PRINT_W_IN = 186 / 25.4; // печатная ширина A4-полосы 
 const SCREEN_DPR = 2;
 const REF_SCALE = 1.5; // full-page render scale for refPages in the print (PDF) export
 
-type TextItem = { kind: "text"; cls: "p" | "head" | "hang" | "foot"; em?: number; text: string };
+// `rect` is the source paragraph's box on the original page: a figure crop
+// snapping out to its ink must not reach into text this page already prints
+// in Russian (crops.ts snapToInk)
+type TextItem = { kind: "text"; cls: "p" | "head" | "hang" | "foot"; em?: number; text: string; rect: Rect };
 type CropItem = {
   kind: "crop";
   x: number;
@@ -108,14 +111,14 @@ function pageItems(paras: TrParagraph[], figures: readonly FigureRegion[], bodyF
     flushAbove(p.y, p.x);
     if (p.kind === "prose" && p.tr) {
       const ratio = bodyFh > 0 && p.fh > 0 ? p.fh / bodyFh : 1;
-      if (ratio >= HEAD_RATIO) items.push({ kind: "text", cls: "head", em: Math.min(HEAD_CAP, ratio), text: p.tr });
+      if (ratio >= HEAD_RATIO) items.push({ kind: "text", cls: "head", em: Math.min(HEAD_CAP, ratio), text: p.tr, rect: p });
       else if (ratio <= FOOT_FH && p.y >= FOOT_ZONE * pageB && FOOT_RE.test(p.text)) {
         // the model drops the printed «N.» label now and then — restore it
         // from the source so the footnote keeps its number (mirrors buildTrPage)
         const lbl = FOOT_LBL.exec(p.text)?.[0];
         const tr = lbl && !/^\s*\d{1,3}[.)]/.test(p.tr) ? lbl + p.tr : p.tr;
-        items.push({ kind: "text", cls: "foot", text: tr });
-      } else items.push({ kind: "text", cls: LIST_RE.test(p.tr) || LIST_RE.test(p.text) ? "hang" : "p", text: p.tr });
+        items.push({ kind: "text", cls: "foot", text: tr, rect: p });
+      } else items.push({ kind: "text", cls: LIST_RE.test(p.tr) || LIST_RE.test(p.text) ? "hang" : "p", text: p.tr, rect: p });
     } else {
       items.push({
         kind: "crop",
@@ -424,6 +427,11 @@ async function assembleDoc(
       const srcs: Src[] = win
         ? cropRects.map((i) => cropSrc(win!, { x: Math.max(0, i.x), y: Math.max(0, i.y), w: i.w, h: i.h }))
         : [];
+      // …and of the paragraphs the page prints as Russian text, which a figure
+      // must never grow into: the ink there already reaches the reader
+      const textSrcs: Src[] = win
+        ? items.filter((i): i is TextItem => i.kind === "text").map((i) => cropSrc(win!, i.rect))
+        : [];
       const pageChunks: string[] = [];
       for (const it of items) {
         if (it.kind === "text") {
@@ -434,7 +442,8 @@ async function assembleDoc(
           probe ??= blankProbe();
           ink ??= inkProbe();
           const k = cropRects.indexOf(it);
-          const crop = cropDataUrl(off, win, it, pageW, probe, print, ink, srcs.slice(0, k).concat(srcs.slice(k + 1)));
+          const others = srcs.slice(0, k).concat(srcs.slice(k + 1), textSrcs);
+          const crop = cropDataUrl(off, win, it, pageW, probe, print, ink, others);
           if (crop) {
             const alt = it.fig ? (it.caption ? esc(it.caption) : "Рисунок") : "Фрагмент оригинала";
             // печать: ширина в % от исходной страницы — пропорции оригинала

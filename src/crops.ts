@@ -144,7 +144,8 @@ export function cropSrc(win: CropWindow, r: Rect): Src {
 // live a few points OUTSIDE it. Cutting the crop on that box shaves them off,
 // and nothing else on the reflowed page shows those pixels. Measured on the
 // user's 838-page book: 126 of 278 stored figure regions clip ink that is
-// reproduced nowhere else, up to 16 pt past the edge.
+// reproduced nowhere else — 9 to 16 device px past the edge in the bulk of
+// the cases, and 16 pt or more in the worst ones.
 //
 // A CONSTANT pad does not fix this — measured on the same book, padding every
 // region by 1/2/3 pt takes the straddling count from 132 to 201/155/159,
@@ -227,10 +228,19 @@ function edgeGrow(
   return grow;
 }
 
+const SIDES: readonly Side[] = ["t", "b", "l", "r"];
+/** Passes over the four edges — an edge that moves can expose ink on the next. */
+const SNAP_PASSES = 4;
+
 /**
  * `s` grown outward on each side until it stops cutting ink. Cheap when there
- * is nothing to fix: the four strips are ≤ INK_SNAP px deep and the common case
- * exits on the first (inside-line) test of every column.
+ * is nothing to fix: the four strips are ≤ INK_SNAP pt deep, the common case
+ * exits on the first (inside-line) test of every column, and a pass that moves
+ * nothing ends the walk.
+ *
+ * Iterated, because widening one edge puts a longer stretch of the page under
+ * the next one: on the user's book a single pass leaves 39 of 161 regions still
+ * cutting ink, four passes leave the 10 that are simply wider than INK_SNAP.
  */
 export function snapToInk(
   probe: CanvasRenderingContext2D,
@@ -240,12 +250,27 @@ export function snapToInk(
   others: readonly Src[],
 ): Src {
   const max = Math.max(1, Math.round(INK_SNAP * win.k));
-  const t = edgeGrow(probe, off, win, s, "t", max, others);
-  const b = edgeGrow(probe, off, win, s, "b", max, others);
-  const l = edgeGrow(probe, off, win, s, "l", max, others);
-  const r = edgeGrow(probe, off, win, s, "r", max, others);
-  if (!(t || b || l || r)) return s;
-  return { sx: s.sx - l, sy: s.sy - t, sw: s.sw + l + r, sh: s.sh + t + b };
+  const grown: Record<Side, number> = { t: 0, b: 0, l: 0, r: 0 };
+  let cur = s;
+  for (let pass = 0; pass < SNAP_PASSES; pass++) {
+    let moved = false;
+    for (const side of SIDES) {
+      const room = max - grown[side];
+      if (room <= 0) continue;
+      const d = edgeGrow(probe, off, win, cur, side, room, others);
+      if (d <= 0) continue;
+      grown[side] += d;
+      moved = true;
+      cur = {
+        sx: s.sx - grown.l,
+        sy: s.sy - grown.t,
+        sw: s.sw + grown.l + grown.r,
+        sh: s.sh + grown.t + grown.b,
+      };
+    }
+    if (!moved) break;
+  }
+  return cur;
 }
 
 // ---- blank-candidate detection ---------------------------------------------
