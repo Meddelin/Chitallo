@@ -1,4 +1,9 @@
 @import "tailwindcss";
+@import "tw-animate-css";
+@import "shadcn/tailwind.css";
+/* streamdown (markdown renderer in AskSidebar) styles itself with tailwind
+   classes inside its dist — they must be visible to the scanner */
+@source "../node_modules/streamdown/dist/*.js";
 
 @custom-variant dark (&:where(.dark, .dark *));
 
@@ -28,11 +33,49 @@
 }
 
 /* native widgets (scrollbars, carets, form controls) follow the app theme */
+/* shadcn variables (AskSidebar / AI components) mapped onto the WP-K system:
+   the same warm neutral ramp above, the same single accent. Surfaces mirror
+   the sidebar (neutral-50 / neutral-800), the primary button mirrors the send
+   pill (ink on paper, paper on ink), hovers reuse the app's tint language
+   (900/5 light, 100/10 dark), the ring IS the accent. Charts unused. */
 :root {
   color-scheme: light;
+  --background: #fafaf9;
+  --foreground: #292524;
+  --card: #ffffff;
+  --card-foreground: #292524;
+  --popover: #ffffff;
+  --popover-foreground: #292524;
+  --primary: #292524;
+  --primary-foreground: #fafaf9;
+  --secondary: #e7e5e4;
+  --secondary-foreground: #292524;
+  --muted: #f5f5f4;
+  --muted-foreground: #78716c;
+  --destructive: #dc2626;
+  --border: #e7e5e4;
+  --input: #e7e5e4;
+  --ring: #3b82f6;
+  --radius: 0.75rem;
 }
 .dark {
   color-scheme: dark;
+  --background: #292524;
+  --foreground: #f5f5f4;
+  --card: #1c1917;
+  --card-foreground: #f5f5f4;
+  --popover: #1c1917;
+  --popover-foreground: #f5f5f4;
+  --primary: #f5f5f4;
+  --primary-foreground: #1c1917;
+  --secondary: #44403c;
+  --secondary-foreground: #f5f5f4;
+  --muted: #44403c;
+  --muted-foreground: #a8a29e;
+  --destructive: #f87171;
+  --border: #44403c;
+  --input: #44403c;
+  --ring: #3b82f6;
 }
 
 /* Keyboard focus: one 2px accent ring everywhere interactive. Text fields are
@@ -350,4 +393,39 @@
   position: static;
   display: block;
   margin: 0.7em auto;
+}
+
+@theme inline {
+  /* Deliberate deviations from the stock shadcn block:
+     — no --font-sans override (the app font from @theme above must win;
+       Geist never ships);
+     — no --color-accent/--color-accent-foreground (the app's `accent` IS the
+       blue #3b82f6 above; components use explicit neutral hover tints);
+     — no --radius-* scale override (rounded-* everywhere in the app must keep
+       Tailwind defaults; components inherit the app radii). */
+  --color-ring: var(--ring);
+  --color-input: var(--input);
+  --color-border: var(--border);
+  --color-destructive: var(--destructive);
+  --color-muted-foreground: var(--muted-foreground);
+  --color-muted: var(--muted);
+  --color-secondary-foreground: var(--secondary-foreground);
+  --color-secondary: var(--secondary);
+  --color-primary-foreground: var(--primary-foreground);
+  --color-primary: var(--primary);
+  --color-popover-foreground: var(--popover-foreground);
+  --color-popover: var(--popover);
+  --color-card-foreground: var(--card-foreground);
+  --color-card: var(--card);
+  --color-foreground: var(--foreground);
+  --color-background: var(--background);
+}
+
+/* shadcn base: default border/outline color for the components (a no-op for
+   the existing UI — every app border names its color). The stock body/html
+   rules are deliberately absent: the app owns its own background and font. */
+@layer base {
+  * {
+    @apply border-border outline-ring/50;
+  }
 }

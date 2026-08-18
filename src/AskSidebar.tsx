@@ -1,8 +1,37 @@
 import { useEffect, useRef, useState } from "react";
 import { Channel, invoke } from "@tauri-apps/api/core";
+import { CheckIcon, CopyIcon, RefreshCcwIcon } from "lucide-react";
+import {
+  Conversation,
+  ConversationContent,
+  ConversationEmptyState,
+  ConversationScrollButton,
+} from "@/components/ai-elements/conversation";
+import {
+  Message,
+  MessageAction,
+  MessageActions,
+  MessageContent,
+  MessageResponse,
+} from "@/components/ai-elements/message";
+import { Loader } from "@/components/ai-elements/loader";
+import {
+  PromptInput,
+  PromptInputSubmit,
+  PromptInputTextarea,
+  PromptInputToolbar,
+  PromptInputTools,
+} from "@/components/ai-elements/prompt-input";
+import { Suggestion, Suggestions } from "@/components/ai-elements/suggestion";
 import { IconClose } from "./icons";
 
 // ---- «Спросить»: chat sidebar over headless Claude Code ---------------------
+//
+// UI: shadcn AI components (shadcn.io/ai patterns — Conversation, Message,
+// Response, Actions, Prompt Input, Loader, Suggestion) restyled to the app's
+// pill aesthetic. Assistant answers render as STREAMING markdown (Streamdown
+// inside MessageResponse; raw HTML is never executed — the hardened renderer
+// drops it).
 //
 // Transport: the Rust `ask_claude` command spawns claude.exe (-p stream-json)
 // and forwards every stdout NDJSON line RAW over a tauri Channel. This
@@ -16,6 +45,10 @@ import { IconClose } from "./icons";
 // Per-book persistence (localStorage):
 //   pdfer:claude:<bookPath>       — Claude session id (--resume across turns)
 //   pdfer:claude:hist:<bookPath>  — last ≤50 messages of the thread
+// History migration: records written before the shadcn rebuild carry no `md`
+// flag — they were produced under a "plain text only" persona and keep
+// rendering as pre-wrapped plain text. New assistant messages set md: true and
+// render as markdown.
 //
 // Outside Tauri (plain-browser ?test= debugging) sends are answered with an
 // honest «доступно только в приложении» message — unless a dev mock is set:
@@ -34,6 +67,7 @@ type Msg = {
   page?: number;
   error?: boolean; // assistant: error text (muted red)
   cancelled?: boolean; // assistant: partial answer kept after a cancel
+  md?: boolean; // assistant: markdown (post-rebuild records; old ones are plain)
 };
 
 // minimal shape of the NDJSON lines this component reads
@@ -50,6 +84,8 @@ type MockLines = string[] | ((prompt: string) => string[]);
 
 const HIST_LIMIT = 50;
 const DEFAULT_Q = "Объясни этот фрагмент";
+// static follow-up chips after a completed answer — no extra model calls
+const SUGGESTIONS = ["Объясни проще", "Приведи пример", "Как это связано с темой книги?"];
 const isTauri = "__TAURI_INTERNALS__" in window;
 
 const sidKey = (p: string) => `pdfer:claude:${p}`;
@@ -81,7 +117,7 @@ async function replayMock(lines: string[], onLine: (l: string) => void, isCancel
 const sysPrompt = (title: string) =>
   `Ты — помощник в PDF-читалке. Пользователь читает книгу «${title}» (обычно на английском) и задаёт вопросы о ней по-русски. ` +
   `Отвечай на русском, кратко и по существу. Если вопрос про выделенный фрагмент — объясняй именно его в контексте книги. ` +
-  `Ссылайся на номера страниц, когда это уместно. Отвечай простым текстом без markdown-разметки.`;
+  `Ссылайся на номера страниц, когда это уместно. Уместна умеренная markdown-разметка (списки, выделение); без заголовков без необходимости.`;
 
 export function AskSidebar({
   open,
@@ -104,6 +140,7 @@ export function AskSidebar({
   const [pending, setPending] = useState<AskSeed | null>(null);
   const [busy, setBusy] = useState(false);
   const [stream, setStream] = useState(""); // streamed text of the in-flight answer
+  const [copied, setCopied] = useState(-1); // msg index with the «Скопировано» state
 
   const msgsRef = useRef(msgs);
   const busyRef = useRef(false);
@@ -111,8 +148,6 @@ export function AskSidebar({
   const resultRef = useRef<NdLine | null>(null);
   const cancelledRef = useRef(false);
   const taRef = useRef<HTMLTextAreaElement>(null);
-  const threadRef = useRef<HTMLDivElement>(null);
-  const stickRef = useRef(true); // autoscroll pinned to bottom until the user scrolls up
   const pathRef = useRef(bookPath);
   pathRef.current = bookPath;
 
@@ -165,24 +200,6 @@ export function AskSidebar({
     taRef.current?.focus();
   }, [seed]);
 
-  // pin the thread to the bottom while content grows (unless scrolled away)
-  useEffect(() => {
-    const el = threadRef.current;
-    if (el && stickRef.current) el.scrollTop = el.scrollHeight;
-  }, [msgs, stream, busy]);
-  const onThreadScroll = () => {
-    const el = threadRef.current!;
-    stickRef.current = el.scrollHeight - el.scrollTop - el.clientHeight < 60;
-  };
-
-  // textarea grows with content up to ~5 lines
-  useEffect(() => {
-    const ta = taRef.current;
-    if (!ta) return;
-    ta.style.height = "0px";
-    ta.style.height = `${Math.min(140, ta.scrollHeight)}px`;
-  }, [input]);
-
   const cancel = () => {
     cancelledRef.current = true;
     if (isTauri) invoke("ask_claude_cancel").catch(() => {});
@@ -197,19 +214,17 @@ export function AskSidebar({
     taRef.current?.focus();
   };
 
-  const send = async () => {
-    if (busyRef.current) return;
-    const pend = pending;
-    const q = input.trim() || (pend ? DEFAULT_Q : "");
-    if (!q) return;
+  // core ask: q is the question text, pend the (already detached) seed.
+  // The form path consumes the pending chip; suggestion/repeat sends pass null
+  // and leave any pending chip for the next manual message.
+  const ask = async (q: string, pend: AskSeed | null) => {
+    if (busyRef.current || !q) return;
     const path = bookPath;
     const sid = localStorage.getItem(sidKey(path));
 
     // the thread shows only the question + quote chip; the prompt below carries
     // the delimited context (selection, surrounding page text, book/page)
     push(path, { role: "user", text: q, quote: pend?.quote, page: pend?.page });
-    setPending(null);
-    setInput("");
 
     let prompt: string;
     if (pend) {
@@ -229,7 +244,6 @@ export function AskSidebar({
     setStream("");
     resultRef.current = null;
     cancelledRef.current = false;
-    stickRef.current = true;
 
     const onLine = (line: string) => {
       let j: NdLine;
@@ -269,10 +283,10 @@ export function AskSidebar({
       // assertion: TS narrows the ref to its pre-await null, blind to onLine's writes
       const r = resultRef.current as NdLine | null;
       if (r && !r.is_error) {
-        push(path, { role: "assistant", text: r.result || streamRef.current || "(пустой ответ)" });
+        push(path, { role: "assistant", text: r.result || streamRef.current || "(пустой ответ)", md: true });
         if (r.session_id) localStorage.setItem(sidKey(path), r.session_id);
       } else if ((cancelledRef.current || r?.subtype === "cancelled") && streamRef.current) {
-        push(path, { role: "assistant", text: streamRef.current, cancelled: true });
+        push(path, { role: "assistant", text: streamRef.current, cancelled: true, md: true });
       } else if (r) {
         push(path, { role: "assistant", text: r.result || `Ошибка: ${r.subtype ?? "неизвестная"}`, error: true });
       } else if (cancelledRef.current) {
@@ -296,15 +310,38 @@ export function AskSidebar({
     }
   };
 
-  const onKeyDown = (e: React.KeyboardEvent) => {
-    if (e.key === "Enter" && !e.shiftKey) {
-      e.preventDefault();
-      void send();
+  // form submit (Enter / send button): consumes the pending seed chip
+  const send = () => {
+    if (busyRef.current) return;
+    const pend = pending;
+    const q = input.trim() || (pend ? DEFAULT_Q : "");
+    if (!q) return;
+    setPending(null);
+    setInput("");
+    void ask(q, pend);
+  };
+
+  const copyMsg = (i: number, text: string) => {
+    navigator.clipboard?.writeText(text).catch(() => {});
+    setCopied(i);
+    window.setTimeout(() => setCopied((c) => (c === i ? -1 : c)), 1500);
+  };
+
+  // «Повторить» on an assistant message: resend the user question that led to it
+  const repeat = (i: number) => {
+    if (busyRef.current) return;
+    for (let k = i - 1; k >= 0; k--) {
+      if (msgs[k].role === "user") {
+        void ask(msgs[k].text, null);
+        return;
+      }
     }
   };
 
   const canAsk = isTauri || !!getMock();
   const sendable = !!input.trim() || !!pending;
+  const last = msgs[msgs.length - 1];
+  const showSuggestions = !busy && canAsk && !!last && last.role === "assistant" && !last.error;
 
   return (
     <aside
@@ -333,51 +370,110 @@ export function AskSidebar({
         </button>
       </div>
 
-      <div ref={threadRef} onScroll={onThreadScroll} className="flex-1 overflow-y-auto px-3.5 py-3">
-        {!canAsk && (
-          <div className="mb-2 rounded-lg bg-amber-500/10 text-amber-700 dark:text-amber-400 px-2.5 py-1.5 text-xs">
-            Доступно только в приложении
-          </div>
-        )}
-        {msgs.length === 0 && !busy && (
-          <div className="h-full flex items-center justify-center text-center px-6 text-xs leading-relaxed text-neutral-500 dark:text-neutral-400 select-none whitespace-pre-line">
-            {"Выделите фрагмент и нажмите «Спросить» —\nили задайте вопрос о книге здесь"}
-          </div>
-        )}
-        {msgs.map((m, i) =>
-          m.role === "user" ? (
-            <div key={i} className="mt-3 first:mt-0 flex justify-end">
-              <div className="max-w-[85%] rounded-xl rounded-br-sm bg-neutral-200/80 dark:bg-neutral-700/70 px-3 py-1.5 whitespace-pre-wrap">
-                {m.quote && (
-                  <div className="mb-1 border-l-2 border-neutral-400/60 dark:border-neutral-500/60 pl-2 text-xs text-neutral-600 dark:text-neutral-300 line-clamp-3">
-                    {m.page ? `стр. ${m.page} — ` : ""}
-                    {m.quote}
-                  </div>
-                )}
-                {m.text}
+      <Conversation className="flex-1" initial="instant">
+        <ConversationContent className="min-h-full gap-3 px-3.5 py-3">
+          {!canAsk && (
+            <div className="rounded-lg bg-amber-500/10 text-amber-700 dark:text-amber-400 px-2.5 py-1.5 text-xs">
+              Доступно только в приложении
+            </div>
+          )}
+          {msgs.length === 0 && !busy && (
+            <ConversationEmptyState className="flex-1 select-none">
+              <div className="px-2 text-xs leading-relaxed text-neutral-500 dark:text-neutral-400 whitespace-pre-line">
+                {"Выделите фрагмент и нажмите «Спросить» —\nили задайте вопрос о книге здесь"}
               </div>
-            </div>
-          ) : (
-            <div
-              key={i}
-              className={`mt-3 first:mt-0 whitespace-pre-wrap leading-relaxed ${
-                m.error ? "text-red-600/90 dark:text-red-400/90" : ""
-              }`}
-            >
-              {m.text}
-              {m.cancelled && <span className="ml-1.5 text-xs text-neutral-500 dark:text-neutral-400">(остановлено)</span>}
-            </div>
-          ),
-        )}
-        {busy && (
-          <div className="mt-3 whitespace-pre-wrap leading-relaxed" data-askstream>
-            {stream}
-            <span className="animate-pulse opacity-60">▍</span>
-          </div>
-        )}
-      </div>
+            </ConversationEmptyState>
+          )}
+          {msgs.map((m, i) =>
+            m.role === "user" ? (
+              <Message from="user" key={i}>
+                <MessageContent>
+                  {m.quote && (
+                    <div className="mb-1 border-l-2 border-neutral-400/60 dark:border-neutral-500/60 pl-2 text-xs text-neutral-600 dark:text-neutral-300 line-clamp-3">
+                      {m.page ? `стр. ${m.page} — ` : ""}
+                      {m.quote}
+                    </div>
+                  )}
+                  {m.text}
+                </MessageContent>
+              </Message>
+            ) : (
+              <Message from="assistant" key={i}>
+                <MessageContent>
+                  {m.md && !m.error ? (
+                    <MessageResponse>{m.text}</MessageResponse>
+                  ) : (
+                    // pre-rebuild history and error texts: plain pre-wrapped text;
+                    // errors in muted red (inner span — MessageContent's own
+                    // group-[.is-assistant]:text-foreground can't defeat it)
+                    <span
+                      className={
+                        m.error
+                          ? "whitespace-pre-wrap text-red-600/90 dark:text-red-400/90"
+                          : "whitespace-pre-wrap"
+                      }
+                    >
+                      {m.text}
+                    </span>
+                  )}
+                  {m.cancelled && (
+                    <span className="text-xs text-neutral-500 dark:text-neutral-400">(остановлено)</span>
+                  )}
+                </MessageContent>
+                {!m.error && (
+                  <MessageActions
+                    className={`-ml-1.5 transition-opacity ${
+                      i === msgs.length - 1 ? "opacity-100" : "opacity-0 group-hover:opacity-100"
+                    }`}
+                  >
+                    <MessageAction
+                      className="text-neutral-500 dark:text-neutral-400"
+                      onClick={() => copyMsg(i, m.text)}
+                      tooltip={copied === i ? "Скопировано" : "Копировать"}
+                    >
+                      {copied === i ? <CheckIcon /> : <CopyIcon />}
+                    </MessageAction>
+                    <MessageAction
+                      className="text-neutral-500 dark:text-neutral-400"
+                      disabled={busy}
+                      onClick={() => repeat(i)}
+                      tooltip="Повторить"
+                    >
+                      <RefreshCcwIcon />
+                    </MessageAction>
+                  </MessageActions>
+                )}
+              </Message>
+            ),
+          )}
+          {busy && (
+            <Message data-askstream from="assistant">
+              <MessageContent>
+                {stream ? (
+                  <MessageResponse>{stream}</MessageResponse>
+                ) : (
+                  <Loader className="text-neutral-500 dark:text-neutral-400" />
+                )}
+              </MessageContent>
+            </Message>
+          )}
+        </ConversationContent>
+        <ConversationScrollButton className="bottom-2 bg-neutral-50 dark:bg-neutral-800 shadow-sm" />
+      </Conversation>
 
       <div className="border-t border-neutral-200 dark:border-neutral-700 p-2.5 shrink-0">
+        {showSuggestions && (
+          <Suggestions className="mb-1.5">
+            {SUGGESTIONS.map((s) => (
+              <Suggestion
+                className="h-6 px-2.5 text-xs text-neutral-600 dark:text-neutral-300"
+                key={s}
+                onClick={(q) => void ask(q, null)}
+                suggestion={s}
+              />
+            ))}
+          </Suggestions>
+        )}
         {pending && (
           <div className="mb-1.5 flex items-start gap-2 rounded-lg bg-neutral-200/70 dark:bg-neutral-700/50 px-2.5 py-1.5 text-xs select-none">
             <div className="flex-1 line-clamp-3 text-neutral-600 dark:text-neutral-300">
@@ -392,31 +488,26 @@ export function AskSidebar({
             </button>
           </div>
         )}
-        <div className="flex items-end gap-1.5">
-          <textarea
+        <PromptInput onSubmit={send}>
+          <PromptInputTextarea
+            onChange={(e) => setInput(e.target.value)}
+            placeholder={pending ? DEFAULT_Q : "Вопрос по книге…"}
             ref={taRef}
             rows={1}
             value={input}
-            placeholder={pending ? DEFAULT_Q : "Вопрос по книге…"}
-            className="flex-1 resize-none rounded-xl bg-neutral-200/60 dark:bg-neutral-700/50 px-3 py-1.5 outline-none leading-relaxed placeholder:text-neutral-400 dark:placeholder:text-neutral-500"
-            onChange={(e) => setInput(e.target.value)}
-            onKeyDown={onKeyDown}
           />
-          <button
-            className={`h-8 w-8 shrink-0 rounded-full transition-colors ${
-              busy
-                ? "bg-neutral-300 dark:bg-neutral-600 hover:bg-neutral-400/70 dark:hover:bg-neutral-500"
-                : sendable
-                  ? "bg-neutral-800 text-neutral-50 dark:bg-neutral-100 dark:text-neutral-900 hover:bg-neutral-700 dark:hover:bg-white"
-                  : "bg-neutral-200 text-neutral-400 dark:bg-neutral-700 dark:text-neutral-500 cursor-default"
-            }`}
-            onClick={busy ? cancel : () => void send()}
-            disabled={!busy && !sendable}
-            title={busy ? "Остановить" : "Отправить (Enter)"}
-          >
-            {busy ? "■" : "↑"}
-          </button>
-        </div>
+          <PromptInputToolbar>
+            <PromptInputTools />
+            <PromptInputSubmit
+              className="size-7"
+              disabled={!busy && !sendable}
+              onClick={busy ? cancel : undefined}
+              status={busy ? (stream ? "streaming" : "submitted") : undefined}
+              title={busy ? "Остановить" : "Отправить (Enter)"}
+              type={busy ? "button" : "submit"}
+            />
+          </PromptInputToolbar>
+        </PromptInput>
       </div>
     </aside>
   );
