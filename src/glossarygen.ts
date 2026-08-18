@@ -176,7 +176,8 @@ type Sent = { raw: string; chunks: string[][] };
 // citation-density page filter: reference lists (years, DOIs, URLs on nearly
 // every line) would otherwise flood the statistics with venue names and author
 // surnames. Pages with many such markers are bibliographies — skipped whole.
-const CITE_MARK = /\b(?:19|20)\d\d[a-z]?\b|\bdoi\b|https?:|\barxiv\b|\bwww\b/gi;
+// (exported: booktranslate.ts reuses the same net for its refPage flag)
+export const CITE_MARK = /\b(?:19|20)\d\d[a-z]?\b|\bdoi\b|https?:|\barxiv\b|\bwww\b/gi;
 const CITE_PAGE_MIN = 8; // running prose rarely has ≥8 markers on one page
 
 // yield to the event loop without setTimeout — hidden-tab timer throttling

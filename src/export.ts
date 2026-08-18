@@ -1,22 +1,30 @@
-// Экспорт перевода (WP-L, Р-9): TXT и HTML из готового store, формат выбирается
-// фильтром системного диалога сохранения (расширение результата решает).
+// Экспорт перевода (WP-L, Р-9): HTML одной кнопкой + TXT вторым путём.
 // Сборка зеркалит типографику buildTrPage (App.tsx): заголовки по fh/bodyFh,
-// висячие отступы списков, капшены не в потоке, дедуп абзацев внутри фигур.
-//   TXT  — чистый текст: перевод; для непереведённого — честные пометки
-//          (оригинал для сбойных абзацев, «[таблица или формула]» для прочего,
-//          подпись фигуры в скобках); мгновенная сборка, без рендера.
-//   HTML — автономный документ с ВСТРОЕННЫМИ кропами оригинала (data-URI):
+// висячие отступы списков, капшены не в потоке, дедуп абзацев внутри фигур;
+// kind:"furniture" (колонтитулы) не попадает в поток вовсе, страницы из
+// store.refPages (библиография — в приложении рендерится оригинал) идут
+// честной пометкой, а не мусорным текстом.
+//   HTML — главный путь, БЕЗ диалога: файл «<книга> — перевод.html» сразу в
+//          «Загрузки» (запись туда — осознанное исключение в capabilities,
+//          см. default.json), при коллизии имени — « (2)», « (3)», …
+//          Автономный документ с ВСТРОЕННЫМИ кропами оригинала (data-URI):
 //          фигуры, таблицы/формулы и сбойные абзацы выглядят как в приложении.
 //          Страницы с кропами рендерятся офлайн своим PDFDocumentProxy
 //          (не зависит от открытого в читалке документа), пустые
 //          fig-кандидаты отбрасываются той же пиксельной проверкой, что в
 //          drawCrops. Тёмная тема — через prefers-color-scheme.
-// Запись: плагин dialog добавляет выбранный save()-путь в runtime-scope fs
-// (проверено в tauri-plugin-dialog 2.7.2 commands.rs: s.allow_file(&path)),
-// поэтому writeFile работает и вне $APPDATA без правки capabilities.
+//   TXT  — вторичный путь (Настройки), по-прежнему через системный диалог
+//          сохранения: плагин dialog добавляет выбранный save()-путь в
+//          runtime-scope fs (проверено в tauri-plugin-dialog 2.7.2
+//          commands.rs: s.allow_file(&path)), поэтому запись работает и вне
+//          $APPDATA/$DOWNLOAD без правки capabilities. Чистый текст: перевод;
+//          для непереведённого — честные пометки (оригинал для сбойных
+//          абзацев, «[таблица или формула]» для прочего, подпись фигуры в
+//          скобках); мгновенная сборка, без рендера.
 
 import { save } from "@tauri-apps/plugin-dialog";
-import { readFile, writeFile } from "@tauri-apps/plugin-fs";
+import { readFile, stat, writeFile } from "@tauri-apps/plugin-fs";
+import { downloadDir } from "@tauri-apps/api/path";
 import { getDocument } from "pdfjs-dist";
 import type { PDFDocumentProxy } from "pdfjs-dist";
 import { loadBookTranslation } from "./booktranslate";
@@ -27,15 +35,20 @@ import type { FigureRegion } from "./paragraphs";
 // ---- constants mirrored from App.tsx (private there; keep values in sync) ---
 const LIST_RE = /^\s*(?:\(\d{1,3}\)|\d{1,3}[.)]|\(?[a-zа-яё]\)|[•◦▪‣–—])\s/i;
 const CROP_PAD = 3; // scale-1 px of original context around paragraph crops
-const HEAD_RATIO = 1.25;
+const HEAD_RATIO = 1.15;
 const HEAD_CAP = 1.8;
+// footnote detection — same tuning as App.tsx buildTrPage (.trFoot)
+const FOOT_RE = /^(?:\d{1,3}[.)]\s|[†‡])/;
+const FOOT_LBL = /^\d{1,3}[.)]\s/;
+const FOOT_FH = 0.92; // fh/bodyFh cap
+const FOOT_ZONE = 0.55; // paragraph must START below this fraction of the page height
 // blank-candidate pixel check — same tuning as App.tsx drawCrops
 const BLANK_VAR = 4;
 const BLANK_RANGE = 24;
 const SAMPLE = 32;
 const EXPORT_SCALE = 2; // offscreen render scale for crops (2× display size)
 
-type TextItem = { kind: "text"; cls: "p" | "head" | "hang"; em?: number; text: string };
+type TextItem = { kind: "text"; cls: "p" | "head" | "hang" | "foot"; em?: number; text: string };
 type CropItem = {
   kind: "crop";
   x: number;
@@ -51,6 +64,11 @@ type Item = TextItem | CropItem;
 // one page of the store → flow items, in reading order (mirrors buildTrPage)
 function pageItems(paras: TrParagraph[], figures: readonly FigureRegion[], bodyFh: number): Item[] {
   const items: Item[] = [];
+  // page-height stand-in for the FOOT_ZONE check: the store carries no page
+  // dims and TXT assembly has no document, so the content bottom serves —
+  // it undershoots the real height slightly (zone marginally more permissive;
+  // the fh cap and label regex still gate)
+  const pageB = Math.max(0, ...paras.map((p) => p.y + p.h), ...figures.map((f) => f.y + f.h));
   const figs = figures.slice().sort((a, b) => a.y - b.y || a.x - b.x);
   const capOf = (r: FigureRegion) =>
     paras.find((p) => p.kind === "caption" && interArea(p, r) >= FIG_CONTAIN * p.w * p.h)?.text;
@@ -62,13 +80,20 @@ function pageItems(paras: TrParagraph[], figures: readonly FigureRegion[], bodyF
     }
   };
   for (const p of paras) {
+    if (p.kind === "furniture") continue; // колонтитулы — не контент (зеркалит buildTrPage)
     if (p.kind === "caption") continue; // lives inside its figure region
     if (figures.some((r) => interArea(p, r) >= FIG_CONTAIN * p.w * p.h)) continue; // pixels already in the region
     flushAbove(p.y, p.x);
     if (p.kind === "prose" && p.tr) {
       const ratio = bodyFh > 0 && p.fh > 0 ? p.fh / bodyFh : 1;
       if (ratio >= HEAD_RATIO) items.push({ kind: "text", cls: "head", em: Math.min(HEAD_CAP, ratio), text: p.tr });
-      else items.push({ kind: "text", cls: LIST_RE.test(p.tr) || LIST_RE.test(p.text) ? "hang" : "p", text: p.tr });
+      else if (ratio <= FOOT_FH && p.y >= FOOT_ZONE * pageB && FOOT_RE.test(p.text)) {
+        // the model drops the printed «N.» label now and then — restore it
+        // from the source so the footnote keeps its number (mirrors buildTrPage)
+        const lbl = FOOT_LBL.exec(p.text)?.[0];
+        const tr = lbl && !/^\s*\d{1,3}[.)]/.test(p.tr) ? lbl + p.tr : p.tr;
+        items.push({ kind: "text", cls: "foot", text: tr });
+      } else items.push({ kind: "text", cls: LIST_RE.test(p.tr) || LIST_RE.test(p.text) ? "hang" : "p", text: p.tr });
     } else {
       items.push({
         kind: "crop",
@@ -88,6 +113,11 @@ function pageItems(paras: TrParagraph[], figures: readonly FigureRegion[], bodyF
 const gapRu = (a: number, b: number) =>
   a === b ? `страница ${a} не переведена` : `страницы ${a}–${b} не переведены`;
 
+// refPages (библиография): в приложении такая страница рендерится оригиналом;
+// в экспорт идёт пометка — полностраничный скрин весил бы мегабайты на
+// страницу и не читался бы как текст, поэтому пиксели не встраиваются
+const refRu = (n: number) => `страница ${n} — оригинал без перевода`;
+
 function metaLine(store: BookTranslation): string {
   const done = store.donePages.length;
   const partial = done < store.total ? ` · готово ${done} из ${store.total} страниц` : "";
@@ -99,6 +129,7 @@ function metaLine(store: BookTranslation): string {
 export function assembleTxt(store: BookTranslation, title: string): string {
   const lines: string[] = [title, metaLine(store)];
   const done = new Set(store.donePages);
+  const refs = new Set(store.refPages);
   let gapStart: number | null = null;
   for (let n = 1; n <= store.total; n++) {
     if (!done.has(n)) {
@@ -108,6 +139,11 @@ export function assembleTxt(store: BookTranslation, title: string): string {
     if (gapStart !== null) {
       lines.push("", `[${gapRu(gapStart, n - 1)}]`);
       gapStart = null;
+    }
+    if (refs.has(n)) {
+      // refPage завершена без перевода (все tr "") — вместо сырого оригинала
+      lines.push("", `[${refRu(n)}]`);
+      continue;
     }
     for (const it of pageItems(store.pages[n] ?? [], store.figures[n] ?? [], store.bodyFh)) {
       if (it.kind === "text") lines.push("", it.text);
@@ -141,6 +177,9 @@ h1 { font-size: 1.5em; line-height: 1.25; margin: 0; text-align: left; }
 p { margin: 0.55em 0 0; text-indent: 1.5em; }
 .head { font-weight: 600; line-height: 1.25; text-align: left; text-indent: 0; margin-top: 1.1em; }
 .hang { text-indent: -1.4em; padding-left: 1.4em; }
+.foot { font-size: 0.85em; text-indent: 0; margin-top: 1.3em; padding-top: 0.6em;
+  border-top: 1px solid color-mix(in srgb, currentColor 30%, transparent); }
+.foot + .foot { margin-top: 0.45em; padding-top: 0; border-top: 0; }
 .crop { display: block; margin: 0.9em auto; max-width: 100%; height: auto; }
 .pg { margin: 2.4em 0 0; text-align: center; color: #a8a29e; font-size: 0.75em; letter-spacing: 0.08em; user-select: none; }
 .gap, .ph { color: #78716c; font-style: italic; text-align: center; text-indent: 0; margin-top: 1.6em; }
@@ -222,9 +261,11 @@ export async function assembleHtml(
   onProgress?: (done: number, total: number) => void,
 ): Promise<string> {
   const done = new Set(store.donePages);
+  const refs = new Set(store.refPages);
   const perPage = new Map<number, Item[]>();
   let needDoc = false;
   for (const n of store.donePages) {
+    if (refs.has(n)) continue; // refPage идёт пометкой — её кропы не нужны
     const items = pageItems(store.pages[n] ?? [], store.figures[n] ?? [], store.bodyFh);
     perPage.set(n, items);
     if (items.some((i) => i.kind === "crop")) needDoc = true;
@@ -250,6 +291,12 @@ export async function assembleHtml(
       if (gapStart !== null) {
         chunks.push(gapHtml(gapStart, n - 1));
         gapStart = null;
+      }
+      if (refs.has(n)) {
+        const t = refRu(n);
+        chunks.push(`<p class="gap">${esc(t[0].toUpperCase() + t.slice(1))}</p>`);
+        onProgress?.(++processed, store.donePages.length);
+        continue;
       }
       const items = perPage.get(n) ?? [];
       // page render only when this page actually needs pixels
@@ -322,26 +369,36 @@ ${chunks.join("\n")}
 
 const safeName = (s: string) => s.replace(/[\\/:*?"<>|]/g, "-").trim() || "перевод";
 
-/// Диалог сохранения (формат = выбранный фильтр/расширение), сборка, запись.
+/// Одна кнопка (волна 3): HTML без диалога — сразу в «Загрузки» ($DOWNLOAD
+/// в fs:allow-write-file, см. заметку в capabilities/default.json). Имя
+/// «<книга> — перевод.html»; занято (stat успешен) — « (2)», « (3)», …
 /// "none" — для книги нет ни одной готовой страницы (меню и так скрывает пункт).
-export async function exportTranslation(
+export async function exportTranslationToDownloads(
   bookPath: string,
   title: string,
   onProgress?: (done: number, total: number) => void,
-): Promise<"saved" | "cancelled" | "none"> {
+): Promise<{ path: string } | "none"> {
+  const store = await loadBookTranslation(bookPath);
+  if (!store || store.donePages.length === 0) return "none";
+  const html = await assembleHtml(store, title, bookPath, onProgress);
+  const dir = await downloadDir();
+  const base = `${dir}\\${safeName(title)} — перевод`;
+  let target = `${base}.html`;
+  for (let i = 2; await stat(target).then(() => true, () => false); i++) target = `${base} (${i}).html`;
+  await writeFile(target, new TextEncoder().encode(html));
+  return { path: target };
+}
+
+/// TXT — вторичный путь (Настройки), прежний системный диалог сохранения.
+/// "none" — для книги нет ни одной готовой страницы (кнопка и так скрыта).
+export async function exportTranslationTxt(bookPath: string, title: string): Promise<"saved" | "cancelled" | "none"> {
   const store = await loadBookTranslation(bookPath);
   if (!store || store.donePages.length === 0) return "none";
   const target = await save({
-    defaultPath: `${safeName(title)} — перевод.html`,
-    filters: [
-      { name: "HTML", extensions: ["html"] },
-      { name: "Текст", extensions: ["txt"] },
-    ],
+    defaultPath: `${safeName(title)} — перевод.txt`,
+    filters: [{ name: "Текст", extensions: ["txt"] }],
   });
   if (!target) return "cancelled";
-  const content = /\.txt$/i.test(target)
-    ? assembleTxt(store, title)
-    : await assembleHtml(store, title, bookPath, onProgress);
-  await writeFile(target, new TextEncoder().encode(content));
+  await writeFile(target, new TextEncoder().encode(assembleTxt(store, title)));
   return "saved";
 }

@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { open } from "@tauri-apps/plugin-dialog";
 import { readFile } from "@tauri-apps/plugin-fs";
-import { openUrl } from "@tauri-apps/plugin-opener";
+import { openUrl, revealItemInDir } from "@tauri-apps/plugin-opener";
 import { appDataDir } from "@tauri-apps/api/path";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import * as pdfjs from "pdfjs-dist";
@@ -26,7 +26,7 @@ import * as glossarygen from "./glossarygen";
 import { ModelSetupModal, Spinner, dlBusy, dlPct, fetchModelStatus, restartModel, statusUp, useDownload } from "./ModelSetup";
 import { AboutModal } from "./About";
 import { SettingsModal, TR_FONT_DEFAULT, TR_FONT_MAX, TR_FONT_MIN } from "./Settings";
-import { exportTranslation } from "./export";
+import { exportTranslationToDownloads, exportTranslationTxt } from "./export";
 import * as exportmod from "./export";
 import { IconChevronDown, IconColumns, IconMoon, IconSliders, IconSun } from "./icons";
 import "./App.css";
@@ -228,6 +228,19 @@ function trOriginalsFromSelection(getTrPage: (n: number) => TrParagraph[] | unde
 // list-item openers for hanging indents: "(1) ", "1. ", "1) ", "• ", "a) ", "а) ", "— "
 const LIST_RE = /^\s*(?:\(\d{1,3}\)|\d{1,3}[.)]|\(?[a-zа-яё]\)|[•◦▪‣–—])\s/i;
 
+// Footnote blocks, detected at RENDER time so stores already on disk benefit
+// without a re-translation: footnote-sized type (fh ≤ 0.92× the book's body
+// median — the test book's footnotes run ~0.85×, bibliography entries ~0.95×
+// stay out), sitting in the lower part of the page, opening with a printed
+// footnote label («12. », «3) », «†»). Rendered as .trFoot (small type + a
+// hairline above the block) — the reflow otherwise erases the rule and size
+// cues, and a footnote reads as stray body prose spliced into the page,
+// often mid-sentence (the user's «цитирование ломается»).
+const FOOT_RE = /^(?:\d{1,3}[.)]\s|[†‡])/;
+const FOOT_LBL = /^\d{1,3}[.)]\s/;
+const FOOT_FH = 0.92; // fh/bodyFh cap
+const FOOT_ZONE = 0.55; // paragraph must START below this fraction of the page height
+
 const CROP_PAD = 3; // scale-1 px of original context kept around a cropped region
 const PAGE_PAD_X = 0.085; // trPage horizontal padding as a fraction of page width — mirrors App.css
 
@@ -303,6 +316,9 @@ function buildTrPage(
 
   paras.forEach((p, i) => {
     if (p.kind === "caption") return; // shown inside its figure region's crop
+    // running header/footer: never rendered — the reflow replaces the page
+    // geometry these navigation aids annotate (see detectFurniture)
+    if (p.kind === "furniture") return;
     // Containment dedup for EVERY kind, prose included: a paragraph mostly
     // inside a figure region (diagram label, table cell, raster-overlapped
     // band) already shows its pixels in the region's crop — flowing it as a
@@ -315,13 +331,20 @@ function buildTrPage(
     if (p.kind === "prose" && p.tr) {
       const d = document.createElement("p");
       const ratio = bodyFh > 0 && p.fh > 0 ? p.fh / bodyFh : 1;
+      let tr = p.tr;
       if (ratio >= 1.15) {
         d.className = "trHead";
         d.style.fontSize = `${Math.min(1.8, ratio).toFixed(3)}em`;
+      } else if (ratio <= FOOT_FH && p.y >= FOOT_ZONE * baseH && FOOT_RE.test(p.text)) {
+        d.className = "trFoot";
+        // the model drops the printed «N.» label now and then — restore it
+        // from the source so the footnote keeps its number
+        const lbl = FOOT_LBL.exec(p.text)?.[0];
+        if (lbl && !/^\s*\d{1,3}[.)]/.test(tr)) tr = lbl + tr;
       } else {
         d.className = LIST_RE.test(p.tr) || LIST_RE.test(p.text) ? "trHang" : "trP";
       }
-      d.textContent = p.tr;
+      d.textContent = tr;
       d.dataset.tridx = String(i);
       root.append(d);
     } else {
@@ -411,6 +434,7 @@ function Page({
   getTrPage,
   getTrFigs,
   getBodyFh,
+  isRefPage,
   linkService,
 }: {
   doc: PDFDocumentProxy;
@@ -422,6 +446,7 @@ function Page({
   getTrPage: (n: number) => TrParagraph[] | undefined;
   getTrFigs: (n: number) => FigureRegion[];
   getBodyFh: () => number;
+  isRefPage: (n: number) => boolean;
   linkService: LinkService;
 }) {
   const ref = useRef<HTMLDivElement>(null);
@@ -432,8 +457,12 @@ function Page({
   // row heights jumped, the whole layout below shifted, scroll content leapt.
   // Scale-independent storage also sizes zoom placeholders exactly. The doc
   // guard keeps a newly opened book from inheriting the previous book's sizes.
-  const [rendered, setRendered] = useState<{ doc: PDFDocumentProxy; base: Size } | null>(null);
+  // trH (optional): measured natural reflow height at scale 1 — see the
+  // measurement after buildTrPage below. Same doc guard, same keep-across-runs
+  // policy as `base`.
+  const [rendered, setRendered] = useState<{ doc: PDFDocumentProxy; base: Size; trH?: number } | null>(null);
   const base = rendered && rendered.doc === doc ? rendered.base : baseSize;
+  const trNatH = rendered && rendered.doc === doc ? rendered.trH : undefined;
   const size = { w: base.w * scale, h: base.h * scale };
   // stale-content policy (WP-K): which doc/page the CURRENT children belong to
   const staleKeyRef = useRef<{ doc: PDFDocumentProxy; num: number } | null>(null);
@@ -444,9 +473,13 @@ function Page({
   // their reflowed translation live, without a manual toggle. In orig mode the
   // dep is pinned to -1, so translation progress never re-renders pages.
   const trDep = viewMode === "tr" ? trVersion : -1;
+  // bibliography/reference pages (store.refPages, set by the engine's isRefPage
+  // classifier) keep the ORIGINAL render even in translation mode — translated
+  // reference entries come out corrupted, the original is strictly better
+  const refPage = viewMode === "tr" && isRefPage(num);
   // reflow pages own their height: natural flow height, but never shorter than
   // the original render (min-height), so virtualization placeholders keep size
-  const reflow = viewMode === "tr" && !!getTrPage(num)?.length;
+  const reflow = viewMode === "tr" && !refPage && !!getTrPage(num)?.length;
 
   useEffect(() => {
     const el = ref.current!;
@@ -484,13 +517,29 @@ function Page({
           );
 
           const dpr = window.devicePixelRatio || 1;
-          const paras = viewMode === "tr" ? getTrPage(num) : undefined;
+          // refPage → paras undefined → the original canvas+textLayer path below
+          const paras = viewMode === "tr" && !isRefPage(num) ? getTrPage(num) : undefined;
           if (paras?.length) {
             // reflowed translated page: NO canvas and NO text layer — the
             // original is rasterized only offscreen (once, if any non-prose
             // region needs an image crop) and discarded after cropping
             const { root, crops } = buildTrPage(paras, getTrFigs(num), getBodyFh(), scale, vp1.width, vp1.height);
             el.replaceChildren(root); // swap-in: any stale render leaves only now
+            // Scroll hardening, secondary to .page:empty{overflow-anchor:none}:
+            // persist the measured natural reflow height (scale-independent).
+            // The layout is settled synchronously — crops get their final CSS
+            // size up front — so offsetHeight is trustworthy here. A collapsed
+            // (unrendered) translated page keeps this footprint as placeholder
+            // min-height, making the later re-render a Δ≈0 height change even
+            // when anchoring fails. Refreshed on every tr re-render (trVersion,
+            // zoom); small drift across zoom levels is acceptable and the ≥1px
+            // bail-out keeps sub-pixel churn from re-rendering.
+            const measured = el.offsetHeight / scale;
+            setRendered((prev) =>
+              prev && prev.doc === doc && prev.trH !== undefined && Math.abs(prev.trH - measured) < 1
+                ? prev
+                : { doc, base: { w: vp1.width, h: vp1.height }, trH: measured },
+            );
             if (crops.length) {
               const off = document.createElement("canvas");
               off.width = Math.floor(vp.width * dpr);
@@ -611,7 +660,7 @@ function Page({
       // NOTE: `rendered` (the page's true base size) is also NOT reset —
       // see the placeholder comment above.
     };
-  }, [doc, num, scale, viewMode, trDep, getTrPage, getTrFigs, getBodyFh, linkService]);
+  }, [doc, num, scale, viewMode, trDep, getTrPage, getTrFigs, getBodyFh, isRefPage, linkService]);
 
   return (
     <div
@@ -621,7 +670,9 @@ function Page({
       style={
         {
           width: size.w,
-          minHeight: size.h,
+          // reflow placeholder keeps the measured natural footprint (never
+          // shorter than the original page) so unrender→re-render is Δ≈0
+          minHeight: reflow && trNatH ? Math.max(size.h, trNatH * scale) : size.h,
           height: reflow ? undefined : size.h,
           "--scale-factor": scale,
         } as React.CSSProperties
@@ -704,13 +755,15 @@ export default function App() {
   // text-layer probe of the open book: null = probing, false = scan (no text)
   const [hasText, setHasText] = useState<boolean | null>(null);
   const hasTextProbeRef = useRef<Promise<boolean> | null>(null);
-  // transient bottom toast (auto-hides); sticky engine states override it in render
-  const [notice, setNotice] = useState<string | null>(null);
+  // transient bottom toast (auto-hides); sticky engine states override it in
+  // render. An optional action renders as an inline button («Открыть» after
+  // export) — such toasts live longer, a button needs time to be clicked
+  const [notice, setNotice] = useState<{ msg: string; action?: { label: string; run: () => void } } | null>(null);
   const noticeTimer = useRef<number>(undefined);
-  const showNotice = useCallback((msg: string) => {
-    setNotice(msg);
+  const showNotice = useCallback((msg: string, action?: { label: string; run: () => void }) => {
+    setNotice({ msg, action });
     clearTimeout(noticeTimer.current);
-    noticeTimer.current = window.setTimeout(() => setNotice(null), 6000);
+    noticeTimer.current = window.setTimeout(() => setNotice(null), action ? 10000 : 6000);
   }, []);
   // bumped whenever trStoreRef content changes — tr-mode Pages re-read overlays
   const [trVersion, setTrVersion] = useState(0);
@@ -833,6 +886,9 @@ export default function App() {
   const getTrPage = useCallback((n: number) => trStoreRef.current?.pages[n], []);
   const getTrFigs = useCallback((n: number) => trStoreRef.current?.figures[n] ?? [], []);
   const getBodyFh = useCallback(() => trStoreRef.current?.bodyFh ?? 0, []);
+  // refPages is a short sorted list (a handful of bibliography pages) —
+  // linear includes() per Page render is fine
+  const isRefPage = useCallback((n: number) => trStoreRef.current?.refPages.includes(n) ?? false, []);
 
   // selection mini-toolbar: after a pointerup that leaves a non-empty selection
   // inside a text layer, show «Перевести» near the selection end — or, when the
@@ -1106,7 +1162,10 @@ export default function App() {
   // out (auto-start on ready), "none"/"dead" surface the reason instead of
   // fake-succeeding (WP-B routes these into the model-setup flow), and a book
   // with no text layer never starts a run at all.
-  const startTr = useCallback(async () => {
+  // update === true routes into «Обновить перевод» (incremental re-clustering,
+  // booktranslate.updateBookTranslation) instead of a translation run; the
+  // model gate is shared — an update may need the wire for changed paragraphs
+  const startTr = useCallback(async (update?: boolean) => {
     if (!doc || !path || booktranslate.getRun(path) || trWaitRef.current) return;
     if ((await hasTextProbeRef.current) === false) {
       if (pathRef.current === path) showNotice("В книге нет текстового слоя — нужен OCR");
@@ -1137,7 +1196,7 @@ export default function App() {
       return;
     }
     // rejects only when the book file cannot be re-opened for the run's doc
-    booktranslate.startRun(path).catch(() => {
+    (update === true ? booktranslate.updateBookTranslation(path) : booktranslate.startRun(path)).catch(() => {
       if (pathRef.current === path) showNotice(OPEN_FAIL_MSG);
     });
   }, [doc, path, showNotice]);
@@ -1411,34 +1470,56 @@ export default function App() {
     setTrVersion((v) => v + 1);
   }, []);
 
-  // «Экспортировать перевод…» (WP-L, Р-9): диалог сохранения решает формат
-  // (TXT/HTML); HTML собирает кропы фигур из собственного рендера — прогресс
-  // идёт в тост, финал называет результат тем же именем, что и пункт меню
+  // «Экспорт перевода» (WP-L, Р-9 → волна 3): ОДИН клик — HTML сразу в
+  // «Загрузки», без диалога; кропы фигур собираются из собственного рендера,
+  // прогресс идёт в тост, финал — «Сохранено в Загрузки» с кнопкой «Открыть»
+  // (файл подсвечивается в Проводнике). TXT — вторичный путь из Настроек,
+  // прежний диалог сохранения.
   const exportBusyRef = useRef(false);
+  const exportTitle = useCallback(() => {
+    const p = pathRef.current!;
+    const file = p.split(/[\\/]/).pop()?.replace(/\.pdf$/i, "") ?? "перевод";
+    try {
+      const idx = JSON.parse(localStorage.getItem("pdfer:books") ?? "{}") as Record<string, { title?: string }>;
+      return (idx[p]?.title ?? "").trim() || file;
+    } catch {
+      return file; // индекса нет — остаётся имя файла
+    }
+  }, []);
   const exportTr = useCallback(async () => {
     const p = pathRef.current;
     if (!p || exportBusyRef.current) return;
-    let title = p.split(/[\\/]/).pop()?.replace(/\.pdf$/i, "") ?? "перевод";
-    try {
-      const idx = JSON.parse(localStorage.getItem("pdfer:books") ?? "{}") as Record<string, { title?: string }>;
-      title = (idx[p]?.title ?? "").trim() || title;
-    } catch {
-      // индекса нет — остаётся имя файла
-    }
     exportBusyRef.current = true;
     try {
-      const res = await exportTranslation(p, title, (done, total) => {
+      const res = await exportTranslationToDownloads(p, exportTitle(), (done, total) => {
         if (done === total || done % 5 === 0) showNotice(`Экспорт… ${Math.floor((100 * done) / total)}%`);
       });
-      if (res === "saved") showNotice("Перевод сохранён");
-      else if (res === "cancelled") setNotice(null); // диалог закрыт — тихо
+      if (res === "none") return; // пункт меню без готовых страниц и так скрыт
+      showNotice("Сохранено в Загрузки", {
+        label: "Открыть",
+        run: () => void revealItemInDir(res.path).catch(() => showNotice("Не удалось открыть папку")),
+      });
     } catch (e) {
       console.error("export failed", e);
       showNotice("Не удалось экспортировать перевод");
     } finally {
       exportBusyRef.current = false;
     }
-  }, [showNotice]);
+  }, [exportTitle, showNotice]);
+  const exportTxt = useCallback(async () => {
+    const p = pathRef.current;
+    if (!p || exportBusyRef.current) return;
+    exportBusyRef.current = true;
+    try {
+      const res = await exportTranslationTxt(p, exportTitle());
+      if (res === "saved") showNotice("Перевод сохранён");
+    } catch (e) {
+      console.error("export failed", e);
+      showNotice("Не удалось экспортировать перевод");
+    } finally {
+      exportBusyRef.current = false;
+    }
+  }, [exportTitle, showNotice]);
 
   // the OS-side window chrome (titlebar) follows the app theme (WP-K); also
   // runs once on start so a persisted dark theme gets a dark titlebar
@@ -1670,8 +1751,8 @@ export default function App() {
       if (trInfo !== null && trInfo.done > 0)
         paletteCommands.push({
           id: "export",
-          label: "Экспортировать перевод…",
-          keywords: "экспорт сохранить export txt html",
+          label: "Экспорт перевода",
+          keywords: "экспорт сохранить export html загрузки downloads",
           run: exportTr,
         });
       paletteCommands.push(
@@ -1700,10 +1781,10 @@ export default function App() {
   // sticky engine states outrank the transient notice; stall clears itself on
   // recovery. anyStall covers BACKGROUND runs too — a model outage while the
   // library (or another book) is on screen must not fail silently.
-  const toastMsg = anyStall
-    ? "Модель недоступна — перевод приостановлен, готовые страницы сохранены"
+  const toast = anyStall
+    ? { msg: "Модель недоступна — перевод приостановлен, готовые страницы сохранены" }
     : trWait
-      ? "Модель запускается… Перевод начнётся автоматически"
+      ? { msg: "Модель запускается… Перевод начнётся автоматически" }
       : notice;
 
   return (
@@ -1824,7 +1905,12 @@ export default function App() {
                       // подпись постоянна (движок пишет каждую страницу сразу)
                       <div className="px-2.5 py-1.5 select-none">
                         <div className="tabular-nums">
-                          {trPct}%{run?.stalled ? " · модель недоступна" : fmtEta(run?.etaMs)}
+                          {/* update sweeps a 100%-done store — its progress is
+                              the run's swept-pages counter, not donePages */}
+                          {run?.update
+                            ? `Обновление · ${Math.floor((100 * run.done) / Math.max(1, run.total))}%`
+                            : `${trPct}%`}
+                          {run?.stalled ? " · модель недоступна" : fmtEta(run?.etaMs)}
                         </div>
                         <button
                           className="mt-1 -mx-1 px-1 rounded transition-colors hover:bg-neutral-100 dark:hover:bg-neutral-700/70"
@@ -1869,6 +1955,21 @@ export default function App() {
                     ) : (
                       <div className="px-2.5 py-1.5 text-neutral-500 dark:text-neutral-400">Книга переведена</div>
                     )}
+                    {/* «Обновить перевод»: инкрементальная пересборка готового
+                        перевода текущим движком — недеструктивная пара к
+                        «Перевести заново», скрыта пока идёт любой ран */}
+                    {trInfo !== null && !trRun && (
+                      <button
+                        className={MENU_ROW}
+                        onClick={() => {
+                          setMenuOpen(false);
+                          startTr(true);
+                        }}
+                        title="Пересобрать структуру страниц и доперевести только изменившееся"
+                      >
+                        Обновить перевод
+                      </button>
+                    )}
                     {/* деструктивное подтверждение (#11): следствие + кнопка,
                         называющая действие; «Перевести заново» (#13) */}
                     {trInfo !== null &&
@@ -1903,8 +2004,9 @@ export default function App() {
                           Перевести заново
                         </button>
                       ))}
-                    {/* экспорт (WP-L, Р-9): при частичном переводе — честная
-                        подпись, сколько страниц попадёт в файл */}
+                    {/* экспорт (WP-L, Р-9): один клик — HTML сразу в «Загрузки»;
+                        при частичном переводе — честная подпись, сколько
+                        страниц попадёт в файл */}
                     {trInfo !== null && trInfo.done > 0 && (
                       <button
                         className={MENU_ROW}
@@ -1912,9 +2014,9 @@ export default function App() {
                           setMenuOpen(false);
                           exportTr();
                         }}
-                        title="Сохранить перевод в TXT или HTML"
+                        title="Сохранить перевод в HTML — файл появится в папке «Загрузки»"
                       >
-                        Экспортировать перевод…
+                        Экспорт перевода
                         {trInfo.done < trInfo.total && (
                           <div className="text-xs text-neutral-500 dark:text-neutral-400 tabular-nums">
                             Готово {trInfo.done} из {trInfo.total} страниц
@@ -2052,6 +2154,7 @@ export default function App() {
                   getTrPage={getTrPage}
                   getTrFigs={getTrFigs}
                   getBodyFh={getBodyFh}
+                  isRefPage={isRefPage}
                   linkService={linkService}
                 />
               ))}
@@ -2138,6 +2241,7 @@ export default function App() {
           trFont={trFont}
           onTrFont={setTrFontPersist}
           onTranslationsCleared={onTranslationsCleared}
+          onExportTxt={doc && trInfo !== null && trInfo.done > 0 ? exportTxt : undefined}
           onClose={() => setSettingsOpen(false)}
         />
       )}
@@ -2166,9 +2270,20 @@ export default function App() {
         />
       )}
       {shortcutsOpen && <ShortcutsOverlay onClose={() => setShortcutsOpen(false)} />}
-      {toastMsg && (
-        <div className="overlay-pop fixed bottom-6 left-1/2 -translate-x-1/2 z-30 rounded-full bg-white/95 dark:bg-neutral-800/95 backdrop-blur px-4 py-2 shadow-xl text-sm text-neutral-700 dark:text-neutral-200 select-none pointer-events-none whitespace-nowrap">
-          {toastMsg}
+      {toast && (
+        /* z-40 + последний в DOM: тост читается и поверх дым-слоя модалок
+           (TXT-экспорт из Настроек); палитра (z-50) всё равно выше. Сам тост
+           клики пропускает, живая только кнопка действия */
+        <div className="overlay-pop fixed bottom-6 left-1/2 -translate-x-1/2 z-40 rounded-full bg-white/95 dark:bg-neutral-800/95 backdrop-blur px-4 py-2 shadow-xl text-sm text-neutral-700 dark:text-neutral-200 select-none pointer-events-none whitespace-nowrap">
+          {toast.msg}
+          {toast.action && (
+            <button
+              className="pointer-events-auto ml-3 font-medium text-neutral-900 dark:text-neutral-50 transition-colors hover:text-neutral-500 dark:hover:text-neutral-300"
+              onClick={toast.action.run}
+            >
+              {toast.action.label}
+            </button>
+          )}
         </div>
       )}
     </div>

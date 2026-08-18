@@ -326,6 +326,21 @@
   padding-left: 1.4em;
   text-indent: -1.4em;
 }
+/* footnotes (buildTrPage detects them at render time): footnote-sized type
+   with one hairline above the block — the cue the reflow otherwise erases;
+   consecutive footnotes share the single rule. currentColor keeps the
+   hairline theme-correct in dark mode. */
+.trPage .trFoot {
+  font-size: 0.85em;
+  margin-top: 1.3em;
+  padding-top: 0.6em;
+  border-top: 1px solid color-mix(in srgb, currentColor 30%, transparent);
+}
+.trPage .trFoot + .trFoot {
+  margin-top: 0.45em;
+  padding-top: 0;
+  border-top: 0;
+}
 /* inline image crops of non-translated regions (formulas/figures/tables and
    failed paragraphs) — in flow, centered, natural size (buildTrPage sets px
    width/height). Overrides the absolute .page canvas rule above; the

@@ -13,8 +13,20 @@ import { appDataDir } from "@tauri-apps/api/path";
 import { mkdir, readFile, remove, rename, stat, writeFile } from "@tauri-apps/plugin-fs";
 import { OPS, getDocument } from "pdfjs-dist";
 import type { PDFDocumentProxy, PDFPageProxy } from "pdfjs-dist";
-import { FIG_CONTAIN, clusterParagraphs, detectFigures, hash, interArea, mul } from "./paragraphs";
-import type { FigureRegion, Paragraph, ParaKind } from "./paragraphs";
+import {
+  FIG_CONTAIN,
+  clusterParagraphs,
+  detectFigures,
+  detectFurniture,
+  forgetFurnitureVotes,
+  hash,
+  interArea,
+  mul,
+  newFurnitureMemory,
+  rememberFurniture,
+} from "./paragraphs";
+import type { FigureRegion, FurnitureMemory, Paragraph, ParaKind } from "./paragraphs";
+import { CITE_MARK } from "./glossarygen";
 import { ModelUnavailableError, hydrateGlossary, isServerUp, parseGlossary, translate } from "./translate";
 import type { GlossaryEntry } from "./translate";
 import { bookKey, contentKey, setBookKey } from "./bookid";
@@ -27,8 +39,9 @@ const MODEL = "HY-MT1.5-7B-Q4_K_M";
 const CONCURRENCY = 3; // worker count only — actual requests draw from the shared ≤3 budget in translate.ts
 const ETA_WINDOW = 5; // moving average over the last N text pages
 
-// v2: paragraphs carry fh (glyph height at scale 1) + kind; kind:"other"
-// (display math / tables) and kind:"caption" are never translated — tr stays ""
+// v2: paragraphs carry fh (glyph height at scale 1) + kind; only kind:"prose"
+// is ever translated — "other" (display math / tables), "caption" and
+// "furniture" (running headers/footers) keep tr ""
 export type TrParagraph = Paragraph & { tr: string };
 export type BookTranslation = {
   version: 2;
@@ -42,21 +55,32 @@ export type BookTranslation = {
   // in, reading order. Candidates may be blank whitespace — the renderer drops
   // blanks by pixel inspection of the offscreen render it makes for crops.
   figures: Record<number, FigureRegion[]>;
+  // bibliography/reference pages (isRefPage): completed WITHOUT translation
+  // (every tr stays "") — the viewer must render these pages as the ORIGINAL
+  // even in translation mode. Additive: pre-refPage stores simply lack the
+  // field (normalized to [] on load) and old builds ignore it.
+  refPages: number[];
   donePages: number[];
   total: number;
   // median fh across prose paragraphs of completed pages — the v2 typesetter's
   // uniform body size reference; refreshed after every completed page
   bodyFh: number;
+  // «Обновить перевод» watermark, present only mid-update: pages 1..updatedThrough
+  // are already re-clustered with the CURRENT engine code (an interrupted update
+  // resumes above it); removed when the sweep reaches the last page. Additive —
+  // old builds ignore it, version stays 2.
+  updatedThrough?: number;
 };
 
 // on-disk shape across versions: v1 paragraphs lack fh/kind, v1 meta lacks
 // bodyFh; stores written before figure detection lack figures
 type StoredParagraph = Omit<TrParagraph, "fh" | "kind"> & { fh?: number; kind?: ParaKind };
-type StoredBookTranslation = Omit<BookTranslation, "version" | "pages" | "bodyFh" | "figures"> & {
+type StoredBookTranslation = Omit<BookTranslation, "version" | "pages" | "bodyFh" | "figures" | "refPages"> & {
   version: number;
   pages: Record<number, StoredParagraph[]>;
   bodyFh?: number;
   figures?: Record<number, FigureRegion[]>;
+  refPages?: number[];
 };
 export type BookProgress = { page: number; total: number; donePages: number; etaMs?: number };
 
@@ -220,6 +244,8 @@ export async function loadBookTranslation(bookPath: string): Promise<BookTransla
     st.bodyFh ??= 0;
     // pre-figure-detection stores simply lack regions until a re-translation
     st.figures ??= {};
+    // pre-refPage stores: no pages were classified — nothing to flag
+    st.refPages ??= [];
     st.version = 2;
     return st as BookTranslation;
   } catch {
@@ -294,13 +320,121 @@ export async function pageImageBoxes(page: PDFPageProxy): Promise<FigureRegion[]
   }
 }
 
+// ---- bibliography pages (refPage) -------------------------------------------
+// Reference lists come out mangled by translation (author names "translated",
+// venues paraphrased — the user reads them as broken «Отображение источников»),
+// and their content is citations, not prose: translating them is pure harm.
+// Classification is PAGE-LEVEL over citation markers — years, DOI/arXiv, URLs
+// (CITE_MARK, the same net glossarygen uses to keep bibliographies out of term
+// statistics). Marker DENSITY alone cannot separate a references page from
+// citation-heavy running prose (measured on the test book: survey prose peaks
+// at the same 4–6 markers per 1000 chars as sparse bibliography pages), so the
+// decisive signal is ENTRY SHAPE: paragraphs that BOTH open like a reference
+// entry ("[12] …", "A. Askari and S. Verberne. 2021 …", "Salton, G. …") AND
+// carry a citation marker. Prose paragraphs virtually never open with an
+// author pattern, however many citations they contain; a references page is
+// made of nothing else (5+ entries per page at book layouts; the test book
+// runs 6–15). The marker floor on top keeps degenerate matches honest.
+// Flagged pages complete immediately with every tr:"" and are listed in
+// store.refPages — the viewer renders them as the ORIGINAL page in translation
+// mode. Deliberately page-level only: a references section STARTING mid-page
+// keeps its page translated (the chapter tail above matters more than the
+// first few entries). One entry-shape blind spot — a page-long single entry
+// (a 100-author collaboration paper) — is closed by the sandwich rule at the
+// flag site in startBookTranslation.
+const REF_ENTRY_MIN = 5; // entry-shaped, marker-bearing paragraphs per page
+const REF_MARKS_MIN = 10; // total citation markers per page
+// bracket label, "A. Surname" initials-first, or "Surname, A." surname-first
+const REF_ENTRY_RE = /^(?:\[\d+\]\s|[A-ZА-ЯЁ]\.\s?[A-ZА-ЯЁ]|[A-ZА-ЯЁ][A-Za-zà-öø-ÿА-Яа-яЁё'’-]+,\s+[A-ZА-ЯЁ]\.)/;
+
+export function isRefPage(paras: readonly Paragraph[]): boolean {
+  let entries = 0;
+  let marks = 0;
+  for (const p of paras) {
+    if (p.kind === "furniture") continue;
+    const m = p.text.match(CITE_MARK)?.length ?? 0;
+    marks += m;
+    if (m && REF_ENTRY_RE.test(p.text)) entries++;
+  }
+  return entries >= REF_ENTRY_MIN && marks >= REF_MARKS_MIN;
+}
+
 // uniform body-size reference: median fh over prose paragraphs of every
-// completed page (pages map only ever holds completed pages)
-function medianBodyFh(pages: Record<number, TrParagraph[]>): number {
+// completed page (pages map only ever holds completed pages). refPages are
+// excluded: bibliography entries are typeset smaller than body (0.9x on the
+// test book) and 100+ reference pages of them would drag the median down,
+// silently re-labeling ordinary subsection headings as trHead in the reflow.
+function medianBodyFh(pages: Record<number, TrParagraph[]>, refPages: readonly number[]): number {
+  const skip = new Set(refPages);
   const fhs: number[] = [];
-  for (const paras of Object.values(pages)) for (const p of paras) if (p.kind === "prose" && p.fh > 0) fhs.push(p.fh);
+  for (const [k, paras] of Object.entries(pages)) {
+    if (skip.has(Number(k))) continue;
+    for (const p of paras) if (p.kind === "prose" && p.fh > 0) fhs.push(p.fh);
+  }
   fhs.sort((a, b) => a - b);
   return fhs.length ? fhs[fhs.length >> 1] : 0;
+}
+
+// ---- incremental update («Обновить перевод») --------------------------------
+// After engine improvements (better clustering, furniture/refPage detection)
+// the stored page structure is stale, but most paragraph TEXT is unchanged —
+// a full re-translation would spend hours re-doing identical work. carryOver
+// moves existing translations onto the freshly-clustered paragraphs: exact
+// normalized-text match first, then a high-overlap prefix match (a superscript
+// marker dropped near the paragraph tail, a re-joined hyphenation). A changed
+// opening (split/merged paragraphs, an early in-text change) deliberately
+// fails both matches — those paragraphs are re-translated, which is the whole
+// point of the update. Old paragraphs are consumed at most once; old tr:""
+// entries carry nothing, so soft-failed paragraphs are re-requested for free.
+
+const normText = (s: string): string => s.replace(/\s+/g, " ").trim();
+
+function lcpLen(a: string, b: string): number {
+  const n = Math.min(a.length, b.length);
+  let i = 0;
+  while (i < n && a.charCodeAt(i) === b.charCodeAt(i)) i++;
+  return i;
+}
+
+const CARRY_PREFIX = 0.9; // common prefix must cover ≥90% of the LONGER text
+const CARRY_MIN = 12; // both texts non-trivial, chars
+
+type CarryEntry = { tr: string; k: string; used: boolean };
+
+// mutates matched paragraphs' tr in place; returns those still needing the wire
+function carryOver(todo: TrParagraph[], old: readonly TrParagraph[]): TrParagraph[] {
+  const pool: CarryEntry[] = old
+    .filter((o) => o.tr !== "")
+    .map((o) => ({ tr: o.tr, k: normText(o.text), used: false }));
+  const byText = new Map<string, CarryEntry[]>();
+  for (const e of pool) {
+    const l = byText.get(e.k);
+    if (l) l.push(e);
+    else byText.set(e.k, [e]);
+  }
+  const rest: TrParagraph[] = [];
+  for (const p of todo) {
+    const e = byText.get(normText(p.text))?.find((c) => !c.used);
+    if (e) {
+      e.used = true;
+      p.tr = e.tr;
+    } else rest.push(p);
+  }
+  const wire: TrParagraph[] = [];
+  for (const p of rest) {
+    const k = normText(p.text);
+    const e = pool.find(
+      (c) =>
+        !c.used &&
+        Math.min(k.length, c.k.length) >= CARRY_MIN &&
+        lcpLen(k, c.k) >= CARRY_PREFIX * Math.max(k.length, c.k.length),
+    );
+    if (e) {
+      e.used = true;
+      p.tr = e.tr;
+    } else wire.push(p);
+  }
+  return wire;
 }
 
 // abortable delay; rejects with AbortError so worker loops unwind like a fetch abort
@@ -385,6 +519,11 @@ async function translateRetry(
 // store is rewritten on disk, so cancel (AbortSignal) never loses a page.
 // A model outage never completes pages: the run stalls in place (onStall
 // reports it) and resumes by itself when /health answers again.
+// update:true («Обновить перевод») changes the sweep, not the machinery: done
+// pages above store.updatedThrough are re-clustered with current code,
+// translations are carried over by text match (carryOver) and only new/changed
+// paragraphs hit the model — a page whose paragraphs all match completes with
+// zero requests. donePages/glossary/version semantics are untouched.
 export async function startBookTranslation(
   doc: PDFDocumentProxy,
   bookPath: string,
@@ -393,9 +532,10 @@ export async function startBookTranslation(
     onStall?: (stalled: boolean) => void;
     signal?: AbortSignal;
     pageLimit?: number;
+    update?: boolean;
   } = {},
 ): Promise<BookTranslation> {
-  const { onProgress, onStall, signal, pageLimit } = opts;
+  const { onProgress, onStall, signal, pageLimit, update } = opts;
   const waitHealthy = makeHealthGate(onStall);
   const total = doc.numPages;
   const store: BookTranslation = (await loadBookTranslation(bookPath)) ?? {
@@ -407,11 +547,34 @@ export async function startBookTranslation(
     glossaryText: await hydrateGlossary(bookPath),
     pages: {},
     figures: {},
+    refPages: [],
     donePages: [],
     total,
     bodyFh: 0,
   };
   store.total = total;
+  // update resume point: pages at or below it already carry current-code
+  // structure and are skipped; 0 = fresh update, sweep from page 1
+  const updatedFrom = update ? store.updatedThrough ?? 0 : 0;
+  // per-run cross-page furniture memory; a resumed store re-seeds it (offset
+  // votes + repetition window from already-stored furniture, zone re-derived
+  // from each page's own content bounds), so the first page after a resume
+  // confirms its running header exactly like an uninterrupted run would —
+  // detectFurniture prunes whatever falls outside its rolling window.
+  // ALL stored furniture pages seed — including pages an update will revisit:
+  // a paused update otherwise resumes with a vote pool below quorum and
+  // re-translates the very headers it already knew (the running-header bug,
+  // resurrected). The revisit double-count is handled at the sweep site: a
+  // page retracts its own seeded votes right before detectFurniture re-votes
+  // its live candidates (forgetFurnitureVotes).
+  const furn: FurnitureMemory = newFurnitureMemory();
+  for (const [k, paras] of Object.entries(store.pages)) {
+    if (!paras.some((p) => p.kind === "furniture")) continue;
+    const cT = Math.min(...paras.map((p) => p.y));
+    const cB = Math.max(...paras.map((p) => p.y + p.h));
+    for (const p of paras)
+      if (p.kind === "furniture") rememberFurniture(furn, Number(k), p, p.y - cT <= cB - (p.y + p.h) ? "t" : "b");
+  }
   // never mint pages against a dead server: one probe up front — an outage
   // stalls the run right here, before even a text-less page can complete and
   // write the first store byte (auto-resumes when /health answers)
@@ -423,27 +586,48 @@ export async function startBookTranslation(
 
   for (let n = 1; n <= last; n++) {
     if (signal?.aborted) break;
-    if (done.has(n)) continue;
+    // update mode revisits done pages above the watermark; a page the update
+    // has never completed (partial store) is translated in full either way
+    if (done.has(n) && (!update || n <= updatedFrom)) continue;
 
     const page = await doc.getPage(n);
     const content = await page.getTextContent();
     const vp1 = page.getViewport({ scale: 1 });
     const paras = clusterParagraphs(content.items, vp1);
+    // running headers/footers → kind:"furniture", BEFORE figure detection
+    // (the caption pass only reclassifies prose — a marked header can no
+    // longer be claimed) and BEFORE the refPage gate (reference pages carry
+    // headers too and must keep feeding the cross-page memory).
+    // Update revisit: this page seeded the memory at run start (its votes fed
+    // the quorum for the pages before it) — withdraw its own stored votes now
+    // so detectFurniture's re-vote of the live candidates doesn't double-count
+    if (update && n > updatedFrom)
+      for (const p of store.pages[n] ?? []) if (p.kind === "furniture") forgetFurnitureVotes(furn, n, p);
+    detectFurniture(paras, n, furn);
+    // bibliography page: completes untranslated below (todo stays empty) and
+    // skips the figure pass — the viewer shows the original page wholesale,
+    // stored regions would never render
+    const refPage = isRefPage(paras);
     // candidate figure regions; reclassifies adjacent "Figure N:" prose
     // paragraphs to kind:"caption" (mutates paras) and merges their bboxes
-    const figures = detectFigures(paras, vp1.width, vp1.height, await pageImageBoxes(page));
+    const figures = refPage ? [] : detectFigures(paras, vp1.width, vp1.height, await pageImageBoxes(page));
 
     const t0 = performance.now();
     const out: TrParagraph[] = paras.map((p) => ({ ...p, tr: "" }));
-    // kind:"other" (display math / tables) and kind:"caption" are skipped —
-    // tr stays "", the v2 typesetter shows original image crops instead.
+    // Only kind:"prose" is translated: kind:"other" (display math / tables)
+    // and kind:"caption" get image crops instead, kind:"furniture" (running
+    // headers/footers) is dropped from the reflow entirely — tr stays "".
     // Prose mostly contained in a figure region is skipped too: its pixels
     // are already in the region's crop and the typesetter excludes it from
     // the flow (FIG_CONTAIN) — translating diagram labels only wastes wire
     // requests and invites hallucinated sentence expansions
-    const todo = out.filter(
-      (p) => p.kind === "prose" && !figures.some((r) => interArea(p, r) >= FIG_CONTAIN * p.w * p.h),
-    );
+    let todo = refPage
+      ? []
+      : out.filter((p) => p.kind === "prose" && !figures.some((r) => interArea(p, r) >= FIG_CONTAIN * p.w * p.h));
+    // update: pull translations over from the old clustering of this page —
+    // only genuinely new/changed paragraphs stay on the wire list
+    const old = update ? store.pages[n] : undefined;
+    if (old) todo = carryOver(todo, old);
     if (todo.length) {
       let i = 0;
       const worker = async () => {
@@ -467,22 +651,47 @@ export async function startBookTranslation(
 
     store.pages[n] = out;
     store.figures[n] = figures;
+    // update: this page's classification is fresh — an old flag no longer
+    // backed by isRefPage on the CURRENT clustering must not survive
+    if (update) store.refPages = store.refPages.filter((p) => p !== n);
+    if (refPage && !store.refPages.includes(n)) {
+      store.refPages = [...store.refPages, n].sort((a, b) => a - b);
+      // sandwich rule: a lone non-ref page between two ref pages sits INSIDE
+      // a bibliography run — isRefPage's entry-shape test loses only to a
+      // page-long single entry (seen: a 100-author collaboration paper), and
+      // that only ever happens mid-bibliography. Flag it retroactively; its
+      // already-spent translation simply stops rendering (original shown).
+      if (store.refPages.includes(n - 2) && !store.refPages.includes(n - 1) && done.has(n - 1))
+        store.refPages = [...store.refPages, n - 1].sort((a, b) => a - b);
+    }
     done.add(n);
     store.donePages = [...done].sort((a, b) => a - b);
-    store.bodyFh = medianBodyFh(store.pages);
+    if (update) store.updatedThrough = n;
+    store.bodyFh = medianBodyFh(store.pages, store.refPages);
     await writeStore(store);
 
-    if (todo.length) {
+    // update pages complete in milliseconds when nothing hit the wire — their
+    // durations belong in the ETA too (it forecasts the sweep, not translation)
+    if (update || todo.length) {
       durations.push(performance.now() - t0);
       if (durations.length > ETA_WINDOW) durations.shift();
     }
     const avg = durations.length ? durations.reduce((a, b) => a + b, 0) / durations.length : undefined;
+    // update progress counts swept pages (the sequential position), not
+    // donePages — a fully-translated store is 100% done before page 1
+    const prog = update ? n : done.size;
     onProgress?.({
       page: n,
       total,
-      donePages: done.size,
-      etaMs: avg === undefined ? undefined : Math.round(avg * (total - done.size)),
+      donePages: prog,
+      etaMs: avg === undefined ? undefined : Math.round(avg * (total - prog)),
     });
+  }
+  // full-book update finished: every page now carries current-code structure —
+  // drop the watermark so a future update sweeps from page 1 again
+  if (update && !signal?.aborted && last === total && (store.updatedThrough ?? 0) >= total) {
+    delete store.updatedThrough;
+    await writeStore(store);
   }
   return store;
 }
@@ -500,10 +709,11 @@ export async function startBookTranslation(
 
 export type RunInfo = {
   bookPath: string;
-  done: number; // completed pages (seeded from the store before page 1 of the run)
+  done: number; // completed pages — or swept pages for an update run (seeded from the store before page 1)
   total: number; // 0 only for the moment before the run's doc is open
   etaMs?: number;
   stalled: boolean; // engine is waiting out a model outage (auto-resumes)
+  update: boolean; // «Обновить перевод» sweep, not a fresh/resumed translation
 };
 
 type Run = { ctrl: AbortController; promise: Promise<void>; info: RunInfo };
@@ -549,26 +759,32 @@ export async function stopRun(bookPath: string): Promise<void> {
   await r.promise.catch(() => {});
 }
 
-// Start the background run for a book (or join the one already running).
-// The returned promise settles when the run does; it rejects ONLY when the
-// book file cannot be opened — pipeline errors (abort included) are logged
-// and swallowed, because the per-page store already holds every finished page.
-export function startRun(bookPath: string): Promise<void> {
+// One launcher for both run flavors. A book has at most ONE active run: a
+// second start (either flavor) joins the run already in flight — the menu
+// hides «Обновить перевод» while a run is active, so the join is a guard,
+// not a UI path. The returned promise settles when the run does; it rejects
+// ONLY when the book file cannot be opened — pipeline errors (abort included)
+// are logged and swallowed, because the per-page store already holds every
+// finished page.
+function launchRun(bookPath: string, update: boolean, pageLimit?: number): Promise<void> {
   const existing = runs.get(bookPath);
   if (existing) return existing.promise;
   const ctrl = new AbortController();
-  const info: RunInfo = { bookPath, done: 0, total: 0, stalled: false };
+  const info: RunInfo = { bookPath, done: 0, total: 0, stalled: false, update };
   const promise = (async () => {
     const doc = await openRunDoc(bookPath); // open failure surfaces to the caller
     try {
       info.total = doc.numPages;
-      // resume runs show their real percentage before the first new page lands
+      // resumed runs show their real percentage before the first new page
+      // lands: completed pages for translation, the watermark for an update
       const st = await loadBookTranslation(bookPath);
-      if (st) info.done = st.donePages.length;
+      if (st) info.done = update ? st.updatedThrough ?? 0 : st.donePages.length;
       emitRuns();
       if (ctrl.signal.aborted) return;
       await startBookTranslation(doc, bookPath, {
         signal: ctrl.signal,
+        update,
+        pageLimit,
         onStall: (stalled) => {
           info.stalled = stalled;
           emitRuns();
@@ -592,4 +808,21 @@ export function startRun(bookPath: string): Promise<void> {
   runs.set(bookPath, { ctrl, promise, info });
   emitRuns();
   return promise;
+}
+
+// Start the background translation run for a book (or join the active run).
+export function startRun(bookPath: string): Promise<void> {
+  return launchRun(bookPath, false);
+}
+
+// «Обновить перевод» — incremental re-translation after engine improvements:
+// sweep EVERY stored page through the CURRENT clustering/classification code
+// (furniture, refPages and figures are recomputed), carry translations over by
+// paragraph-text match and send only new/changed paragraphs to the model —
+// unchanged pages complete instantly, with zero requests. Runs through the
+// same run manager as a normal translation: progress/pause (stopRun)/
+// background semantics are identical, resume via store.updatedThrough.
+// opts.pageLimit is the same dev/test hook startBookTranslation has.
+export function updateBookTranslation(bookPath: string, opts: { pageLimit?: number } = {}): Promise<void> {
+  return launchRun(bookPath, true, opts.pageLimit);
 }

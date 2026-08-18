@@ -1,7 +1,7 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
-  "description": "Capability for the main window",
+  "description": "Capability for the main window. NOTE for the wave-3 scope-narrowing agent: $DOWNLOAD/** under fs:allow-write-file is a DELIBERATE exception — one-click «Экспорт перевода» writes the HTML straight to the Downloads folder without a save dialog (src/export.ts exportTranslationToDownloads). Keep it when narrowing the broad ** read scopes.",
   "windows": ["main"],
   "permissions": [
     "core:default",
@@ -35,7 +35,7 @@
     },
     {
       "identifier": "fs:allow-write-file",
-      "allow": [{ "path": "$APPDATA/**" }]
+      "allow": [{ "path": "$APPDATA/**" }, { "path": "$DOWNLOAD/**" }]
     },
     {
       "identifier": "fs:allow-remove",

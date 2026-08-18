@@ -251,6 +251,7 @@ export function SettingsModal({
   trFont,
   onTrFont,
   onTranslationsCleared,
+  onExportTxt,
   onClose,
 }: {
   dark: boolean;
@@ -258,6 +259,9 @@ export function SettingsModal({
   trFont: number;
   onTrFont: (px: number) => void;
   onTranslationsCleared: (path?: string) => void;
+  // вторичный экспорт открытой книги (главный — HTML одной кнопкой из меню);
+  // undefined = книга не открыта или переведённых страниц нет — строки нет
+  onExportTxt?: () => void;
   onClose: () => void;
 }) {
   const [libDir, setLibDir] = useState<string | null>(() => localStorage.getItem("pdfer:libdir"));
@@ -501,6 +505,16 @@ export function SettingsModal({
               })
             ))}
         </div>
+        {onExportTxt && (
+          <Row
+            label="Перевод открытой книги"
+            title="Сохранить перевод простым текстом — без картинок и вёрстки; папку и имя спросит диалог"
+          >
+            <button className={`text-xs ${QUIET_BTN}`} onClick={onExportTxt}>
+              Экспорт в TXT…
+            </button>
+          </Row>
+        )}
         <Row label="Обложки библиотеки" title="Создаются заново при открытии библиотеки">
           <span className="flex items-center gap-3 text-xs">
             <span className="tabular-nums text-neutral-500 dark:text-neutral-400">

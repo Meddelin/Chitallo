@@ -15,8 +15,12 @@ export type Frag = { words: Word[]; top: number; bottom: number; left: number; r
 // the v2 typesetter shows an image crop of the region instead of a translation;
 // caption = "Figure N:"-style paragraph adjacent to a detected figure region —
 // never translated, never flowed as text: its bbox is merged into the region,
-// so the region's image crop shows figure + caption exactly as the original
-export type ParaKind = "prose" | "other" | "caption";
+// so the region's image crop shows figure + caption exactly as the original;
+// furniture = running header/footer page furniture (repeated section titles,
+// printed page numbers) — never translated AND never rendered at all: the
+// reflow replaces the original page geometry, so its navigation aids are
+// noise there (see detectFurniture below)
+export type ParaKind = "prose" | "other" | "caption" | "furniture";
 // fh: median glyph (font) height of the paragraph's items, in the units of the
 // viewport passed to clusterParagraphs (the book engine passes scale 1)
 export type Paragraph = { x: number; y: number; w: number; h: number; text: string; fh: number; kind: ParaKind };
@@ -191,16 +195,48 @@ export function growParagraph(frags: Frag[], home: Frag, lineH: number, claimed?
   return para;
 }
 
+// Superscript footnote markers — a tiny RAISED digit run glued to the end of a
+// word or of sentence punctuation, with a word break after («cross-encoder¹ in»,
+// «Vespa.² In») — are DROPPED during assembly. Flowed into the text they corrupt
+// words: the test book's markers came out as «Lucene3», «Vespa4» in translations,
+// with the model keeping or dropping the digit at random; the reflow's footnote
+// blocks keep their own printed «N.» labels, so the in-body marker carries no
+// recoverable meaning there. Math survives by construction: exponents follow
+// single-letter variables or brackets ("O(n2)", "(a+b)2" — the 3-letter tail
+// rule fails), subscripts sit BELOW the baseline (the raise test fails), and
+// display math is kind:"other" whose text never renders. Numeric-citation
+// superscripts (other books' "…retrieval12") are dropped too — same rationale.
+const SUP_DIGITS = /^\d{1,2}$/;
+const SUP_TAIL = /(?:[A-Za-zÀ-ÖØ-öø-ÿА-Яа-яЁё]{3}|[.,;:!?])$/;
+
 // assemble: words left→right per line (a space where rects show a word gap —
 // whitespace-only words are filtered before clustering), lines joined dehyphenated
 export function paraText(para: Frag[], lineH: number): string {
   let text = "";
   for (const f of para) {
     const ws = f.words.slice().sort((a, b) => a.rect.left - b.rect.left);
+    // frag-local metrics for the superscript-marker rule: median glyph height
+    // ≈ the line's font size, median bottom ≈ the line's text baseline
+    const hs = ws.map((w) => w.rect.bottom - w.rect.top).sort((a, b) => a - b);
+    const medH = hs[hs.length >> 1] || 0;
+    const bots = ws.map((w) => w.rect.bottom).sort((a, b) => a - b);
+    const medBot = bots[bots.length >> 1] || 0;
     let t = "";
     for (let i = 0; i < ws.length; i++) {
-      if (i && ws[i].rect.left - ws[i - 1].rect.right > 0.12 * lineH) t += " ";
-      t += ws[i].text;
+      const w = ws[i];
+      const spaced = i > 0 && w.rect.left - ws[i - 1].rect.right > 0.12 * lineH;
+      if (
+        i > 0 &&
+        !spaced && // glued to the previous word…
+        SUP_DIGITS.test(w.text.trim()) &&
+        w.rect.bottom - w.rect.top <= 0.85 * medH && // …smaller (markers run 0.8×)…
+        medBot - w.rect.bottom >= 0.25 * medH && // …raised clear off the baseline…
+        SUP_TAIL.test(t) && // …after a real word or sentence punctuation…
+        (i === ws.length - 1 || /^\s/.test(ws[i + 1].text) || ws[i + 1].rect.left - w.rect.right > 0.12 * lineH) // …at a word break
+      )
+        continue; // superscript footnote marker — dropped (see above)
+      if (spaced) t += " ";
+      t += w.text;
     }
     t = t.replace(/\s+/g, " ").trim();
     if (!t) continue;
@@ -296,6 +332,270 @@ export function classifyMetrics(m: ParaMetrics): ParaKind {
   if (m.hasEq && m.stopCount === 0 && m.pureWordRatio < 0.7) return "other"; // camelCase equations: [pFalse,pTrue] = softmax(…) — sentences always carry function words
   if (m.wordRatio < 0.3 && m.singleRatio > 0.4) return "other"; // glyph soup
   return "prose";
+}
+
+// ---- running-page furniture (headers/footers) -------------------------------
+// Running headers («2.4 Системы, ориентированные на представление информации
+// 27») and standalone printed page numbers are PAGE FURNITURE: navigation aids
+// repeated on every page, not content. Left as prose they get translated and
+// rendered as stray one-line blocks at the top of every reflowed page (seen on
+// the real book). kind:"furniture" is never translated (the engine only sends
+// kind:"prose") and must be skipped entirely by renderers — no text flow, no
+// image crop — exactly like kind:"caption" is skipped in App.tsx buildTrPage
+// and export.ts pageItems.
+//
+// Detection = geometric candidates + confirmation.
+//   CANDIDATE: a short single-line paragraph hugging the page content's top or
+//   bottom edge, separated from the rest of the page by a clear vertical gap,
+//   at body-or-smaller glyph size (running headers sit at ~1.05x body, under
+//   the 1.12 cap; real section headings at >=1.15x never qualify — the same
+//   sizes the fh-cliff in growParagraph is tuned around).
+//   CONFIRMED by any of:
+//   (a) printed page number — a standalone integer token at the line's start
+//       or end equal to physicalPage + learned offset. The printed<->physical
+//       offset is LEARNED, never assumed: every candidate whose edge token is
+//       a bare integer votes (int − physicalPage); the modal offset wins once
+//       it has ≥3 votes and 2x the runner-up (see learnedOffset). Before the
+//       offset is known only a PURE number confirms here — a candidate that is
+//       nothing but one integer (the classic centered page number) or one
+//       roman numeral (front matter, where no arabic offset can ever match).
+//   (b) cross-page repetition — the digit-normalized text (digit runs → "#")
+//       was seen at a similar Y in the same zone within the last MEMORY_PAGES
+//       pages: running titles repeat verbatim page after page (verso/recto
+//       alternation lands 2 pages apart, well inside the window), body lines
+//       never do. The first page of a fresh header text (chapter start) is
+//       caught by (a) instead, since running headers carry the page number.
+//   (c) band rescue — an unconfirmed candidate sharing its line with a
+//       confirmed one: buildFrags' column-gap rule often splits «title  27»
+//       into two frags; the page number confirms via (a), the title frag
+//       rides along.
+// ASYMMETRY: (b) needs the sequential cross-page memory that only the engine
+// (booktranslate.ts) maintains — it sweeps pages in order and owns one
+// FurnitureMemory per run. The viewer-side DOM path (App.tsx Alt+click) has no
+// page history: a memoryless detectFurniture call degrades to the geometric +
+// pure-number rule only, which is deliberate — there a miss merely translates
+// one header line on demand in the popover, nothing is persisted.
+// Known limits (accepted): a header with NO page number on it is missed on its
+// first occurrence per window (repetition needs a second sighting); page-level
+// furniture only — this never touches margin notes or footnotes (multi-line,
+// mid-gap, and never confirmed).
+
+const FURN_MEMORY_PAGES = 8; // repetition window, pages
+const FURN_MAX_CHARS = 120; // headers are short; and shorter than most body lines
+const FURN_MAX_TOKENS = 14; // also excludes TOC dot-leader lines outright
+const FURN_FH_CAP = 1.12; // headers ≈1.05x body; section headings ≥1.15x stay out
+const FURN_EDGE = 0.6; // candidate hugs the content edge, x lineH
+const FURN_GAP = 0.7; // min clear gap toward the body (leading gaps are 0.2–0.4)
+const FURN_Y_TOL = 1.5; // repetition match: same-Y tolerance across pages, x lineH
+
+export type FurnitureMemory = {
+  // printed-number offset votes: (standalone edge number − physical page) →
+  // count. Arabic and roman numbering are SEPARATE schemes with separate
+  // offsets: front matter prints "Contents xvii" while the body prints
+  // "2.4 Title 27" — one modal offset would let the body majority silence the
+  // front matter forever (roman page numbers change every page, so repetition
+  // can never confirm those headers either).
+  votes: Map<number, number>;
+  rvotes: Map<number, number>;
+  // digit-normalized candidate lines of recent pages (confirmed or not — the
+  // first, unconfirmed sighting is what the second one matches against)
+  recent: { page: number; zone: "t" | "b"; y: number; key: string }[];
+};
+export const newFurnitureMemory = (): FurnitureMemory => ({ votes: new Map(), rvotes: new Map(), recent: [] });
+
+const INT_RE = /^\d{1,4}$/;
+const ROMAN_RE = /^(?:[ivxlcdm]{1,7}|[IVXLCDM]{1,7})$/; // no mixed case — keeps "Mid"-like words out
+const furnKey = (t: string): string => t.toLowerCase().replace(/\d+/g, "#");
+
+const ROMAN_VAL: Record<string, number> = { i: 1, v: 5, x: 10, l: 50, c: 100, d: 500, m: 1000 };
+const romanToInt = (s: string): number => {
+  const t = s.toLowerCase();
+  let v = 0;
+  for (let i = 0; i < t.length; i++) {
+    const a = ROMAN_VAL[t[i]];
+    v += a < (ROMAN_VAL[t[i + 1]] ?? 0) ? -a : a;
+  }
+  return v;
+};
+
+// standalone page-number token at either end of the line — where running
+// headers carry the printed number ("2.4 Title 27", "26 Chapter Two",
+// "Contents xvii", bare "27"/"xi"); arabic wins when a token parses as both
+function edgeNo(text: string): { a: number | null; r: number | null } {
+  const toks = text.split(" ");
+  for (const t of [toks[toks.length - 1], toks[0]]) {
+    const core = (t ?? "").replace(EDGE_PUNCT, "");
+    if (INT_RE.test(core)) return { a: parseInt(core, 10), r: null };
+    if (ROMAN_RE.test(core)) return { a: null, r: romanToInt(core) };
+  }
+  return { a: null, r: null };
+}
+
+// modal offset with ≥3 votes and a 2x margin over the runner-up: the real
+// offset collects one consistent vote per numbered page, while TOC lines,
+// "Chapter 2" tails and body coincidences scatter across offsets
+export function learnedOffset(votes: ReadonlyMap<number, number>): number | null {
+  let off: number | null = null;
+  let best = 0;
+  let second = 0;
+  for (const [o, n] of votes) {
+    if (n > best) {
+      second = best;
+      best = n;
+      off = o;
+    } else if (n > second) second = n;
+  }
+  return off !== null && best >= 3 && best >= 2 * second ? off : null;
+}
+
+// Re-seed one already-classified furniture paragraph (engine resume: stored
+// pages re-vote the offset and refill the repetition window, so a mid-book
+// resume confirms its very first header like an uninterrupted run would).
+export function rememberFurniture(mem: FurnitureMemory, page: number, p: Paragraph, zone: "t" | "b"): void {
+  const e = edgeNo(p.text);
+  if (e.a !== null) mem.votes.set(e.a - page, (mem.votes.get(e.a - page) ?? 0) + 1);
+  if (e.r !== null) mem.rvotes.set(e.r - page, (mem.rvotes.get(e.r - page) ?? 0) + 1);
+  mem.recent.push({ page, zone, y: zone === "t" ? p.y : p.y + p.h, key: furnKey(p.text) });
+}
+
+// Withdraw one seeded paragraph's offset votes (update-mode resume: pages the
+// sweep will REVISIT seed the memory too — their votes must count for the
+// pages before them, but detectFurniture re-votes the page's live candidates,
+// so the stored contribution is retracted right before that page's re-sweep).
+// The repetition window needs no counterpart: same-page entries never confirm
+// their own page and detectFurniture's window update replaces them wholesale.
+export function forgetFurnitureVotes(mem: FurnitureMemory, page: number, p: Paragraph): void {
+  const e = edgeNo(p.text);
+  const drop = (m: Map<number, number>, off: number) => {
+    const v = (m.get(off) ?? 0) - 1;
+    if (v > 0) m.set(off, v);
+    else m.delete(off);
+  };
+  if (e.a !== null) drop(mem.votes, e.a - page);
+  if (e.r !== null) drop(mem.rvotes, e.r - page);
+}
+
+// Mark confirmed running headers/footers on one page: kind → "furniture"
+// (MUTATES paras). Call BEFORE detectFigures — the caption pass only
+// reclassifies prose, so a marked header can no longer be claimed by a figure.
+// `mem` is the engine's per-run cross-page memory; omitted (DOM path) the
+// detector degrades to the pure-number rule (see the asymmetry note above).
+export function detectFurniture(paras: Paragraph[], physPage: number, mem?: FurnitureMemory): void {
+  if (!paras.length) return;
+  // page line-height unit: median prose glyph height WEIGHTED BY TEXT LENGTH.
+  // A plain paragraph-count median is hijacked on figure-heavy pages, where
+  // dozens of short 0.8x-body diagram labels (kind prose) outnumber the few
+  // real body paragraphs and drag the unit low enough that the actual running
+  // header (~0.95x body) reads as "heading-sized" and is never marked (seen
+  // on the test book's architecture-diagram pages). Characters concentrate in
+  // body paragraphs, so the char-weighted median is the body size.
+  const pool = (paras.some((p) => p.kind === "prose" && p.fh > 0) ? paras.filter((p) => p.kind === "prose") : paras)
+    .filter((p) => p.fh > 0)
+    .sort((a, b) => a.fh - b.fh);
+  let lineH = 12;
+  const totalChars = pool.reduce((a, p) => a + p.text.length, 0);
+  for (let acc = 0, i = 0; i < pool.length; i++) {
+    acc += pool[i].text.length;
+    if (acc * 2 >= totalChars) {
+      lineH = pool[i].fh;
+      break;
+    }
+  }
+  lineH = Math.max(6, lineH);
+  const cT = Math.min(...paras.map((p) => p.y));
+  const cB = Math.max(...paras.map((p) => p.y + p.h));
+
+  type Cand = {
+    p: Paragraph;
+    zone: "t" | "b";
+    edge: { a: number | null; r: number | null };
+    pureNo: boolean;
+    roman: boolean;
+  };
+  const cands: Cand[] = [];
+  for (const p of paras) {
+    if (p.h > 1.8 * lineH) continue; // multi-line paragraphs are body content
+    if (p.fh <= 0 || p.fh > FURN_FH_CAP * lineH) continue; // heading-sized → real title
+    if (p.text.length > FURN_MAX_CHARS) continue;
+    const toks = p.text.split(" ");
+    if (toks.length > FURN_MAX_TOKENS) continue;
+    const top = p.y <= cT + FURN_EDGE * lineH;
+    const bot = !top && p.y + p.h >= cB - FURN_EDGE * lineH;
+    if (!top && !bot) continue;
+    // clear separation from the body: nearest other band TOWARD the content
+    // ("toward" via the 0.4·lineH shift keeps same-line frags — the split-off
+    // page number — and same-height paragraphs in other columns out of the
+    // measurement). Consecutive body lines sit 0.2–0.4·lineH apart, so a
+    // spillover line ending a page/column never passes; header-to-body and
+    // footer-to-body gaps run ≥1·lineH.
+    let gap = Infinity;
+    for (const q of paras) {
+      if (q === p) continue;
+      if (top && q.y > p.y + 0.4 * lineH) gap = Math.min(gap, q.y - (p.y + p.h));
+      if (bot && q.y + q.h < p.y + p.h - 0.4 * lineH) gap = Math.min(gap, p.y - (q.y + q.h));
+    }
+    if (gap < FURN_GAP * lineH) continue;
+    const core = toks.length === 1 ? toks[0].replace(EDGE_PUNCT, "") : "";
+    cands.push({
+      p,
+      zone: top ? "t" : "b",
+      edge: edgeNo(p.text),
+      pureNo: INT_RE.test(core),
+      roman: ROMAN_RE.test(core),
+    });
+  }
+
+  // offset votes land BEFORE confirmation, so the page that completes the
+  // quorum already benefits from it
+  if (mem)
+    for (const c of cands) {
+      if (c.edge.a !== null) mem.votes.set(c.edge.a - physPage, (mem.votes.get(c.edge.a - physPage) ?? 0) + 1);
+      if (c.edge.r !== null) mem.rvotes.set(c.edge.r - physPage, (mem.rvotes.get(c.edge.r - physPage) ?? 0) + 1);
+    }
+  const offA = mem ? learnedOffset(mem.votes) : null;
+  const offR = mem ? learnedOffset(mem.rvotes) : null;
+
+  const confirmed = new Set<Paragraph>();
+  for (const c of cands) {
+    // (a) printed page number, per numbering scheme (offset-checked once
+    // learned; conservative pure-number fallback before that and on the
+    // memoryless path; a bare roman numeral is always a page number)
+    let ok =
+      (offA !== null ? c.edge.a === physPage + offA : c.pureNo) ||
+      (offR !== null && c.edge.r !== null && c.edge.r === physPage + offR) ||
+      c.roman;
+    // (b) cross-page repetition
+    if (!ok && mem) {
+      const key = furnKey(c.p.text);
+      const y = c.zone === "t" ? c.p.y : c.p.y + c.p.h;
+      ok = mem.recent.some(
+        (e) => e.page !== physPage && e.zone === c.zone && Math.abs(e.y - y) <= FURN_Y_TOL * lineH && e.key === key,
+      );
+    }
+    if (ok) confirmed.add(c.p);
+  }
+  // (c) band rescue: unconfirmed frag on a confirmed line (title beside number)
+  for (const c of cands) {
+    if (confirmed.has(c.p)) continue;
+    const cy = c.p.y + c.p.h / 2;
+    if (cands.some((d) => confirmed.has(d.p) && d.zone === c.zone && Math.abs(d.p.y + d.p.h / 2 - cy) <= 0.7 * lineH))
+      confirmed.add(c.p);
+  }
+  for (const p of confirmed) p.kind = "furniture";
+
+  // memory update: every candidate is a future repetition anchor; entries
+  // expire out of the rolling window (same-page entries are replaced on a
+  // re-run of the same page, e.g. dev HMR double-processing)
+  if (mem) {
+    mem.recent = mem.recent.filter((e) => e.page < physPage && physPage - e.page < FURN_MEMORY_PAGES);
+    for (const c of cands)
+      mem.recent.push({
+        page: physPage,
+        zone: c.zone,
+        y: c.zone === "t" ? c.p.y : c.p.y + c.p.h,
+        key: furnKey(c.p.text),
+      });
+  }
 }
 
 // 2x3 affine matrix product (pdfjs Util.transform, inlined to keep this module
