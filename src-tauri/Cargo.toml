@@ -32,4 +32,9 @@ sha2 = "0.10"
 [target.'cfg(windows)'.dependencies]
 # free-disk-space check before a multi-GB download
 windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_Storage_FileSystem"] }
+# silent PDF export: drive WebView2's PrintToPdf on a hidden window.
+# Versions deliberately match what wry already pulls in (Cargo.lock:
+# webview2-com 0.38.2 / windows-core 0.61.2) so no duplicate majors appear.
+webview2-com = "0.38.2"
+windows-core = "0.61"
 

@@ -26,7 +26,7 @@ import * as glossarygen from "./glossarygen";
 import { ModelSetupModal, Spinner, dlBusy, dlPct, fetchModelStatus, restartModel, statusUp, useDownload } from "./ModelSetup";
 import { AboutModal } from "./About";
 import { SettingsModal, TR_FONT_DEFAULT, TR_FONT_MAX, TR_FONT_MIN } from "./Settings";
-import { exportTranslationToDownloads, exportTranslationTxt } from "./export";
+import { exportTranslationPdf, exportTranslationToDownloads, exportTranslationTxt } from "./export";
 import * as exportmod from "./export";
 import { IconChevronDown, IconColumns, IconMoon, IconSliders, IconSun } from "./icons";
 import "./App.css";
@@ -820,7 +820,20 @@ export default function App() {
   //   __pdferDev.startBookTranslation(__pdferDev.doc, __pdferDev.path, { pageLimit: 3 })
   useEffect(() => {
     if (!import.meta.env.DEV) return;
-    (window as unknown as Record<string, unknown>).__pdferDev = { doc, path, ...booktranslate, ...glossarygen, ...exportmod };
+    (window as unknown as Record<string, unknown>).__pdferDev = {
+      doc,
+      path,
+      ...booktranslate,
+      ...glossarygen,
+      ...exportmod,
+      // прямой прогон PDF-экспорта без меню (агентские E2E-проверки):
+      //   __pdferDev.exportPdf() — открытая книга; __pdferDev.exportPdf(bookPath) — любая
+      exportPdf: (bp?: string) => {
+        const p = bp ?? path;
+        if (!p) return Promise.reject(new Error("no book"));
+        return exportmod.exportTranslationPdf(p, (p.split(/[\\/]/).pop() ?? "перевод").replace(/\.pdf$/i, ""));
+      },
+    };
   }, [doc, path]);
 
   // dev-only: auto-start/resume the book translation when a marker file
@@ -1470,12 +1483,17 @@ export default function App() {
     setTrVersion((v) => v + 1);
   }, []);
 
-  // «Экспорт перевода» (WP-L, Р-9 → волна 3): ОДИН клик — HTML сразу в
-  // «Загрузки», без диалога; кропы фигур собираются из собственного рендера,
-  // прогресс идёт в тост, финал — «Сохранено в Загрузки» с кнопкой «Открыть»
-  // (файл подсвечивается в Проводнике). TXT — вторичный путь из Настроек,
+  // Экспорт перевода (WP-L, Р-9 + PDF): ОДИН клик — файл сразу в «Загрузки»,
+  // без диалога; кропы фигур собираются из собственного рендера, прогресс идёт
+  // в тост, финал — «Сохранено в Загрузки» с кнопкой «Открыть» (файл
+  // подсвечивается в Проводнике). PDF — главный путь (печать скрытым окном
+  // WebView2, print_html_to_pdf), HTML — второй, TXT — третий из Настроек,
   // прежний диалог сохранения.
   const exportBusyRef = useRef(false);
+  // PDF-экспорт на большой книге живёт минуты (рендер кропов + печать) — на
+  // это время строка меню «Экспорт в PDF» становится спиннером «Подготовка
+  // PDF…», а меню при клике не закрывается: эффект клика виден на месте
+  const [pdfBusy, setPdfBusy] = useState(false);
   const exportTitle = useCallback(() => {
     const p = pathRef.current!;
     const file = p.split(/[\\/]/).pop()?.replace(/\.pdf$/i, "") ?? "перевод";
@@ -1504,6 +1522,29 @@ export default function App() {
       showNotice("Не удалось экспортировать перевод");
     } finally {
       exportBusyRef.current = false;
+    }
+  }, [exportTitle, showNotice]);
+  const exportPdf = useCallback(async () => {
+    const p = pathRef.current;
+    if (!p || exportBusyRef.current) return;
+    exportBusyRef.current = true;
+    setPdfBusy(true);
+    try {
+      showNotice("Подготовка PDF…");
+      const res = await exportTranslationPdf(p, exportTitle(), (done, total) => {
+        if (done === total || done % 5 === 0) showNotice(`Подготовка PDF… ${Math.floor((100 * done) / total)}%`);
+      });
+      if (res === "none") return; // пункт меню без готовых страниц и так скрыт
+      showNotice("Сохранено в Загрузки", {
+        label: "Открыть",
+        run: () => void revealItemInDir(res.path).catch(() => showNotice("Не удалось открыть папку")),
+      });
+    } catch (e) {
+      console.error("pdf export failed", e);
+      showNotice("Не удалось сохранить PDF");
+    } finally {
+      exportBusyRef.current = false;
+      setPdfBusy(false);
     }
   }, [exportTitle, showNotice]);
   const exportTxt = useCallback(async () => {
@@ -1760,12 +1801,20 @@ export default function App() {
           run: startTr,
         });
       if (trInfo !== null && trInfo.done > 0)
-        paletteCommands.push({
-          id: "export",
-          label: "Экспорт перевода",
-          keywords: "экспорт сохранить export html загрузки downloads",
-          run: exportTr,
-        });
+        paletteCommands.push(
+          {
+            id: "exportpdf",
+            label: "Экспорт в PDF",
+            keywords: "экспорт сохранить export pdf печать print загрузки downloads",
+            run: exportPdf,
+          },
+          {
+            id: "export",
+            label: "Экспорт в HTML",
+            keywords: "экспорт сохранить export html загрузки downloads",
+            run: exportTr,
+          },
+        );
       paletteCommands.push(
         { id: "gloss", label: "Глоссарий…", keywords: "термины glossary", run: () => setGlossOpen(true) },
         { id: "ask", label: "Спросить", hint: "Ctrl+J", keywords: "вопрос чат claude ask", run: toggleAsk },
@@ -2020,25 +2069,43 @@ export default function App() {
                           Перевести заново
                         </button>
                       ))}
-                    {/* экспорт (WP-L, Р-9): один клик — HTML сразу в «Загрузки»;
-                        при частичном переводе — честная подпись, сколько
+                    {/* экспорт (WP-L, Р-9 + PDF): один клик — файл сразу в
+                        «Загрузки». PDF — главный путь (иллюстрации оригинала
+                        встроены); пока скрытое окно печатает, строка — спиннер,
+                        меню при клике не закрывается: эффект виден на месте.
+                        При частичном переводе — честная подпись, сколько
                         страниц попадёт в файл */}
                     {trInfo !== null && trInfo.done > 0 && (
-                      <button
-                        className={MENU_ROW}
-                        onClick={() => {
-                          setMenuOpen(false);
-                          exportTr();
-                        }}
-                        title="Сохранить перевод в HTML — файл появится в папке «Загрузки»"
-                      >
-                        Экспорт перевода
-                        {trInfo.done < trInfo.total && (
-                          <div className="text-xs text-neutral-500 dark:text-neutral-400 tabular-nums">
-                            Готово {trInfo.done} из {trInfo.total} страниц
+                      <>
+                        {pdfBusy ? (
+                          <div className="px-2.5 py-1.5 flex items-center gap-1.5 text-neutral-500 dark:text-neutral-400">
+                            <Spinner /> Подготовка PDF…
                           </div>
+                        ) : (
+                          <button
+                            className={MENU_ROW}
+                            onClick={exportPdf}
+                            title="Сохранить перевод в PDF с иллюстрациями оригинала — файл появится в папке «Загрузки»"
+                          >
+                            Экспорт в PDF
+                            {trInfo.done < trInfo.total && (
+                              <div className="text-xs text-neutral-500 dark:text-neutral-400 tabular-nums">
+                                Готово {trInfo.done} из {trInfo.total} страниц
+                              </div>
+                            )}
+                          </button>
                         )}
-                      </button>
+                        <button
+                          className={MENU_ROW}
+                          onClick={() => {
+                            setMenuOpen(false);
+                            exportTr();
+                          }}
+                          title="Сохранить перевод в HTML — файл появится в папке «Загрузки»"
+                        >
+                          Экспорт в HTML
+                        </button>
+                      </>
                     )}
                     <button
                       className={MENU_ROW}

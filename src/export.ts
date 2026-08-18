@@ -1,10 +1,19 @@
-// Экспорт перевода (WP-L, Р-9): HTML одной кнопкой + TXT вторым путём.
+// Экспорт перевода (WP-L, Р-9 + PDF): PDF одной кнопкой, HTML вторым, TXT третьим.
 // Сборка зеркалит типографику buildTrPage (App.tsx): заголовки по fh/bodyFh,
 // висячие отступы списков, капшены не в потоке, дедуп абзацев внутри фигур;
 // kind:"furniture" (колонтитулы) не попадает в поток вовсе, страницы из
 // store.refPages (библиография — в приложении рендерится оригинал) идут
 // честной пометкой, а не мусорным текстом.
-//   HTML — главный путь, БЕЗ диалога: файл «<книга> — перевод.html» сразу в
+//   PDF  — главный путь, БЕЗ диалога: печатный вариант того же документа
+//          (buildPrintHtml: типографика в pt, правила разрыва страниц, кропы
+//          PNG 2×, refPages — оригинальной страницей-картинкой 1.5×) пишется
+//          временным HTML в $APPDATA и уходит скрытому окну WebView2
+//          (Rust-команда print_html_to_pdf, A4 портрет, поля 12 мм);
+//          результат «<книга> — перевод.pdf» сразу в «Загрузках», временный
+//          HTML удаляется в finally. A4 выбран как универсальный печатный
+//          формат: кропы масштабируются в процентах от ширины исходной
+//          страницы, поэтому пропорции оригинала сохраняются на любом листе.
+//   HTML — второй путь, БЕЗ диалога: файл «<книга> — перевод.html» сразу в
 //          «Загрузки» (запись туда — осознанное исключение в capabilities,
 //          см. default.json), при коллизии имени — « (2)», « (3)», …
 //          Автономный документ с ВСТРОЕННЫМИ кропами оригинала (data-URI):
@@ -13,7 +22,7 @@
 //          (не зависит от открытого в читалке документа), пустые
 //          fig-кандидаты отбрасываются той же пиксельной проверкой, что в
 //          drawCrops. Тёмная тема — через prefers-color-scheme.
-//   TXT  — вторичный путь (Настройки), по-прежнему через системный диалог
+//   TXT  — третий путь (Настройки), по-прежнему через системный диалог
 //          сохранения: плагин dialog добавляет выбранный save()-путь в
 //          runtime-scope fs (проверено в tauri-plugin-dialog 2.7.2
 //          commands.rs: s.allow_file(&path)), поэтому запись работает и вне
@@ -22,9 +31,10 @@
 //          абзацев, «[таблица или формула]» для прочего, подпись фигуры в
 //          скобках); мгновенная сборка, без рендера.
 
+import { invoke } from "@tauri-apps/api/core";
 import { save } from "@tauri-apps/plugin-dialog";
-import { readFile, stat, writeFile } from "@tauri-apps/plugin-fs";
-import { downloadDir } from "@tauri-apps/api/path";
+import { readFile, remove, stat, writeFile } from "@tauri-apps/plugin-fs";
+import { appDataDir, downloadDir } from "@tauri-apps/api/path";
 import { getDocument } from "pdfjs-dist";
 import type { PDFDocumentProxy } from "pdfjs-dist";
 import { loadBookTranslation } from "./booktranslate";
@@ -47,6 +57,7 @@ const BLANK_VAR = 4;
 const BLANK_RANGE = 24;
 const SAMPLE = 32;
 const EXPORT_SCALE = 2; // offscreen render scale for crops (2× display size)
+const REF_SCALE = 1.5; // full-page render scale for refPages in the print (PDF) export
 
 type TextItem = { kind: "text"; cls: "p" | "head" | "hang" | "foot"; em?: number; text: string };
 type CropItem = {
@@ -114,8 +125,9 @@ const gapRu = (a: number, b: number) =>
   a === b ? `страница ${a} не переведена` : `страницы ${a}–${b} не переведены`;
 
 // refPages (библиография): в приложении такая страница рендерится оригиналом;
-// в экспорт идёт пометка — полностраничный скрин весил бы мегабайты на
-// страницу и не читался бы как текст, поэтому пиксели не встраиваются
+// в TXT/HTML идёт пометка — полностраничный скрин весил бы мегабайты на
+// страницу и не читался бы как текст; PDF-экспорт (печать) встраивает
+// оригинальную страницу картинкой (refPageImgHtml), пометка — его fallback
 const refRu = (n: number) => `страница ${n} — оригинал без перевода`;
 
 function metaLine(store: BookTranslation): string {
@@ -191,6 +203,36 @@ p { margin: 0.55em 0 0; text-indent: 1.5em; }
 }
 `;
 
+// Печатная типографика (Экспорт в PDF). Поля даёт print_html_to_pdf (12 мм со
+// всех сторон), поэтому body без отступов и без @page (размер листа тоже
+// задаёт печать: A4 портрет). Правила разрыва: кропы, сноски и refPages не
+// рвутся между страницами, заголовок не отрывается от следующего абзаца.
+// Печать всегда светлая — тёмной ветки нет, цвета фиксированы.
+const PRINT_CSS = `
+:root { color-scheme: light; }
+body { margin: 0; background: #fff; color: #111;
+  font-family: Georgia, "Iowan Old Style", "Times New Roman", serif;
+  font-size: 11pt; line-height: 1.5; text-align: justify;
+  hyphens: auto; overflow-wrap: break-word; }
+h1 { font-size: 1.5em; line-height: 1.25; margin: 0; text-align: left;
+  break-after: avoid; page-break-after: avoid; }
+.meta { margin: 0.4em 0 0; color: #555; font-size: 0.8em; text-align: left; text-indent: 0; }
+p { margin: 0.55em 0 0; text-indent: 1.5em; }
+.head { font-weight: 600; line-height: 1.25; text-align: left; text-indent: 0; margin-top: 1.1em;
+  break-after: avoid; page-break-after: avoid; break-inside: avoid; page-break-inside: avoid; }
+.hang { text-indent: -1.4em; padding-left: 1.4em; }
+.foot { font-size: 0.85em; text-indent: 0; margin-top: 1.3em; padding-top: 0.6em;
+  border-top: 1px solid #999; break-inside: avoid; page-break-inside: avoid; }
+.foot + .foot { margin-top: 0.45em; padding-top: 0; border-top: 0; }
+.crop { display: block; margin: 0.9em auto; max-width: 100%; height: auto;
+  break-inside: avoid; page-break-inside: avoid; }
+.refpg { display: block; width: 100%; margin: 0.9em 0;
+  break-inside: avoid; page-break-inside: avoid; }
+.pg { margin: 1.8em 0 0; text-align: center; color: #999; font-size: 0.7em; letter-spacing: 0.08em;
+  break-after: avoid; page-break-after: avoid; }
+.gap, .ph { color: #555; font-style: italic; text-align: center; text-indent: 0; margin-top: 1.4em; }
+`;
+
 // own document for crop rendering — independent of the viewer's lifecycle
 // (?test= dev books are URLs, mirrors booktranslate.openRunDoc)
 async function openDoc(bookPath: string): Promise<PDFDocumentProxy> {
@@ -213,6 +255,7 @@ function cropDataUrl(
   off: HTMLCanvasElement,
   it: CropItem,
   probe: CanvasRenderingContext2D,
+  png: boolean, // print wants lossless PNG; the screen HTML keeps lighter JPEG
 ): { url: string; w: number } | null {
   const k = EXPORT_SCALE;
   const sx = Math.min(off.width, Math.round(Math.max(0, it.x) * k));
@@ -244,7 +287,25 @@ function cropDataUrl(
   c.width = sw;
   c.height = sh;
   c.getContext("2d")!.drawImage(off, sx, sy, sw, sh, 0, 0, sw, sh);
-  return { url: c.toDataURL("image/jpeg", 0.87), w: Math.round(sw / k) };
+  return { url: png ? c.toDataURL("image/png") : c.toDataURL("image/jpeg", 0.87), w: Math.round(sw / k) };
+}
+
+// refPage в печати: оригинальная страница целиком, картинкой (1.5×). JPEG, не
+// PNG — полностраничный PNG весил бы мегабайты на страницу; текст библиографии
+// при 1.5×/0.9 в печати читается. Сбойная страница → null → прежняя пометка.
+async function refPageImgHtml(doc: PDFDocumentProxy, n: number): Promise<string | null> {
+  try {
+    const page = await doc.getPage(n);
+    const vp = page.getViewport({ scale: REF_SCALE });
+    const c = document.createElement("canvas");
+    c.width = Math.floor(vp.width);
+    c.height = Math.floor(vp.height);
+    await page.render({ canvas: c, viewport: vp }).promise;
+    page.cleanup();
+    return `<img class="refpg" alt="Страница ${n} оригинала" src="${c.toDataURL("image/jpeg", 0.9)}">`;
+  } catch {
+    return null;
+  }
 }
 
 // crop item without pixels (no doc / render failure) → honest text fallback
@@ -254,10 +315,15 @@ function cropFallbackHtml(it: CropItem): string {
   return it.para ? `<p>${esc(it.para.text)}</p>` : "";
 }
 
-export async function assembleHtml(
+// Общая сборка документа. print=false — экранный HTML (JPEG-кропы в px,
+// тёмная тема, пометки вместо refPages); print=true — печатный вариант для
+// print_html_to_pdf (PNG-кропы шириной в % от исходной страницы, правила
+// разрыва, refPages — страницей-картинкой).
+async function assembleDoc(
   store: BookTranslation,
   title: string,
   bookPath: string,
+  print: boolean,
   onProgress?: (done: number, total: number) => void,
 ): Promise<string> {
   const done = new Set(store.donePages);
@@ -265,11 +331,13 @@ export async function assembleHtml(
   const perPage = new Map<number, Item[]>();
   let needDoc = false;
   for (const n of store.donePages) {
-    if (refs.has(n)) continue; // refPage идёт пометкой — её кропы не нужны
+    if (refs.has(n)) continue; // refPage идёт пометкой/картинкой — её кропы не нужны
     const items = pageItems(store.pages[n] ?? [], store.figures[n] ?? [], store.bodyFh);
     perPage.set(n, items);
     if (items.some((i) => i.kind === "crop")) needDoc = true;
   }
+  // печать встраивает refPages картинками — документ нужен и без кропов
+  if (print && store.donePages.some((n) => refs.has(n))) needDoc = true;
 
   let doc: PDFDocumentProxy | null = null;
   if (needDoc) doc = await openDoc(bookPath).catch(() => null); // без документа кропы деградируют в пометки
@@ -293,8 +361,12 @@ export async function assembleHtml(
         gapStart = null;
       }
       if (refs.has(n)) {
-        const t = refRu(n);
-        chunks.push(`<p class="gap">${esc(t[0].toUpperCase() + t.slice(1))}</p>`);
+        const ref = print && doc ? await refPageImgHtml(doc, n) : null;
+        if (ref) chunks.push(`<div class="pg">${n}</div>`, ref);
+        else {
+          const t = refRu(n);
+          chunks.push(`<p class="gap">${esc(t[0].toUpperCase() + t.slice(1))}</p>`);
+        }
         onProgress?.(++processed, store.donePages.length);
         continue;
       }
@@ -327,10 +399,15 @@ export async function assembleHtml(
             c.height = SAMPLE;
             probe = c.getContext("2d", { willReadFrequently: true })!;
           }
-          const crop = cropDataUrl(off, it, probe);
+          const crop = cropDataUrl(off, it, probe, print);
           if (crop) {
             const alt = it.fig ? (it.caption ? esc(it.caption) : "Рисунок") : "Фрагмент оригинала";
-            pageChunks.push(`<img class="crop" style="width:${crop.w}px" alt="${alt}" src="${crop.url}">`);
+            // печать: ширина в % от исходной страницы — пропорции оригинала
+            // сохраняются на любом листе; экран: прежние px
+            const wStyle = print
+              ? `width:${Math.min(100, (100 * crop.w * EXPORT_SCALE) / off.width).toFixed(2)}%`
+              : `width:${crop.w}px`;
+            pageChunks.push(`<img class="crop" style="${wStyle}" alt="${alt}" src="${crop.url}">`);
           }
           // blank fig candidate: dropped, like in the app
         } else {
@@ -352,7 +429,7 @@ export async function assembleHtml(
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>${esc(title)} — перевод</title>
-<style>${HTML_CSS}</style>
+<style>${print ? PRINT_CSS : HTML_CSS}</style>
 </head>
 <body>
 <main>
@@ -363,6 +440,25 @@ ${chunks.join("\n")}
 </body>
 </html>
 `;
+}
+
+export function assembleHtml(
+  store: BookTranslation,
+  title: string,
+  bookPath: string,
+  onProgress?: (done: number, total: number) => void,
+): Promise<string> {
+  return assembleDoc(store, title, bookPath, false, onProgress);
+}
+
+/// Печатный вариант того же документа — вход скрытой печати print_html_to_pdf.
+export function buildPrintHtml(
+  store: BookTranslation,
+  title: string,
+  bookPath: string,
+  onProgress?: (done: number, total: number) => void,
+): Promise<string> {
+  return assembleDoc(store, title, bookPath, true, onProgress);
 }
 
 // ---- entry ------------------------------------------------------------------
@@ -389,7 +485,37 @@ export async function exportTranslationToDownloads(
   return { path: target };
 }
 
-/// TXT — вторичный путь (Настройки), прежний системный диалог сохранения.
+/// Одна кнопка, главный путь: PDF без диалога — печатный HTML во временный
+/// файл $APPDATA (имя с Date.now(): параллельных экспортов нет, но след от
+/// упавшего не мешает следующему), скрытая печать print_html_to_pdf (Rust,
+/// WebView2 PrintToPdf: A4 портрет, поля 12 мм — умолчания команды), результат
+/// «<книга> — перевод.pdf» в «Загрузках», при коллизии — « (2)», « (3)», …
+/// Временный HTML удаляется в finally при любом исходе. onProgress покрывает
+/// сборку кропов (долгая фаза); сама печать прогресса не даёт — вызывающий
+/// держит на это время спиннер. "none" — нет ни одной готовой страницы.
+export async function exportTranslationPdf(
+  bookPath: string,
+  title: string,
+  onProgress?: (done: number, total: number) => void,
+): Promise<{ path: string } | "none"> {
+  const store = await loadBookTranslation(bookPath);
+  if (!store || store.donePages.length === 0) return "none";
+  const html = await buildPrintHtml(store, title, bookPath, onProgress);
+  const tmp = `${await appDataDir()}\\pdf-export-${Date.now()}.html`;
+  await writeFile(tmp, new TextEncoder().encode(html));
+  try {
+    const dir = await downloadDir();
+    const base = `${dir}\\${safeName(title)} — перевод`;
+    let target = `${base}.pdf`;
+    for (let i = 2; await stat(target).then(() => true, () => false); i++) target = `${base} (${i}).pdf`;
+    await invoke("print_html_to_pdf", { htmlPath: tmp, pdfPath: target });
+    return { path: target };
+  } finally {
+    await remove(tmp).catch(() => {});
+  }
+}
+
+/// TXT — третий путь (Настройки), прежний системный диалог сохранения.
 /// "none" — для книги нет ни одной готовой страницы (кнопка и так скрыта).
 export async function exportTranslationTxt(bookPath: string, title: string): Promise<"saved" | "cancelled" | "none"> {
   const store = await loadBookTranslation(bookPath);

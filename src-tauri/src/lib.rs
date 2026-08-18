@@ -4,7 +4,7 @@ use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -1138,6 +1138,231 @@ fn delete_model(
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// PDF export: print a local HTML file to PDF through WebView2's PrintToPdf.
+//
+// Flow: a hidden WebviewWindow navigates to file://<html_path>; once the page
+// (including its data-URI images) fires the load event, PrintToPdf renders it
+// to <pdf_path> silently — no print dialog, no visible window. The command
+// resolves when the COM completion handler reports the outcome.
+//
+// Threading: WebView2 is single-threaded (STA on the app's main/UI thread).
+// The command runs async on the tokio pool, so the main thread stays free to
+// pump Windows messages — that pump is exactly what delivers both the
+// with_webview closure and the PrintToPdf completion callback. We therefore
+// do NOT need webview2_com::wait_with_pump (that is for apps whose UI thread
+// blocks before an event loop exists); plain mpsc channels + recv_timeout on
+// a blocking-pool thread are enough and cannot deadlock the UI.
+//
+// Teardown: the hidden window is destroyed on every exit path (success,
+// setup error, COM error, timeout) — `drive_print` is the only thing between
+// window creation and the unconditional destroy() below it. If a timeout
+// fires while PrintToPdf is still running, destroying the window tears down
+// the WebView2 controller, which cancels the print job; a completion callback
+// that races the teardown sends into a dropped Receiver and is ignored.
+
+/// JS contract: invoke("print_html_to_pdf", { htmlPath, pdfPath,
+///   pageWidthMm?, pageHeightMm?, marginMm? })
+/// Defaults: A4 portrait (210×297 mm), 12 mm margins on all sides, scale 1.0,
+/// backgrounds printed, no browser headers/footers. Both paths must be
+/// absolute; the output directory is created if missing.
+#[cfg(windows)]
+#[tauri::command]
+async fn print_html_to_pdf(
+    app: tauri::AppHandle,
+    html_path: String,
+    pdf_path: String,
+    page_width_mm: Option<f64>,
+    page_height_mm: Option<f64>,
+    margin_mm: Option<f64>,
+) -> Result<(), String> {
+    let html = PathBuf::from(&html_path);
+    if !html.is_file() {
+        return Err(format!("html file not found: {html_path}"));
+    }
+    let url = tauri::Url::from_file_path(&html)
+        .map_err(|_| format!("cannot build a file:// url from {html_path} (must be absolute)"))?;
+    if !Path::new(&pdf_path).is_absolute() {
+        return Err("pdf_path must be absolute".into());
+    }
+    if let Some(parent) = Path::new(&pdf_path).parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent).map_err(|e| format!("cannot create output dir: {e}"))?;
+        }
+    }
+
+    const MM_PER_INCH: f64 = 25.4;
+    let page_w_in = page_width_mm.unwrap_or(210.0) / MM_PER_INCH;
+    let page_h_in = page_height_mm.unwrap_or(297.0) / MM_PER_INCH;
+    let margin_in = margin_mm.unwrap_or(12.0) / MM_PER_INCH;
+
+    // Unique label per call: a lagging teardown of a previous export can never
+    // collide with (and thus fail) the next one.
+    static PRINT_SEQ: AtomicU64 = AtomicU64::new(0);
+    let label = format!("pdf-print-{}", PRINT_SEQ.fetch_add(1, Ordering::Relaxed));
+
+    let (load_tx, load_rx) = std::sync::mpsc::channel::<()>();
+    let window = tauri::WebviewWindowBuilder::new(&app, &label, tauri::WebviewUrl::External(url))
+        .title("Экспорт в PDF")
+        .visible(false)
+        .focused(false)
+        .skip_taskbar(true)
+        .inner_size(900.0, 1200.0)
+        .on_page_load(move |_win, payload| {
+            // Finished == wry's NavigationCompleted == the document's load
+            // event, which waits for <img> decoding incl. data: URIs.
+            if matches!(payload.event(), tauri::webview::PageLoadEvent::Finished) {
+                let _ = load_tx.send(());
+            }
+        })
+        .build()
+        .map_err(|e| format!("failed to create hidden print window: {e}"))?;
+
+    // From here the hidden window exists: whatever happens, destroy it.
+    let result = drive_print(&window, &pdf_path, page_w_in, page_h_in, margin_in, load_rx).await;
+    let _ = window.destroy();
+    result
+}
+
+#[cfg(not(windows))]
+#[tauri::command]
+async fn print_html_to_pdf(
+    _app: tauri::AppHandle,
+    _html_path: String,
+    _pdf_path: String,
+    _page_width_mm: Option<f64>,
+    _page_height_mm: Option<f64>,
+    _margin_mm: Option<f64>,
+) -> Result<(), String> {
+    Err("PDF export via WebView2 is only available on Windows".into())
+}
+
+/// Everything between window creation and teardown, so the caller can
+/// unconditionally destroy() no matter where this errors out.
+#[cfg(windows)]
+async fn drive_print(
+    window: &tauri::WebviewWindow,
+    pdf_path: &str,
+    page_w_in: f64,
+    page_h_in: f64,
+    margin_in: f64,
+    load_rx: std::sync::mpsc::Receiver<()>,
+) -> Result<(), String> {
+    // Big books arrive as one HTML file with many MB of data-URI images;
+    // parsing + decoding can be slow, hence the generous load budget.
+    recv_off_thread(load_rx, 120, "page load in the hidden print window").await?;
+
+    let (done_tx, done_rx) = std::sync::mpsc::channel::<Result<(), String>>();
+    let pdf = pdf_path.to_string();
+    window
+        .with_webview(move |wv| {
+            // Runs on the UI thread. Synchronous COM failures are reported
+            // through the same channel the completion handler uses.
+            if let Err(e) =
+                start_print_to_pdf(&wv, &pdf, page_w_in, page_h_in, margin_in, done_tx.clone())
+            {
+                let _ = done_tx.send(Err(e));
+            }
+        })
+        .map_err(|e| format!("with_webview: {e}"))?;
+
+    recv_off_thread(done_rx, 600, "PrintToPdf completion").await??;
+
+    if !Path::new(pdf_path).is_file() {
+        return Err("PrintToPdf reported success but no file appeared".into());
+    }
+    Ok(())
+}
+
+/// Wait for a channel message on the blocking pool so neither the async
+/// runtime nor the main thread stalls — the main thread must keep pumping
+/// Windows messages, because that is what delivers WebView2's callbacks.
+#[cfg(windows)]
+async fn recv_off_thread<T: Send + 'static>(
+    rx: std::sync::mpsc::Receiver<T>,
+    secs: u64,
+    what: &'static str,
+) -> Result<T, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        rx.recv_timeout(Duration::from_secs(secs)).map_err(|e| match e {
+            std::sync::mpsc::RecvTimeoutError::Timeout => {
+                format!("timeout ({secs}s) waiting for {what}")
+            }
+            std::sync::mpsc::RecvTimeoutError::Disconnected => {
+                format!("hidden print window died while waiting for {what}")
+            }
+        })
+    })
+    .await
+    .map_err(|e| format!("blocking task join: {e}"))?
+}
+
+/// UI-thread half: configure ICoreWebView2PrintSettings and kick off
+/// PrintToPdf. The completion handler (invoked later, also on the UI thread,
+/// via the app's normal message loop) reports the outcome through `done`.
+#[cfg(windows)]
+fn start_print_to_pdf(
+    wv: &tauri::webview::PlatformWebview,
+    pdf_path: &str,
+    page_w_in: f64,
+    page_h_in: f64,
+    margin_in: f64,
+    done: std::sync::mpsc::Sender<Result<(), String>>,
+) -> Result<(), String> {
+    use webview2_com::Microsoft::Web::WebView2::Win32::{
+        ICoreWebView2Environment6, ICoreWebView2_7, COREWEBVIEW2_PRINT_ORIENTATION_PORTRAIT,
+    };
+    use webview2_com::PrintToPdfCompletedHandler;
+    use windows_core::{Interface, PCWSTR};
+
+    let core = unsafe { wv.controller().CoreWebView2() }.map_err(|e| format!("CoreWebView2: {e}"))?;
+    let wv7: ICoreWebView2_7 = core
+        .cast()
+        .map_err(|e| format!("WebView2 runtime too old for PrintToPdf (needs ICoreWebView2_7): {e}"))?;
+    let env6: ICoreWebView2Environment6 = wv
+        .environment()
+        .cast()
+        .map_err(|e| format!("WebView2 runtime too old (needs ICoreWebView2Environment6): {e}"))?;
+
+    let settings =
+        unsafe { env6.CreatePrintSettings() }.map_err(|e| format!("CreatePrintSettings: {e}"))?;
+    unsafe {
+        settings
+            .SetOrientation(COREWEBVIEW2_PRINT_ORIENTATION_PORTRAIT)
+            .and_then(|_| settings.SetScaleFactor(1.0))
+            .and_then(|_| settings.SetPageWidth(page_w_in))
+            .and_then(|_| settings.SetPageHeight(page_h_in))
+            .and_then(|_| settings.SetMarginTop(margin_in))
+            .and_then(|_| settings.SetMarginBottom(margin_in))
+            .and_then(|_| settings.SetMarginLeft(margin_in))
+            .and_then(|_| settings.SetMarginRight(margin_in))
+            .and_then(|_| settings.SetShouldPrintBackgrounds(true))
+            .and_then(|_| settings.SetShouldPrintSelectionOnly(false))
+            .and_then(|_| settings.SetShouldPrintHeaderAndFooter(false))
+            .map_err(|e| format!("print settings: {e}"))?;
+    }
+
+    let handler = PrintToPdfCompletedHandler::create(Box::new(
+        move |result: windows_core::Result<()>, is_success: bool| {
+            let outcome = match result {
+                Err(e) => Err(format!("PrintToPdf failed: {e}")),
+                Ok(()) if !is_success => Err(
+                    "PrintToPdf reported failure (target file locked, or path invalid?)".into(),
+                ),
+                Ok(()) => Ok(()),
+            };
+            let _ = done.send(outcome);
+            Ok(())
+        },
+    ));
+
+    // UTF-16 buffer only needs to outlive the synchronous call below:
+    // WebView2 copies the string before PrintToPdf returns.
+    let path_w: Vec<u16> = pdf_path.encode_utf16().chain(std::iter::once(0)).collect();
+    unsafe { wv7.PrintToPdf(PCWSTR::from_raw(path_w.as_ptr()), &settings, &handler) }
+        .map_err(|e| format!("PrintToPdf call: {e}"))
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -1159,7 +1384,8 @@ pub fn run() {
             model_download_status,
             delete_model,
             ask_claude,
-            ask_claude_cancel
+            ask_claude_cancel,
+            print_html_to_pdf
         ])
         .setup(|app| {
             let handle = app.handle().clone();
