@@ -443,6 +443,94 @@ function drawCrops(off: HTMLCanvasElement, win: CropWindow, crops: Crop[], dpr: 
   }
 }
 
+// ---- translated outline -----------------------------------------------------
+// doc.getOutline() speaks the BOOK's language. In translation mode the page
+// under it is reflowed Russian, so an English navigator is the one surface that
+// never switched over («навигация все равно оригинала»). Each outline row
+// already resolves to a page; that page's stored paragraphs hold both the
+// original heading text and its translation, so the row can be matched by TEXT
+// and relabelled.
+//
+// Matching is a Sørensen–Dice coefficient over character bigrams of the
+// normalized strings — robust to the page number the engine sometimes welds
+// onto a heading («1.4 Content Organization 5»), to hyphenation, and to
+// punctuation the outline and the page disagree about.
+const OUT_MATCH = 0.75;
+// Chapter openers set their title in display type that wraps, and the clusterer
+// keeps each line as its own paragraph, so «2 Neural Information Retrieval»
+// lives on the page as «Neural Information» + «Retrieval». Runs of consecutive
+// same-size heading paragraphs are therefore offered as joined candidates too.
+const OUT_RUN = 3; // paragraphs per run, at most
+const OUT_HEAD_RATIO = 1.15; // fh/bodyFh over which a paragraph may start a run
+const OUT_FH_TOL = 0.06; // same-size tolerance inside a run
+
+// Calibrated on the user's book (838 pages, 548 outline rows, 4 514 stored
+// translations): 527 rows relabel (96.2%), 21 fall back. The fallbacks are
+// honest ones — 18 run-in headings that are not standalone paragraphs at all
+// («Distinctness», «Step 4: Ranking» — the bold lead-in of a body paragraph),
+// «Bibliography» which lands on a refPage that is deliberately left untranslated,
+// and one title the clusterer truncated. The threshold sits in a real gap: the
+// best wrong match measured 0.718 («What is a knowledge graph» pulled toward the
+// chapter title «Knowledge Graphs» on the same page), the weakest right one 0.800
+// («III VERTICALS» → «ВЕРТИКАЛЫ»).
+const outNorm = (s: string) =>
+  s
+    .toLowerCase()
+    .replace(/[­‐-―−]/g, "-")
+    .replace(/[^\p{L}\p{N}]+/gu, " ")
+    .trim();
+
+function outDice(a: string, b: string): number {
+  if (!a || !b) return 0;
+  if (a === b) return 1;
+  if (a.length < 2 || b.length < 2) return 0;
+  const A = new Map<string, number>();
+  for (let i = 0; i + 1 < a.length; i++) A.set(a.slice(i, i + 2), (A.get(a.slice(i, i + 2)) ?? 0) + 1);
+  let inter = 0;
+  for (let i = 0; i + 1 < b.length; i++) {
+    const g = b.slice(i, i + 2);
+    const v = A.get(g);
+    if (v) {
+      inter++;
+      A.set(g, v - 1);
+    }
+  }
+  return (2 * inter) / (a.length - 1 + b.length - 1);
+}
+
+/** Translation of the heading `title` names on `paras`, or null when unsure. */
+function matchHeadingTr(paras: TrParagraph[] | undefined, bodyFh: number, title: string): string | null {
+  if (!paras?.length) return null;
+  const want = outNorm(title);
+  if (!want) return null;
+  let best = 0;
+  let bestTr: string | null = null;
+  const usable = (p: TrParagraph | undefined) => !!p && p.kind === "prose" && !p.contOf && !!p.tr;
+  const take = (text: string, tr: string) => {
+    const s = outDice(want, outNorm(text));
+    if (s > best) {
+      best = s;
+      bestTr = tr;
+    }
+  };
+  for (let i = 0; i < paras.length; i++) {
+    const p = paras[i];
+    if (!usable(p)) continue;
+    take(p.text, p.tr);
+    if (!(bodyFh > 0 && p.fh >= OUT_HEAD_RATIO * bodyFh)) continue;
+    let text = p.text;
+    let tr = p.tr;
+    for (let j = i + 1; j < Math.min(paras.length, i + OUT_RUN); j++) {
+      const q = paras[j];
+      if (!usable(q) || Math.abs(q.fh - p.fh) > OUT_FH_TOL * p.fh) break;
+      text += ` ${q.text}`;
+      tr += ` ${q.tr}`;
+      take(text, tr);
+    }
+  }
+  return best >= OUT_MATCH ? bestTr : null;
+}
+
 function Page({
   doc,
   num,
@@ -947,6 +1035,19 @@ export default function App() {
   // refPages is a short sorted list (a handful of bibliography pages) —
   // linear includes() per Page render is fine
   const isRefPage = useCallback((n: number) => trStoreRef.current?.refPages.includes(n) ?? false, []);
+
+  // Outline row → its translated heading (matchHeadingTr), only in translation
+  // mode. Identity changes with trVersion so a navigator left open while the
+  // engine runs picks up headings as their pages land.
+  const trOutlineTitle = useCallback(
+    (page: number, title: string) => {
+      if (viewMode !== "tr") return null;
+      const st = trStoreRef.current;
+      return st ? matchHeadingTr(st.pages[page], st.bodyFh, title) : null;
+    },
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [viewMode, trVersion],
+  );
 
   // selection mini-toolbar: after a pointerup that leaves a non-empty selection
   // inside a text layer, show «Перевести» near the selection end — or, when the
@@ -2281,6 +2382,7 @@ export default function App() {
               {navOpen && (
                 <Outline
                   doc={doc}
+                  trTitle={trOutlineTitle}
                   onJump={(p, frac) => {
                     setNavOpen(false);
                     goToPage(p, frac);

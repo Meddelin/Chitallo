@@ -46,7 +46,10 @@ type OutlineItem = {
 };
 
 // one flattened outline row; `page` fills in asynchronously (dest resolution
-// runs in the background after the tree is already on screen)
+// runs in the background after the tree is already on screen), and `tr` with
+// it — the translated heading is found by matching the row's title against the
+// paragraphs stored for the page it resolves to, so it cannot be known before
+// the destination is
 type Row = {
   id: number;
   depth: number;
@@ -55,6 +58,7 @@ type Row = {
   dest: unknown;
   url: string | null;
   page?: number;
+  tr?: string;
 };
 
 const ROW =
@@ -64,10 +68,15 @@ export default function Outline({
   doc,
   onJump,
   onClose,
+  trTitle,
 }: {
   doc: PDFDocumentProxy;
   onJump: (page: number, frac: number) => void;
   onClose: () => void;
+  // translation mode only: the row's heading as the reflowed page prints it, or
+  // null when the match isn't confident (App.tsx matchHeadingTr). Reading a
+  // book in Russian and navigating it in English was the mismatch this closes.
+  trTitle?: (page: number, title: string) => string | null;
 }) {
   const [rows, setRows] = useState<Row[] | null>(null); // null while getOutline runs
   const [input, setInput] = useState("");
@@ -104,7 +113,10 @@ export default function Outline({
         if (flat[i].dest) {
           const t = await resolveDest(doc, flat[i].dest);
           if (stale) return;
-          if (t) flat[i].page = t.page;
+          if (t) {
+            flat[i].page = t.page;
+            flat[i].tr = trTitle?.(t.page, flat[i].title) ?? undefined;
+          }
         }
         if (i % 16 === 15) setRows([...flat]);
       }
@@ -113,7 +125,7 @@ export default function Outline({
     return () => {
       stale = true;
     };
-  }, [doc]);
+  }, [doc, trTitle]);
 
   const submit = () => {
     const n = parseInt(input, 10);
@@ -160,14 +172,17 @@ export default function Outline({
             <div className="px-2.5 py-1.5 text-neutral-500 dark:text-neutral-400 cursor-default">В книге нет оглавления</div>
           ) : (
             rows.map((r) => (
-              <button key={r.id} className={ROW} onClick={() => activate(r)} title={r.title}>
+              // the row prints the translated heading when there is one; the
+              // tooltip keeps the original underneath it, so a row is always
+              // traceable back to the printed book
+              <button key={r.id} className={ROW} onClick={() => activate(r)} title={r.tr ? `${r.tr}\n${r.title}` : r.title}>
                 <span
                   className={`flex-1 min-w-0 truncate ${r.bold ? "font-medium" : ""} ${
                     r.depth ? "text-neutral-600 dark:text-neutral-300" : ""
                   }`}
                   style={r.depth ? { paddingLeft: r.depth * 14 } : undefined}
                 >
-                  {r.title}
+                  {r.tr ?? r.title}
                 </span>
                 {r.page !== undefined && (
                   <span className="shrink-0 tabular-nums text-xs text-neutral-500 dark:text-neutral-400">{r.page}</span>
