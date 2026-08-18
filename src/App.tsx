@@ -1702,6 +1702,17 @@ export default function App() {
   const trPct = trInfo ? Math.floor((100 * trInfo.done) / Math.max(1, trInfo.total)) : 0;
   // active background run for the OPEN book (mirrored from the manager)
   const trRun = run !== null;
+  // run-based percent: an update sweeps a 100%-done store, so donePages-based
+  // trPct is a motionless 100% for its whole duration («прогресс-бар
+  // потерялся») — the band must mirror the RUN's swept pages instead
+  const runPct = run && run.total > 0 ? Math.floor((100 * run.done) / run.total) : 0;
+  const bandPct = run?.update ? runPct : trPct;
+  // interrupted update watermark (store.updatedThrough mid-update): the idle
+  // menu row resumes from here — surface the percentage so the click's effect
+  // is legible before AND after the run
+  const updPct = trInfo && (trStoreRef.current?.updatedThrough ?? 0) > 0
+    ? Math.floor((100 * (trStoreRef.current?.updatedThrough ?? 0)) / Math.max(1, trInfo.total))
+    : 0;
 
   // Ctrl+K commands — every action already in the UI, one name each, with its
   // key as the hint (the palette doubles as the cheat-sheet). Built only while
@@ -1801,12 +1812,15 @@ export default function App() {
         style={{ left: doc && askOpen ? `calc(50% - ${ASK_W / 2}px)` : "50%" }}
       >
         {/* run progress — 2px band along the pill's bottom edge; the trigger
-            label stays constant so the pill never resizes mid-run (WP-H) */}
+            label stays constant so the pill never resizes mid-run (WP-H).
+            bandPct, not trPct: an update run's store is already 100% done */}
         {doc && trRun && trInfo && (
           <span aria-hidden className="pointer-events-none absolute inset-0 overflow-hidden rounded-full">
             <span
               className="absolute bottom-0 left-0 h-0.5 bg-accent transition-[width] duration-300"
-              style={{ width: `${trPct}%` }}
+              // 2% floor: a run at 0 swept pages must still show a living
+              // sliver — a 0-width band is «клик ничего не сделал»
+              style={{ width: `${Math.max(2, bandPct)}%` }}
             />
           </span>
         )}
@@ -1957,17 +1971,19 @@ export default function App() {
                     )}
                     {/* «Обновить перевод»: инкрементальная пересборка готового
                         перевода текущим движком — недеструктивная пара к
-                        «Перевести заново», скрыта пока идёт любой ран */}
+                        «Перевести заново», скрыта пока идёт любой ран.
+                        Прерванное обновление (watermark updatedThrough) видно
+                        прямо в подписи — клик продолжит с этого места */}
                     {trInfo !== null && !trRun && (
                       <button
-                        className={MENU_ROW}
+                        className={`${MENU_ROW}${updPct > 0 ? " tabular-nums" : ""}`}
                         onClick={() => {
                           setMenuOpen(false);
                           startTr(true);
                         }}
                         title="Пересобрать структуру страниц и доперевести только изменившееся"
                       >
-                        Обновить перевод
+                        {updPct > 0 ? `Продолжить обновление · ${updPct}%` : "Обновить перевод"}
                       </button>
                     )}
                     {/* деструктивное подтверждение (#11): следствие + кнопка,

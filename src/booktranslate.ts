@@ -772,11 +772,21 @@ function launchRun(bookPath: string, update: boolean, pageLimit?: number): Promi
   const ctrl = new AbortController();
   const info: RunInfo = { bookPath, done: 0, total: 0, stalled: false, update };
   const promise = (async () => {
+    // resumed runs show their real percentage BEFORE the (slow) doc open: the
+    // toolbar band must move within the click's first beat, not after a 38MB
+    // file read — completed pages for translation, the watermark for an update.
+    // Best-effort: a moved book resolves its store only after bindBook inside
+    // openRunDoc — the post-open seeding below covers that case.
+    const st0 = await loadBookTranslation(bookPath).catch(() => null);
+    if (st0) {
+      info.done = update ? st0.updatedThrough ?? 0 : st0.donePages.length;
+      info.total = st0.total;
+      emitRuns();
+    }
     const doc = await openRunDoc(bookPath); // open failure surfaces to the caller
     try {
       info.total = doc.numPages;
-      // resumed runs show their real percentage before the first new page
-      // lands: completed pages for translation, the watermark for an update
+      // re-seed after binding: the pre-open read misses a just-moved book's store
       const st = await loadBookTranslation(bookPath);
       if (st) info.done = update ? st.updatedThrough ?? 0 : st.donePages.length;
       emitRuns();
