@@ -168,10 +168,44 @@ export function parseGlossary(text: string): GlossaryEntry[] {
   return out;
 }
 
-// only entries whose source term actually occurs in the text (case-insensitive)
+// Entries whose source term actually occurs in the text — as a WORD, not as a
+// substring. A raw `includes` test made the two-letter term «Li» (an author
+// surname the generator mistook for a term) match inside applications,
+// quality, online, click, literature… so `Li 翻译成 инвертированные списки` was
+// prepended as an authoritative instruction to 48% of the book's prompts, and
+// the model duly wrote «инвертированные списки» over «BOW encodings»,
+// «embeddings», a variable name, and once looped on it until the paragraph
+// dissolved. Boundaries are letter/digit-class transitions on both sides, so
+// acronyms («IR», «QAC») still match while their letters inside longer words
+// no longer do; terms are anchored at the edges only where the term itself
+// starts/ends with a word character, which keeps entries like «F1-score» or
+// «(MRR)» matching.
+const WORD_CH = /[\p{L}\p{N}_]/u;
+const RX_ESC = /[.*+?^${}()|[\]\\]/g;
+
+function termMatcher(src: string): RegExp {
+  const body = src.replace(RX_ESC, "\\$&");
+  const head = WORD_CH.test(src[0]) ? "(?<![\\p{L}\\p{N}_])" : "";
+  const tail = WORD_CH.test(src[src.length - 1]) ? "(?![\\p{L}\\p{N}_])" : "";
+  return new RegExp(head + body + tail, "iu");
+}
+
+const matcherCache = new Map<string, RegExp | null>();
+
 function matched(text: string, glossary: GlossaryEntry[]): GlossaryEntry[] {
-  const lower = text.toLowerCase();
-  return glossary.filter((g) => g.src && lower.includes(g.src.toLowerCase()));
+  return glossary.filter((g) => {
+    if (!g.src) return false;
+    let rx = matcherCache.get(g.src);
+    if (rx === undefined) {
+      try {
+        rx = termMatcher(g.src);
+      } catch {
+        rx = null; // unbuildable term (lone combining mark, etc.) — never matches
+      }
+      matcherCache.set(g.src, rx);
+    }
+    return rx ? rx.test(text) : false;
+  });
 }
 
 export function buildPrompt(text: string, glossary: GlossaryEntry[], context?: string): string {
@@ -196,8 +230,12 @@ const SAMPLING = { temperature: 0.7, top_k: 20, top_p: 0.6, repeat_penalty: 1.05
 // interactive popover, batch book translation, glossary fallback. Combined
 // in-flight stays ≤3 against n_slots=4, so the server always has a spare slot
 // and two pipelines running at once cannot stack their per-module worker pools
-// into 6 concurrent requests. The aux terminologist (11545) gets its OWN
-// separate ≤3 budget — its requests never eat into the translator's slots.
+// into 6 concurrent requests. The slot count is the llama-server default and
+// its unified KV gives every slot the full context — verified from the server's
+// own startup line for the spawn in lib.rs ("n_slots = 4, n_ctx_slot = 4096,
+// kv_unified = true"), so concurrency here costs no context per request. The
+// aux terminologist (11545) gets its OWN separate ≤3 budget — its requests
+// never eat into the translator's slots.
 
 function makeLimiter(max: number) {
   let inflight = 0;

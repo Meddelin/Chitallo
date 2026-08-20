@@ -124,10 +124,29 @@ export function buildFrags(words: Word[]): Frag[] {
   return frags;
 }
 
-// median fragment height ≈ line height, the unit for every threshold below
+// Median fragment height ≈ line height, the unit for every threshold below.
+// WEIGHTED BY FRAGMENT WIDTH, and that weighting is load-bearing: a plain
+// median counts a 20pt diagram label the same as a 359pt line of body text, so
+// a page whose diagram carries more labels than the page carries body lines
+// median-votes itself down to the label size. growParagraph merges lines only
+// while their top-to-top gap stays under 1.6×lineH, and a book set at 9.96pt
+// glyphs with 13.9pt leading needs lineH ≥ 8.69 — barely 13% of headroom. On
+// the test book the plain median collapsed to 7.2–8.5 on 13 pages and EVERY
+// body line there became its own one-line "paragraph", each translated
+// standalone into a mangled sentence (a line ending in "quality fac-" came
+// back as «Торсы»). Width-weighting moves lineH on 19 of 820 pages, always up
+// and always to the true body height; furniture detection over the whole book
+// is bit-identical before and after.
 export function medianLineH(frags: Frag[]): number {
-  const hs = frags.map((f) => f.bottom - f.top).sort((a, b) => a - b);
-  return hs[hs.length >> 1] || 12;
+  const items = frags.map((f) => ({ h: f.bottom - f.top, w: Math.max(1, f.right - f.left) })).sort((a, b) => a.h - b.h);
+  let total = 0;
+  for (const it of items) total += it.w;
+  let acc = 0;
+  for (const it of items) {
+    acc += it.w;
+    if (acc * 2 >= total) return it.h || 12;
+  }
+  return 12;
 }
 
 const overlaps = (a: Frag, b: Frag) => a.left < b.right && b.left < a.right;
@@ -178,12 +197,21 @@ export function growParagraph(frags: Frag[], home: Frag, lineH: number, claimed?
   const endsShort = (f: Frag) => colRight - f.right > 0.5 * lineH;
   const indent = (a: Frag, b: Frag) => a.left - b.left > 0.9 * lineH;
 
+  // The merge gap scales with the LINES' OWN size, not only the page's body
+  // unit: leading is proportional to type size, so a chapter title set at 29pt
+  // over two lines sits 32pt apart on a page whose lineH is 10, and used to be
+  // split in half — «Neural Information» and «Retrieval» went to the model as
+  // two separate "paragraphs" and came back as two unrelated Russian phrases.
+  // Body text is unaffected (its own height IS the page unit), and a
+  // title-over-body pair is still separated by the size cliff below.
+  const gate = (a: Frag, b: Frag) => 1.6 * Math.max(lineH, fhOf(a), fhOf(b));
+
   const para = [home];
   for (let cur = home; ; ) {
     let best: Frag | null = null;
     for (const f of frags)
       if (f.top < cur.top - 1 && overlaps(f, cur) && (!best || f.top > best.top)) best = f;
-    if (!best || claimed?.has(best) || cur.top - best.top >= 1.6 * lineH) break;
+    if (!best || claimed?.has(best) || cur.top - best.top >= gate(cur, best)) break;
     if (fhCliff(cur, best, lineH)) break; // heading/body size cliff
     if (indent(cur, best) && endsShort(best)) break; // cur is a paragraph's indented first line
     para.unshift(best);
@@ -193,7 +221,7 @@ export function growParagraph(frags: Frag[], home: Frag, lineH: number, claimed?
     let best: Frag | null = null;
     for (const f of frags)
       if (f.top > cur.top + 1 && overlaps(f, cur) && (!best || f.top < best.top)) best = f;
-    if (!best || claimed?.has(best) || best.top - cur.top >= 1.6 * lineH) break;
+    if (!best || claimed?.has(best) || best.top - cur.top >= gate(cur, best)) break;
     if (fhCliff(cur, best, lineH)) break; // heading/body size cliff
     if (indent(best, cur) && endsShort(cur)) break; // next line starts a new paragraph
     para.push(best);
@@ -213,8 +241,15 @@ export function growParagraph(frags: Frag[], home: Frag, lineH: number, claimed?
 // rule fails), subscripts sit BELOW the baseline (the raise test fails), and
 // display math is kind:"other" whose text never renders. Numeric-citation
 // superscripts (other books' "…retrieval12") are dropped too — same rationale.
+// A closing bracket or quote counts as part of the word the marker is glued
+// to: the marker after «(ELEVATE)» or after a closing quotation mark used to
+// fail the tail test and flowed into the body as a bare digit, which the model
+// then read as part of the word («Википедии2», «ELEVATE3)») or turned into an
+// invented citation. Two letters suffice before a closer — math never puts one
+// there («O(n2)», «(a+b)2» have a single variable or digit before the bracket,
+// so the digit is still kept).
 const SUP_DIGITS = /^\d{1,2}$/;
-const SUP_TAIL = /(?:[A-Za-zÀ-ÖØ-öø-ÿА-Яа-яЁё]{3}|[.,;:!?])$/;
+const SUP_TAIL = /(?:[A-Za-zÀ-ÖØ-öø-ÿА-Яа-яЁё]{3}|[.,;:!?])["'”’)\]]?$|[A-Za-zÀ-ÖØ-öø-ÿА-Яа-яЁё]{2}["'”’)\]]$/;
 
 // one fragment's text: words left→right, a space where rects show a word gap
 // (whitespace-only words are filtered before clustering). Exported because the
@@ -278,9 +313,11 @@ export function paraText(para: Frag[], lineH: number, keepHyphen?: HyphenDecider
 // primes, and the Mathematical Alphanumeric Symbols block (𝑞, 𝒅 — how many
 // PDFs encode italic math variables)
 const MATH_SYM =
-  /[=+±×÷∗⋅√∞∫∮∑∏∂∇≈≃≅≠≤≥≪≫≡∼∝∈∉∋⊂⊆⊃⊇∪∩∧∨¬∀∃∅⊕⊗⊤⊥⟨⟩⌊⌋⌈⌉‖∣′″]|[Ͱ-Ͽ℀-⅏←-⇿]|[\u{1d400}-\u{1d7ff}]/gu;
+  /[=+±×÷∗⋅√∞∫∮∑∏∂∇≈≃≅≠≤≥≪≫≡∼∝∈∉∋⊂⊆⊃⊇∪∩∧∨¬∀∃∅⊕⊗⊤⊥⟨⟩⌊⌋⌈⌉‖∣′″]|[Ͱ-Ͽ℀-⅏←-⇿]|[\u{239b}-\u{23ad}]|[\u{1d400}-\u{1d7ff}]/gu;
 
 export type ParaMetrics = {
+  codeShaped: boolean; // a query/code listing — see isCodeShaped
+  idRatio: number; // tokens that are catalogue identifiers — ISBN/ISSN/DOI/URL — see ID_TOK
   wordRatio: number; // tokens containing a ≥2-letter run / all tokens — prose ≈ 0.8–1
   pureWordRatio: number; // tokens that are plain words after stripping edge punctuation —
   // separates real sentences from formulas built of function names (softmax([zFalse,…)
@@ -300,6 +337,45 @@ const STOP = new Set(
     "where when while than then and such each per into over under between can may should must also " +
     "и в на с по для как что это из не к о от при").split(" "),
 );
+
+// A query/code listing. It has to be recognised BEFORE the stop-word sentence
+// override in classifyMetrics: a SPARQL block is full of English-looking
+// keywords ("where", "as", "by"), clears the stop-word bar, and is called
+// prose — which sends it to the translator instead of the crop pipeline, so
+// the reader gets `?astronaut` → `?астронавт`, `OPTIONAL` → `ОПЦИОНАЛЬНО`,
+// and no original anywhere on the page to fall back to. Three independent
+// signals, any one of which a real sentence never shows: an opening keyword in
+// caps at token 0, a real share of ?/$-prefixed variable tokens, or SPARQL
+// brace plumbing around at least one such variable.
+// An opening keyword, or pure plumbing at token 0 — prose never starts with a
+// closing brace, an @directive or a property map.
+const CODE_OPEN =
+  /^(?:SELECT|PREFIX|ASK|CONSTRUCT|DESCRIBE|INSERT|DELETE|UPDATE|MATCH|RETURN|WHERE|FILTER|OPTIONAL)\b|^[@}\]]|^\{/;
+// A token only source code produces: a ?/$ variable, a lone or leading comment
+// mark, a prefixed name (wd:Q873, rdfs:label, ps:P166), or an angle IRI. The
+// part AFTER the colon is required, so prose colons ("Note:", "Section 4.2:")
+// never match.
+const CODE_TOK =
+  /^(?:[?$][A-Za-z_]|#$|#[A-Za-z(]|@[a-z]|<[^<>\s]*>$|[A-Za-z][\w-]{0,12}:(?:[A-Za-z_][\w-]*|\d[\w-]*)$)/;
+const CODE_SHARE = 0.2; // code tokens / all tokens
+// Catalogue identifiers: a grouped number (ISBN 979-8-4007-1050-6, ISSN
+// 2374-6769, DOI 10.1145/3674127.3674137) or a bare host/URL. A copyright page
+// is mostly these, and translating it produced fragments with nothing to
+// translate; the reader wants the printed original of that page anyway.
+const ID_TOK = /^(?:https?:\/\/\S+|[\w-]+\.(?:org|com|net|edu|io|acm|gov)(?:\/\S*)?|\d[\d.\-/]{5,})$/i;
+const ID_SHARE = 0.25;
+const CODE_MAP = /\{[^}]*:\s*"/; // Cypher/JSON property map
+const CODE_LANGTAG = /"@[a-z]{2}(?:-[A-Za-z]+)?\b/; // RDF language-tagged literal
+
+function isCodeShaped(t: string, tokens: readonly string[]): boolean {
+  if (CODE_OPEN.test(t) || CODE_MAP.test(t) || CODE_LANGTAG.test(t)) return true;
+  let code = 0;
+  for (const tok of tokens) if (CODE_TOK.test(tok)) code++;
+  // an angle IRI may carry spaces ("<Best Costume Design>"), so it is counted
+  // over the whole string instead of per token
+  const iris = t.match(/<[^<>]{1,40}>/g)?.length ?? 0;
+  return code + iris >= 1 && (code + iris) / tokens.length >= CODE_SHARE;
+}
 
 const LETTER = "A-Za-zÀ-ÖØ-öø-ÿА-Яа-яЁё";
 const WORDISH = new RegExp(`[${LETTER}]{2,}`);
@@ -387,6 +463,8 @@ export function paraMetrics(text: string, words: readonly Word[], fh: number): P
     if (Math.abs(h - fh) > 0.2 * fh) off++;
   }
   return {
+    codeShaped: isCodeShaped(t, tokens),
+    idRatio: tokens.filter((tok) => ID_TOK.test(tok.replace(EDGE_PUNCT, ""))).length / tokens.length,
     wordRatio: wordy / tokens.length,
     pureWordRatio: pure / tokens.length,
     mathDensity: chars.length ? (chars.match(MATH_SYM)?.length ?? 0) / chars.length : 0,
@@ -404,12 +482,15 @@ export function paraMetrics(text: string, words: readonly Word[], fh: number): P
 // console can inspect the same decision the engine made.
 export function classifyMetrics(m: ParaMetrics): ParaKind {
   if (m.wordRatio === 0) return "other"; // no real words: numbers, symbols, glyph shards
+  if (m.codeShaped) return "other"; // query/code listing — cropped, never translated (BEFORE the override below, which it would clear)
+  if (m.idRatio >= ID_SHARE && m.stopCount < 2) return "other"; // catalogue block: ISBN/ISSN/DOI/URL runs on a copyright page
   if (m.stopCount >= 3 && m.wordRatio >= 0.5 && !m.hasEq) return "prose"; // sentence override: math-flavored prose ("…as the new dimension ℓ, that is, ℓ + 1 → ℓ")
   if (m.mathDensity > 0.2) return "other"; // saturated with operators/Greek
   if (m.mathDensity > 0.06 && m.wordRatio < 0.55) return "other"; // formula with a few word-like runs (log, tf)
   if (m.mathDensity > 0.03 && m.hSpread > 0.3 && m.singleRatio > 0.3) return "other"; // sub/superscript-heavy display math
   if (m.pureWordRatio < 0.35 && (m.mathDensity > 0.03 || m.structDensity > 0.05)) return "other"; // function-name equations: f(x) = softmax([…])
-  if (m.hasEq && m.stopCount === 0 && m.pureWordRatio < 0.7) return "other"; // camelCase equations: [pFalse,pTrue] = softmax(…) — sentences always carry function words
+  if (m.hasEq && m.stopCount === 0) return "other"; // equations: [pFalse,pTrue] = softmax(…), «SSError MSError = dfError» — a sentence with an "=" in it always carries function words too
+  if (m.mathDensity > 0.1 && m.stopCount === 0) return "other"; // a piecewise brace's own case labels: «⎧5 if France ⎪⎪4 if Germany»
   if (m.wordRatio < 0.3 && m.singleRatio > 0.4) return "other"; // glyph soup
   return "prose";
 }
@@ -706,9 +787,47 @@ export function itemWords(items: readonly unknown[], viewport: { transform: numb
     const tr = mul(vt, it.transform as number[]);
     const fontH = Math.hypot(tr[2], tr[3]) || 1;
     const w = (typeof it.width === "number" ? it.width : 0) * sc;
-    words.push({ rect: { left: tr[4], top: tr[5] - fontH, right: tr[4] + w, bottom: tr[5] }, text: it.str });
+    // Advance and ascent directions come from the transform, NOT from the axes:
+    // laying the advance along +x and the ascent along −y unconditionally models
+    // a 90°-rotated string (a landscape table, a rotated axis label) as a short
+    // WIDE box, so its words share one `left`, buildFrags bands them apart by y,
+    // and growParagraph welds words from unrelated table columns into one
+    // "paragraph" that classifies as prose and gets translated. The bbox of the
+    // four transformed corners is identical arithmetic for unrotated text
+    // (advance (1,0), ascent (0,−1)) and correct at every other angle.
+    const aLen = Math.hypot(tr[0], tr[1]) || 1;
+    const ax = tr[0] / aLen; // unit advance (reading) direction
+    const ay = tr[1] / aLen;
+    const ux = ay; // unit ascent: the advance rotated −90° in device space
+    const uy = -ax;
+    const x0 = tr[4];
+    const y0 = tr[5]; // baseline origin
+    const xs = [x0, x0 + ax * w, x0 + ux * fontH, x0 + ax * w + ux * fontH];
+    const ys = [y0, y0 + ay * w, y0 + uy * fontH, y0 + ay * w + uy * fontH];
+    const rect = { left: Math.min(...xs), top: Math.min(...ys), right: Math.max(...xs), bottom: Math.max(...ys) };
+    words.push({ rect, text: it.str });
   }
   return words;
+}
+
+// Share of a page's text items set at an angle. A landscape table page is
+// majority-rotated; a chart with one rotated axis label is not. The engine
+// gates whole pages on this (see booktranslate's isRotatedPage): a mostly
+// rotated page has no reflowable measure at all, and every attempt to cluster
+// it yields cell shards the model expands into invented sentences — the only
+// honest rendering is the original page.
+export function rotatedItemShare(items: readonly unknown[], viewport: { transform: number[] }): number {
+  const vt = viewport.transform;
+  let n = 0;
+  let rot = 0;
+  for (const raw of items) {
+    const it = raw as PdfTextItem;
+    if (typeof it.str !== "string" || !it.str.trim() || !Array.isArray(it.transform)) continue;
+    n++;
+    const tr = mul(vt, it.transform as number[]);
+    if (Math.abs(tr[1]) > Math.abs(tr[0])) rot++;
+  }
+  return n ? rot / n : 0;
 }
 
 // frags of one paragraph → its typeset lines (frags sharing a baseline band —
@@ -871,7 +990,37 @@ export const interArea = (
 export const FIG_CONTAIN = 0.6;
 
 // caption openers: "Figure 3:", "Fig. 2.1", "Table 4 —", "Algorithm 1", …
-export const CAPTION_RE = /^(?:figure|fig\.|table|chart|diagram|listing|algorithm|scheme)\s*\d/i;
+// A welded table ROW masquerading as body prose. buildFrags keeps a whole
+// table row in one fragment (its cell gaps are under the column-split
+// threshold) and growParagraph then stacks several rows into one paragraph
+// 300–400pt wide — wider than the 0.6×column "this is body text" bar that both
+// the caption envelope and the table walk use to decide where figure material
+// ends. On the test book the very first row of Table 5.1 stopped both, no
+// region was ever claimed, and the table's cells stayed kind:"prose" and were
+// translated («Poor Slow» → «Бедняга Слоу…»). A welded row is recognisable by
+// what it lacks: function words and a sentence terminator. Only prose is
+// tested — a wide display formula (kind:"other") must keep bounding, and a
+// body paragraph torn at a page break keeps its function words and so is
+// never mistaken for a row.
+const ROW_TERM = /[.!?:;][)"'”’]?$/;
+const ROW_STOP_MIN = 2;
+function weldedRow(p: Paragraph): boolean {
+  if (p.kind !== "prose") return false;
+  const t = p.text.trim();
+  if (ROW_TERM.test(t)) return false;
+  let stop = 0;
+  for (const tok of t.split(/\s+/)) {
+    if (STOP.has(tok.replace(EDGE_PUNCT, "").toLowerCase()) && ++stop >= ROW_STOP_MIN) return false;
+  }
+  return true;
+}
+
+// "Example 6.1 SELECT" labels a worked query exactly the way "Listing 3" labels
+// a code block — same role, same claim on the block under it. Without it the
+// label stayed prose, no region was claimed, and the example's own lines went
+// to the model one by one. isCaptionText still requires the tail to be
+// caption-shaped, so ordinary prose ("Example 2 is the simplest…") is unaffected.
+export const CAPTION_RE = /^(?:figure|fig\.|table|chart|diagram|listing|algorithm|scheme|example)\s*\d/i;
 
 // "Table 1.1 provides a high-level overview…" is a SENTENCE about the table,
 // not its caption (seen on the test book, adjacent to the real table): real
@@ -1054,6 +1203,38 @@ export function detectFigures(
   // clips boxes at the figure's right edge). Overlaps re-merge below.
   // Paragraphs contained in the final regions are excluded from translation
   // and reflow by the callers (FIG_CONTAIN) — their pixels are in the crop.
+  // The page's BODY MEASURE — the left edge and right edge that running text
+  // shares, taken as the character-weighted mode over prose paragraphs. This is
+  // what actually bounds figure material: "wide enough to be body text" is not
+  // a usable test, because a welded table row is 300–400pt wide too, but a
+  // table row never starts at the body's left margin AND ends at its right one.
+  // Cells are inset, ragged, and column-scoped; body paragraphs are neither.
+  // Welded rows are excluded from the VOTE as well as from the test: on a page
+  // that is almost entirely a table, the rows are the longest text there is and
+  // would otherwise elect themselves the body measure, after which the first
+  // row bounds the very walk that was meant to swallow it.
+  const edge = (get: (q: Paragraph) => number) => {
+    const wt = new Map<number, number>();
+    for (const q of paras)
+      if (q.kind === "prose" && q.text.length > 40 && !weldedRow(q) && !isCaptionText(q.text)) {
+        const k = Math.round(get(q));
+        wt.set(k, (wt.get(k) ?? 0) + q.text.length);
+      }
+    let best = 0;
+    let bw = 0;
+    for (const [k, n] of wt) if (n > bw) ((bw = n), (best = k));
+    return bw ? best : null;
+  };
+  const bodyL = edge((q) => q.x);
+  const bodyR = edge((q) => q.x + q.w);
+  const BODY_TOL = 3; // px slack on either margin
+  const isBodyMeasure = (q: Paragraph): boolean =>
+    bodyL !== null &&
+    bodyR !== null &&
+    Math.abs(q.x - bodyL) <= BODY_TOL &&
+    Math.abs(q.x + q.w - bodyR) <= BODY_TOL &&
+    !weldedRow(q);
+
   let claimed = false;
   for (const p of paras) {
     if (p.kind !== "prose" || !isCaptionText(p.text)) continue;
@@ -1091,7 +1272,27 @@ export function detectFigures(
     let bBot = cB + EDGE_INSET * lineH;
     for (const q of paras) {
       if (q === p || isCaptionText(q.text)) continue;
-      if (Math.min(q.x + q.w, col.r) - Math.max(q.x, col.l) <= 0 || q.w < 0.6 * colW) continue;
+      if (Math.min(q.x + q.w, col.r) - Math.max(q.x, col.l) <= 0) continue;
+      // bound = running text at the body measure, or a wide non-prose block
+      // (a display formula still bounds the envelope, as it always did)
+      const bounds =
+        bodyL === null
+          ? q.w >= 0.6 * colW && !weldedRow(q)
+          : isBodyMeasure(q) || (q.kind !== "prose" && q.w >= 0.6 * colW);
+      if (!bounds) continue;
+      if (q.y + q.h <= p.y && q.y + q.h > aTop) aTop = q.y + q.h;
+      if (q.y >= p.y + p.h && q.y < bBot) bBot = q.y;
+    }
+    // Running headers/footers bound the envelope regardless of width. They are
+    // short, so the width test above never reaches them, and the envelope for a
+    // figure at the top of a page therefore ran all the way to the content edge
+    // and baked the header into the crop — the reader got an untranslated
+    // English running title and the book's printed page number as a raster band
+    // in the middle of a translated page (55 pages of the test book).
+    // kind:"furniture" means "never rendered, in any form"; that has to hold for
+    // pixels too.
+    for (const q of paras) {
+      if (q.kind !== "furniture") continue;
       if (q.y + q.h <= p.y && q.y + q.h > aTop) aTop = q.y + q.h;
       if (q.y >= p.y + p.h && q.y < bBot) bBot = q.y;
     }
@@ -1124,7 +1325,10 @@ export function detectFigures(
           .sort((a, b) => (down ? a.y - b.y : b.y + b.h - (a.y + a.h)));
         for (const q of cand) {
           if ((down ? q.y - bot : top - (q.y + q.h)) >= CAPTION_ADJ * lineH) break; // real gap
-          if (q.w >= 0.6 * cW) break; // full-width prose bounds the table
+          if (q.kind === "furniture") break; // a running header is never crop material
+          // running text at the body measure bounds the table; a welded row is
+          // just as wide but never sits on both margins at once
+          if (bodyL === null ? q.w >= 0.6 * cW && !weldedRow(q) : isBodyMeasure(q)) break;
           x0 = Math.min(x0, q.x);
           x1 = Math.max(x1, q.x + q.w);
           if (down) bot = Math.max(bot, q.y + q.h);
@@ -1174,12 +1378,40 @@ export function detectFigures(
   // Expand regions over such paragraphs' bboxes to fixpoint (expansion is the
   // safe direction — it can only add pixels to the crop), then re-merge any
   // overlaps the expansion created.
-  for (let changed = true; changed; ) {
+  // The invariant is TWO-SIDED, and the other side used to be missing: a
+  // paragraph the callers will INCLUDE in the flow (under FIG_CONTAIN) must sit
+  // completely OUTSIDE the region, or the reader sees it twice — once as a band
+  // of horizontally sliced English glyphs at the crop edge, once as the
+  // translated paragraph below. Straddling at 10–59% is resolved by pulling the
+  // region's near edge off the paragraph: it keeps more of itself outside than
+  // in, so the crop loses only pixels that were mostly its own text.
+  // The iteration cap is a backstop — expansion and shrink pull in opposite
+  // directions, so a pathological page could otherwise oscillate.
+  for (let changed = true, iter = 0; changed && iter < 64; iter++) {
     changed = false;
     for (const r of out)
       for (const p of paras) {
         const a = interArea(p, r);
-        if (a < FIG_CONTAIN * p.w * p.h || a >= p.w * p.h) continue;
+        if (a <= 0 || a >= p.w * p.h) continue;
+        if (a < FIG_CONTAIN * p.w * p.h) {
+          if (p.kind === "furniture" || p.kind === "prose") {
+            const pb = p.y + p.h;
+            const rb = r.y + r.h;
+            // pull whichever edge the paragraph straddles; leave the region be
+            // when the pull would collapse it (expansion is unsafe here)
+            if (p.y + p.h / 2 >= r.y + r.h / 2) {
+              if (p.y > r.y) {
+                r.h = p.y - r.y;
+                changed = true;
+              }
+            } else if (pb < rb) {
+              r.h = rb - pb;
+              r.y = pb;
+              changed = true;
+            }
+          }
+          continue;
+        }
         const x = Math.min(r.x, p.x);
         const y = Math.min(r.y, p.y);
         r.w = Math.max(r.x + r.w, p.x + p.w) - x;
@@ -1192,6 +1424,125 @@ export function detectFigures(
   const fin = mergeRegions(out, 0);
   fin.sort((a, b) => a.y - b.y || a.x - b.x);
   return fin;
+}
+
+// ---- cell grids (tables and formula furniture without a caption) ------------
+// Not every grid of short fragments has a "Table N" caption to hang a figure
+// region on: SPARQL result tables, piecewise-function braces, the two-column
+// «metric name | formula» layouts of an appendix. Their fragments classify as
+// prose, go to the model one by one, and come back as invented sentences — the
+// model has to supply the grammar the source never had («Poor Slow» →
+// «Бедняга Слоу…», «Stage Context» → «Контекст сцены»).
+//
+// The signal is layout, not wording, and a cell belongs to a ROW or to a
+// COLUMN: it shares its typeset row with another cell or with a kind:"other"
+// block (a formula's own furniture), or it sits in a stack of cells on one
+// left edge, which is what a table column is. A short standalone heading —
+// «Editors», «Omar Alonso», a chapter title — belongs to neither, and is
+// additionally protected by type size: headings are set ABOVE body size, cells
+// at or below it. Bullets and numbered subsections are excluded outright.
+// Confirmed cells become kind:"other", which the renderers already show as a
+// crop of the original: the reader gets the real table instead of a confident
+// mistranslation of one cell of it.
+const CELL_MAX_TOKENS = 10;
+const CELL_MIN = 3; // confirmed cells before the page is treated as gridded
+const CELL_ROW_TOL = 0.9; // same typeset row, × lineH
+const CELL_NOTATION_TOKENS = 3; // isolated notation is at most this long
+const CELL_NOTATION_CH = /[^\p{L}\p{Zs}'’-]/u; // …and carries a character no plain label has
+const CELL_ADJ_TOKENS = 4; // "furniture of the formula next door" is this short
+const CELL_ADJ_TOL = 1.2; // …and this close to it, × lineH
+const CELL_COL_TOL = 3; // same column, px on the left edge
+const CELL_COL_GAP = 6; // max vertical gap inside one column stack, × lineH
+const CELL_COL_MIN = 3; // cells in a stack before the stack counts as a column
+const CELL_FH_CAP = 1.05; // cells run at or below body size; headings above it
+const CELL_BULLET = /^\s*(?:[•●▪‣∗*–—]|\(?\d{1,2}[.)]\s|[a-z]\)\s)/;
+const CELL_NUMBERED = /^\d+(?:\.\d+)*\.?\s+\S/; // "5.2 Problem Definitions", "22. The geometric…"
+
+export function detectCellGrid(paras: Paragraph[], lineH: number): void {
+  // body size: char-weighted mode of prose glyph height, same statistic
+  // stitchModel uses — characters concentrate in body text, so labels and
+  // headings cannot win the vote
+  const wt = new Map<number, number>();
+  for (const p of paras) if (p.kind === "prose" && p.fh > 0) wt.set(p.fh, (wt.get(p.fh) ?? 0) + p.text.length);
+  let bodyFh = 0;
+  let bw = 0;
+  for (const [k, n] of wt) if (n > bw) ((bw = n), (bodyFh = k));
+  if (!bodyFh) return;
+
+  const candidate = (p: Paragraph): boolean => {
+    if (p.kind !== "prose" || p.fh > CELL_FH_CAP * bodyFh) return false;
+    const t = p.text.trim();
+    if (!t || ROW_TERM.test(t) || CAPTION_RE.test(t) || CELL_BULLET.test(t) || CELL_NUMBERED.test(t)) return false;
+    return t.split(/\s+/).length <= CELL_MAX_TOKENS;
+  };
+
+  const cands = new Set(paras.filter(candidate));
+  if (!cands.size) return;
+  const confirmed = new Set<Paragraph>();
+  // rules (1)–(3) describe a GRID and need a page-level quorum; rule (4) below
+  // is self-evidencing and runs even on a page with a single stray operand
+  if (cands.size >= CELL_MIN) {
+    // (1) row: a peer cell or a formula block on the same typeset line
+    for (const c of cands)
+      for (const q of paras) {
+        if (q === c || Math.abs(q.y - c.y) > CELL_ROW_TOL * lineH) continue;
+        if (q.kind === "other" || cands.has(q)) {
+          confirmed.add(c);
+          break;
+        }
+      }
+    // (2) adjacency: a very short fragment directly above or below a display-math
+    // block is that block's own furniture — a case label, a fraction's numerator
+    // gloss, a stray operand run («logb(k)», «DCG(k) iDCG(k)», «sin (»).
+    for (const c of cands) {
+      if (c.text.trim().split(/\s+/).length > CELL_ADJ_TOKENS) continue;
+      for (const q of paras)
+        if (
+          q.kind === "other" &&
+          Math.min(Math.abs(q.y - (c.y + c.h)), Math.abs(c.y - (q.y + q.h))) <= CELL_ADJ_TOL * lineH
+        ) {
+          confirmed.add(c);
+          break;
+        }
+    }
+    // (3) column: a stack of cells on one left edge, no big vertical break
+    const byLeft = new Map<number, Paragraph[]>();
+    for (const c of cands) {
+      const k = Math.round(c.x / CELL_COL_TOL);
+      (byLeft.get(k) ?? byLeft.set(k, []).get(k)!).push(c);
+    }
+    for (const col of byLeft.values()) {
+      if (col.length < CELL_COL_MIN) continue;
+      col.sort((a, b) => a.y - b.y);
+      let run = [col[0]];
+      for (let i = 1; i <= col.length; i++) {
+        const cont =
+          i < col.length && col[i].y - (run[run.length - 1].y + run[run.length - 1].h) <= CELL_COL_GAP * lineH;
+        if (cont) run.push(col[i]);
+        else {
+          if (run.length >= CELL_COL_MIN) for (const c of run) confirmed.add(c);
+          if (i < col.length) run = [col[i]];
+        }
+      }
+    }
+  } // end of the gridded-page rules
+  // (4) isolated notation: a run of at most three tokens, at body size, with no
+  // sentence punctuation, that is either a single token or carries a character
+  // outside letters and spaces. That is an operand, a label or a fragment of a
+  // formula — «logb(k)», «DCG(k) iDCG(k)», «Dis(qloc, ploc)», a lone «sum»
+  // between two equation lines. Translating it means inventing a sentence, so
+  // the original is cropped instead. A plain two- or three-word label («SPO
+  // index», «First Edition») has no such character and keeps its translation.
+  // Unlike (1)–(3) this one needs no page-level quorum: it is self-evidencing,
+  // and a lone stray operand between two equation lines is the common case.
+  const notation: Paragraph[] = [];
+  for (const c of cands) {
+    const t = c.text.trim();
+    const toks = t.split(/\s+/);
+    if (toks.length <= CELL_NOTATION_TOKENS && (toks.length === 1 || CELL_NOTATION_CH.test(t))) notation.push(c);
+  }
+  if (confirmed.size >= CELL_MIN) for (const c of confirmed) c.kind = "other";
+  for (const c of notation) c.kind = "other";
 }
 
 // ---- v2 cross-page paragraph stitching --------------------------------------
@@ -1257,6 +1608,10 @@ const STITCH_MIN_TOKENS = 4; // S4: minimum head length when it starts uppercase
 
 // sentence terminator, optionally behind a closing quote/bracket
 const STITCH_TERM = /[.!?…]["'”’)\]]?$/;
+// …except an abbreviation's own period closing a parenthetical: "(…, etc.)"
+// ends no sentence, and reading it as one refuses a real continuation. Kept
+// deliberately narrow — "et al." DOES end sentences, so it is not listed.
+const STITCH_ABBR = /(?:etc|e\.g|i\.e|cf|vs|resp)\.\)$/i;
 // a continuation opens lowercase…
 const STITCH_LOWER = /^[a-zà-öø-ÿа-яё]/;
 // …or with a math/continuation glyph (Greek, letterlike, arrows/operators, and
@@ -1347,11 +1702,29 @@ export function stitchModel(
 
   // in-column body: inside the measure, and with a last line long enough to be
   // running text (this is what drops equation numbers and narrow table cells)
-  const inCol = body.filter((i) => {
+  let inCol = body.filter((i) => {
     const p = paras[i];
     const last = lines[i][lines[i].length - 1];
     return p.x + p.w <= colR + STITCH_FLUSH * lineH && colR - last.left >= 0.35 * (colR - colL);
   });
+  // colR is voted from FIRST lines, but the filter above tests the WHOLE
+  // paragraph bbox: a page where a body paragraph pokes past the voted margin
+  // (a hanging citation, a wide inline formula) empties inCol while body is
+  // full, and an empty body silently drops the page out of cross-page stitching
+  // — tearing whatever paragraph runs over its bottom edge and leaving the
+  // model to invent a subject for the orphaned half. Retry against the widest
+  // right edge actually observed before giving up on the page.
+  if (!inCol.length) {
+    const wideR = Math.max(...body.map((i) => paras[i].x + paras[i].w));
+    const retry = body.filter((i) => {
+      const last = lines[i][lines[i].length - 1];
+      return wideR - last.left >= 0.35 * (wideR - colL);
+    });
+    if (retry.length) {
+      inCol = retry;
+      colR = wideR;
+    } else inCol = body;
+  }
 
   const inFig = (p: Paragraph) => figures.some((r) => interArea(p, r) >= FIG_CONTAIN * p.w * p.h);
   const blockers = new Set<number>();
@@ -1397,7 +1770,8 @@ export function stitchPair(a: StitchPage, b: StitchPage): { tail: number; head: 
   const off = A.colR - tl[tl.length - 1].left - (B.colR - hl[0].left);
   if (Math.abs(off) > STITCH_OFFSET * A.lineH) return null;
   // L1 — the tail is an unfinished sentence
-  if (STITCH_TERM.test(tail.text.replace(/\s+$/, ""))) return null;
+  const tt = tail.text.replace(/\s+$/, "");
+  if (STITCH_TERM.test(tt) && !STITCH_ABBR.test(tt)) return null;
   // S2 — same type size
   if (Math.abs(tail.fh - head.fh) > STITCH_FH_TOL * Math.max(tail.fh, head.fh)) return null;
   // S3 / S4 — the head reads like a continuation
