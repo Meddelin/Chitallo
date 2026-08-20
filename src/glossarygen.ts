@@ -387,7 +387,14 @@ export async function extractTerms(
     const isAcr =
       disp.length >= 2 && disp === disp.toUpperCase() && /[A-Z]/.test(disp) && !/^[IVXLCDM]+$/.test(disp);
     if (isAcr && c.adj >= MIN_FREQ) accepted.push({ ...c, disp });
+    // A two-letter capitalized token in running text is an author surname (Li,
+    // Yu, Xu, Ma), never a domain term: the citation-heavy prose of a survey
+    // makes them frequent and non-sentence-initial, so they clear every test
+    // above. One such entry («Li = инвертированные списки», mined from an
+    // inverted-list formula) reached the shipped glossary and poisoned the
+    // book. Genuine two-letter terms are acronyms and are accepted above.
     else if (
+      disp.length >= 3 &&
       /^[A-Z][^A-Z]/.test(disp) &&
       st.capNonInit >= MIN_CAP_FREQ &&
       st.capNonInit > st.nonInit - st.capNonInit &&

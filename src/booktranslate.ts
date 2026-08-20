@@ -17,6 +17,7 @@ import {
   FIG_CONTAIN,
   buildFrags,
   clusterParagraphsEx,
+  detectCellGrid,
   detectFigures,
   detectFurniture,
   forgetFurnitureVotes,
@@ -32,6 +33,7 @@ import {
   newFurnitureMemory,
   newHyphenLexicon,
   rememberFurniture,
+  rotatedItemShare,
   stitchModel,
   stitchPair,
 } from "./paragraphs";
@@ -402,6 +404,7 @@ async function scanHyphenLexicon(doc: PDFDocumentProxy, signal?: AbortSignal): P
 // detectFurniture still called exactly once per page in ascending order.
 const STITCH_MAX_HOPS = 4; // a logical paragraph may span this many pages
 const STITCH_BLANK_SKIP = 2; // consecutive text-less pages walked over
+const FURN_WARMUP = 32; // fresh-run furniture vote warm-up, pages
 
 type PageModel = {
   n: number;
@@ -450,6 +453,82 @@ export function isRefPage(paras: readonly Paragraph[]): boolean {
   }
   return entries >= REF_ENTRY_MIN && marks >= REF_MARKS_MIN;
 }
+
+// ---- back-of-book index (also a refPage) ------------------------------------
+// The index is the bibliography's twin and used to have no gate at all:
+// isRefPage keys on citation markers, and an index line ("Term, 45  Other
+// term, 88–90") carries no year, DOI or "A. Surname", so every line went to
+// the model as if it were a sentence. Worse, growParagraph welds
+// alphabetically adjacent entries into one block first, so the model reflows
+// the whole block into prose and the page numbers migrate onto the wrong
+// terms: on the test book 33 pages / 293 paragraphs / 80KB of Russian, with
+// 256 of 1767 "term → page" bindings destroyed and dataset names literally
+// translated. There is no per-paragraph repair for this — the damage happens
+// before classification sees it — so the page is flagged whole and rendered as
+// the original, exactly like a bibliography page.
+// Signal: the "headword, page" BINDING — a word ending, a comma, a bare page
+// number — measured per 1000 characters of the page. Density, not a count of
+// entry-shaped paragraphs: the same welding that ruins the translation collapses
+// a whole index page into two or three giant paragraphs, so anything counted
+// per paragraph reads three entries where there are sixty. The word-ending
+// requirement is what keeps a chart's numeric labels ("0.75, 1") out.
+// Measured over the whole test book: index pages run 15.9–41.6 bindings per
+// 1000 chars, every other page in the book is at or under 1.7 — a 9× gap, so
+// the floor sits comfortably between them. The absolute floor only guards
+// against a near-empty page scoring high on a handful of matches.
+const IDX_BIND_MIN = 3; // bindings on the page
+const IDX_BIND_DENSITY = 8; // …and per 1000 characters
+const IDX_BIND_RE = /[\p{L}][\p{L}\p{N})\]'’.-]{0,2},\s*\d{1,3}(?:\s*[–—-]\s*\d{1,3})?(?=[\s,]|$)/gu;
+
+export function isIndexPage(paras: readonly Paragraph[]): boolean {
+  let binds = 0;
+  let chars = 0;
+  for (const p of paras) {
+    if (p.kind === "furniture") continue;
+    const t = p.text.trim();
+    chars += t.length + 1;
+    binds += t.match(IDX_BIND_RE)?.length ?? 0;
+  }
+  return chars >= 50 && binds >= IDX_BIND_MIN && (1000 * binds) / chars >= IDX_BIND_DENSITY;
+}
+
+// ---- table of contents (also a refPage) -------------------------------------
+// Same failure as the index, same shape of evidence: growParagraph welds a
+// dozen contents lines into one paragraph, the model reflows them into prose,
+// and the page numbers end up against the wrong headings. The signal is the
+// contents BINDING — a word, whitespace, a bare page number — per 1000
+// characters. Measured over the test book: contents pages run 23.7–34.0, the
+// densest page anywhere else in the book is 13.7 (a numeric table), and
+// ordinary body pages sit at 0. The book's real navigation is translated
+// separately from the PDF outline, so nothing is lost by showing these pages
+// as the original.
+const TOC_BIND_MIN = 8;
+const TOC_BIND_DENSITY = 18; // per 1000 characters
+const TOC_BIND_RE = /[\p{L})\]] +\d{1,3}(?= |$)/gu;
+
+export function isTocPage(paras: readonly Paragraph[]): boolean {
+  let binds = 0;
+  let chars = 0;
+  for (const p of paras) {
+    if (p.kind === "furniture") continue;
+    const t = p.text.trim();
+    chars += t.length + 1;
+    binds += t.match(TOC_BIND_RE)?.length ?? 0;
+  }
+  return chars >= 50 && binds >= TOC_BIND_MIN && (1000 * binds) / chars >= TOC_BIND_DENSITY;
+}
+
+// ---- landscape / rotated pages (also a refPage) -----------------------------
+// A page whose text is mostly set at 90° is a landscape table. It has no
+// reflowable measure: the reading direction runs across the page, so clustering
+// yields cell shards, and the model expands each two-word shard into a
+// confident invented sentence («shown. is» → «Показано следующее.»). The test
+// book's five-page Table 8.1 produced 135 such paragraphs, all translated, with
+// no crop of the original anywhere. Rendering the original page is the only
+// honest option, so the page joins refPages. The threshold is a clear majority:
+// a chart carrying one rotated y-axis label stays a normal page.
+const ROT_PAGE_SHARE = 0.5;
+export const isRotatedPage = (share: number): boolean => share >= ROT_PAGE_SHARE;
 
 // uniform body-size reference: median fh over prose paragraphs of every
 // completed page (pages map only ever holds completed pages). refPages are
@@ -704,12 +783,16 @@ export async function startBookTranslation(
   // page retracts its own seeded votes right before detectFurniture re-votes
   // its live candidates (forgetFurnitureVotes).
   const furn: FurnitureMemory = newFurnitureMemory();
+  // what each page contributed to the pool before it is swept, so the sweep can
+  // retract exactly its own votes (stored classification, or the warm-up below)
+  const seeded = new Map<number, Paragraph[]>();
   for (const [k, paras] of Object.entries(store.pages)) {
-    if (!paras.some((p) => p.kind === "furniture")) continue;
+    const f = paras.filter((p) => p.kind === "furniture");
+    if (!f.length) continue;
     const cT = Math.min(...paras.map((p) => p.y));
     const cB = Math.max(...paras.map((p) => p.y + p.h));
-    for (const p of paras)
-      if (p.kind === "furniture") rememberFurniture(furn, Number(k), p, p.y - cT <= cB - (p.y + p.h) ? "t" : "b");
+    for (const p of f) rememberFurniture(furn, Number(k), p, p.y - cT <= cB - (p.y + p.h) ? "t" : "b");
+    seeded.set(Number(k), f);
   }
   // never mint pages against a dead server: one probe up front — an outage
   // stalls the run right here, before even a text-less page can complete and
@@ -727,6 +810,35 @@ export async function startBookTranslation(
     if (keep) store.hyphens = keep; // persisted with this run's first page
   }
   if (store.hyphens) keepHyphen = hyphenKeeper(store.hyphens);
+
+  // Fresh-run warm-up for the furniture vote pool. detectFurniture's repetition
+  // rule and its learned printed-page offset both need a quorum, and a
+  // resumed/updated run starts with one seeded from the WHOLE store — so the
+  // same book translated from scratch used to keep four running headers as body
+  // text (pages 9, 10, 23, 24 of the test book) that an update correctly
+  // dropped. Same book, two outputs, the from-scratch one strictly worse. A
+  // bounded prescan closes it where it actually bites — the front of the book,
+  // before any header text has been seen twice; later chapter starts confirm
+  // through the page number instead. Votes are recorded in `seeded` and
+  // retracted page by page at the sweep site, exactly like stored ones, so
+  // nothing is counted twice.
+  if (!seeded.size) {
+    for (let n = 1; n <= Math.min(last, FURN_WARMUP); n++) {
+      if (signal?.aborted) break;
+      const page = await doc.getPage(n);
+      try {
+        const content = await page.getTextContent();
+        const { paras } = clusterParagraphsEx(content.items, page.getViewport({ scale: 1 }), { keepHyphen });
+        detectFurniture(paras, n, furn);
+        const f = paras.filter((p) => p.kind === "furniture");
+        if (f.length) seeded.set(n, f);
+      } catch {
+        // one unreadable page only costs its own warm-up votes
+      } finally {
+        page.cleanup();
+      }
+    }
+  }
 
   // ---- classification with a one-page lookahead (see PageModel above) -------
   const models = new Map<number, PageModel>();
@@ -747,15 +859,27 @@ export async function startBookTranslation(
     // votes fed the quorum for the pages before it) and is about to be
     // replaced — withdraw those votes so detectFurniture's re-vote of the live
     // candidates doesn't double-count them.
-    for (const p of store.pages[n] ?? []) if (p.kind === "furniture") forgetFurnitureVotes(furn, n, p);
+    for (const p of seeded.get(n) ?? []) forgetFurnitureVotes(furn, n, p);
+    seeded.delete(n);
     detectFurniture(paras, n, furn);
-    // bibliography page: completes untranslated below (todo stays empty) and
-    // skips the figure pass — the viewer shows the original page wholesale,
-    // stored regions would never render
-    const refPage = isRefPage(paras);
+    // "show the original page wholesale" pages: completes untranslated below
+    // (todo stays empty) and skips the figure pass — stored regions would never
+    // render. Three kinds qualify, for the same reason: their content is not
+    // reflowable prose and translating it does pure harm — bibliography
+    // (citations), back-of-book index (term→page bindings the model reshuffles),
+    // and landscape/rotated pages (no reading measure at all).
+    const refPage =
+      isRefPage(paras) || isIndexPage(paras) || isTocPage(paras) || isRotatedPage(rotatedItemShare(content.items, vp1));
     // candidate figure regions; reclassifies adjacent "Figure N:" prose
     // paragraphs to kind:"caption" (mutates paras) and merges their bboxes
     const figures = refPage ? [] : detectFigures(paras, vp1.width, vp1.height, await pageImageBoxes(page));
+    // grids without a caption to hang a region on (SPARQL result tables,
+    // piecewise braces, appendix formula tables): their cells become
+    // kind:"other" and render as a crop instead of being translated one by one.
+    // AFTER detectFigures on purpose — cells already inside a claimed region
+    // need no reclassification, and a caption's bounds are computed against the
+    // page's prose, which this pass would otherwise thin out.
+    if (!refPage) detectCellGrid(paras, lineH);
     const m: PageModel = { n, paras, lines, figures, refPage, model: stitchModel(paras, lines, lineH, figures) };
     models.set(n, m);
     return m;
@@ -767,7 +891,16 @@ export async function startBookTranslation(
     for (let m = from + 1, blank = 0; m <= last && blank <= STITCH_BLANK_SKIP; m++) {
       const pm = await classifyPage(m);
       if (!pm) return null;
-      if (pm.paras.some((p) => p.kind === "prose")) return pm;
+      // "carries text" must mean BODY text. A full-page figure or table is full
+      // of kind:"prose" paragraphs — its labels and cells — so testing the kind
+      // alone made every such page count as a text page, the blank-skip never
+      // ran, and the paragraph running across it stayed torn (the model then
+      // rewrote the orphaned half into a whole sentence the book never states).
+      // The FIG_CONTAIN test is the same one the translation todo list uses.
+      if (
+        pm.paras.some((p) => p.kind === "prose" && !pm.figures.some((r) => interArea(p, r) >= FIG_CONTAIN * p.w * p.h))
+      )
+        return pm;
       blank++;
     }
     return null;
