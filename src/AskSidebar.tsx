@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from "react";
 import { Channel, invoke } from "@tauri-apps/api/core";
 import {
   BookOpenIcon,
+  ChartColumnIcon,
   CheckIcon,
   CopyIcon,
   FileTextIcon,
@@ -133,6 +134,7 @@ const commands = (): Cmd[] => [
   { id: "explain", label: t("ask.cmdExplain"), icon: TextQuoteIcon, msg: () => t("ask.defaultQ"), need: "seed" },
   { id: "term", label: t("ask.cmdTerm"), icon: BookOpenIcon, msg: () => t("ask.cmdTermMsg"), need: "seed" },
   { id: "page", label: t("ask.cmdPage"), icon: FileTextIcon, msg: (p) => t("ask.cmdPageMsg", { n: p }) },
+  { id: "chart", label: t("ask.cmdChart"), icon: ChartColumnIcon, msg: (p) => t("ask.cmdChartMsg", { n: p }) },
   { id: "link", label: t("ask.cmdLink"), icon: Link2Icon, msg: () => t("ask.linkTopicMsg"), need: "seedOrAnswer" },
   { id: "simpler", label: t("ask.cmdSimpler"), icon: LightbulbIcon, msg: () => t("ask.simpler"), need: "answer" },
 ];
@@ -270,9 +272,13 @@ async function replayMock(lines: string[], onLine: (l: string) => void, isCancel
   }
 }
 
-// Reading-assistant persona, in the interface language so the answers come
-// back in it; goes to the CLI as --append-system-prompt
-const sysPrompt = (title: string) => t("ask.system", { title });
+// Reading-assistant persona, in the interface language so the answers come back
+// in it; goes to the CLI as --append-system-prompt. With it, the two formats an
+// answer may carry besides prose — maths in LaTeX and a ```chart fence. Kept as
+// two catalogue entries rather than one:
+// `ask.viz` describes a machine contract that must stay in step with
+// chart-block.tsx, and it has no business being buried inside the voice.
+const sysPrompt = (title: string) => `${t("ask.system", { title })}\n\n${t("ask.viz")}`;
 
 // VS Code / Cursor grammar: an invisible 8 px strip on the panel edge, a 2 px
 // tint on hover or drag, col-resize cursor. No grip dots — they would be the

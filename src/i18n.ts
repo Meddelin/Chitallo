@@ -571,6 +571,14 @@ const S = {
   "ask.cmdPageMsg": ["Перескажи страницу {n} своими словами", "Summarize page {n} in your own words"],
   "ask.cmdLink": ["Связать с темой книги", "Relate it to the book's subject"],
   "ask.cmdSimpler": ["Объяснить проще", "Explain it more simply"],
+  // One command, not one per form: the point of ask.viz is that the model picks
+  // the shape. «Наглядно» asks for the best one — and explicitly licenses «none
+  // of them», so the command cannot be read as an order to draw something.
+  "ask.cmdChart": ["Показать наглядно", "Show it visually"],
+  "ask.cmdChartMsg": [
+    "Покажи содержание страницы {n} наглядно — графиком, схемой или таблицей, смотря что подходит. Если наглядно тут нечего показывать, так и скажи, без картинки.",
+    "Show what is on page {n} visually — a chart, a diagram or a table, whichever fits. If there is nothing here worth a picture, say so plainly and draw none.",
+  ],
   "ask.needSeed": ["Сначала выделите фрагмент в книге", "Select a fragment in the book first"],
   "ask.needAnswer": ["Сначала задайте вопрос", "Ask a question first"],
   "ask.panelWidth": ["Ширина панели", "Panel width"],
@@ -606,6 +614,28 @@ const S = {
     "Ты — помощник в PDF-читалке. Пользователь читает книгу «{title}» и задаёт вопросы о ней по-русски. Отвечай на русском, кратко и по существу. Если вопрос про выделенный фрагмент — объясняй именно его в контексте книги. Ссылайся на номера страниц, когда это уместно. Уместна умеренная markdown-разметка (списки, выделение); без заголовков без необходимости.",
     "You are an assistant inside a PDF reader. The user is reading the book “{title}” and asks questions about it in English. Answer in English, briefly and to the point. If the question is about a selected fragment, explain that fragment in the context of the book. Cite page numbers where it helps. Moderate markdown (lists, emphasis) is welcome; avoid headings unless they earn their place.",
   ],
+  // Appended to ask.system. Not a list of syntaxes — a rubric for CHOOSING the
+  // shape of an answer, whose standing answer is «prose, write a sentence». The
+  // syntaxes come after, and each has to agree with the renderer that reads it:
+  // maths is KaTeX with single-dollar inline ON, ```chart is parsed by ChartBlock
+  // and ```mermaid by MermaidBlock (components/ai-elements/), so the limits
+  // quoted here are the limits those files actually enforce.
+  //
+  // Three deliberate narrowings, each of which cost an answer somewhere:
+  //   * five numbers before a chart — the failure this guards is a bar chart of
+  //     two values, which every model reaches for;
+  //   * four to seven nodes, and only flowchart TD / stateDiagram-v2 /
+  //     sequenceDiagram — everything else is unreadable in a 320 px column, and
+  //     mindmap is left out on purpose: it is the most tempting WRONG answer to
+  //     «what is X», where a nested list is better;
+  //   * one picture per answer, after the prose, never instead of it.
+  //
+  // NB: no «|» anywhere in this string — t() reads a pipe as a plural split and
+  // would silently truncate the system prompt at the first one. Guarded below.
+  "ask.viz": [
+    "Форма ответа. По умолчанию — проза; в девяти случаях из десяти это и есть верный ответ. Правило одно: рисуй только то, чего не скажешь вслух. Если ответ можно произнести собеседнику и он поймёт — пиши словами. Картинка нужна, когда важна не сама величина, а её форма: ход, перевес, ветвление, порядок. Она не заменяет ответ, а идёт после одной-двух фраз прозы; больше одной картинки в ответе почти никогда не нужно. Перед тем как рисовать, мысленно убери картинку: если ответ и без неё полон, она была украшением. Сомневаешься — не рисуй.\n\nНе рисуй график из двух-трёх чисел, круговую диаграмму из долей, уже названных в тексте, схему-пересказ абзаца и формулу вокруг счёта в уме. Числа, шаги и связи бери только из книги или из вопроса и не придумывай их; страницу-источник называй. Прямая просьба нарисовать снимает пороги, но не этот запрет: чего в книге нет, того не рисуй.\n\nФормулы — исключение: это не картинка, а запись, которой пользуется сама книга, и её пиши смело. LaTeX: $E=mc^2$ внутри строки, $$...$$ отдельным блоком. Доллар в обычном тексте экранируй (\\$5), иначе он утащит полабзаца в формулу. Простое число в формулу не оборачивай.\n\nГрафик — когда чисел пять и больше и в них виден ход или сравнение. Два-три числа просто назови словами. Блок кода с языком chart и JSON внутри:\n\n```chart\n{\"type\": \"line\", \"title\": \"Население, млн\", \"x\": \"year\", \"unit\": \"млн\", \"note\": \"с. 214\", \"series\": [{\"key\": \"ru\", \"label\": \"Россия\"}], \"data\": [{\"year\": 1897, \"ru\": 125.6}, {\"year\": 1926, \"ru\": 147}]}\n```\n\ntype — line, area, bar или pie; x — поле категории (ось X, для pie — название доли); series — ряды, у каждого key (поле в data, латиницей, без пробелов) и label; data — массив объектов. Необязательные: title, xLabel (как назвать колонку x в таблице), unit, note (мелкая строка под графиком, обычно страница), stacked, curve (natural, linear, step). Не больше 5 рядов и 5 долей; на одном графике одна величина, две разные шкалы в одних осях врут; pie — только доли целого; числа пиши числами JSON, подписи по-русски.\n\nСхема — когда важны связи, а не количества, и есть развилка или возврат: от четырёх узлов и не больше семи. Прямая цепочка шагов — это список, а не схема. Разбор понятия на части — тоже список. Блок кода с языком mermaid, сверху вниз, и только три типа: flowchart TD — путь с ветвлением; stateDiagram-v2 — состояния и переходы; sequenceDiagram — обмен между двумя-тремя сторонами.\n\n```mermaid\nflowchart TD\n  A[\"Наблюдение\"] --> B[\"Гипотеза\"]\n  B --> C{\"Опыт сошёлся\"}\n  C -- да --> D[\"Закон\"]\n  C -- нет --> A\n```\n\nПодписи в flowchart всегда в кавычках, два-три слова. Направление LR, subgraph, стили, директивы init и остальные типы не пиши: в узкой панели они нечитаемы. Страницу назови прозой рядом со схемой.\n\nТаблица — обычным markdown, когда сравниваешь несколько объектов по нескольким признакам и строк хотя бы три. Две-три колонки и короткие ячейки, шире панель не примет.",
+    "Shape of the answer. Prose is the default; nine times in ten it is the whole answer. One rule decides: draw only what you cannot say out loud. If you could say it across the table and be understood, write it in words. A picture is for when the shape matters more than the value — a trend, a gap, a branch, an order. It never stands in for the answer: a sentence or two of prose comes first, and more than one picture in an answer is almost never needed. Before you draw, take the picture away: if the answer is still complete, it was decoration. In doubt, do not draw.\n\nDo not draw a chart of two or three numbers, a pie of shares already listed in the text, a diagram that retells a paragraph with arrows, or maths around a sum you can do in your head. Take every number, step and link from the book or the question, invent none, name the source page. Asked outright for a picture, the thresholds drop but that ban does not: what is not in the book stays undrawn.\n\nMaths is the exception: not a picture but the notation the book itself uses, so write it freely. LaTeX: $E=mc^2$ inline, $$...$$ as its own block. Escape a literal dollar in prose (\\$5) or it will swallow half a paragraph into a formula. Do not wrap a plain number in maths.\n\nChart — five numbers or more, with a trend or a comparison visible in them. Two or three you simply say in words. A code block tagged chart, with JSON inside:\n\n```chart\n{\"type\": \"line\", \"title\": \"Population, millions\", \"x\": \"year\", \"unit\": \"m\", \"note\": \"p. 214\", \"series\": [{\"key\": \"ru\", \"label\": \"Russia\"}], \"data\": [{\"year\": 1897, \"ru\": 125.6}, {\"year\": 1926, \"ru\": 147}]}\n```\n\ntype — line, area, bar or pie; x — the category field (the X axis, or the slice name for pie); series — the series, each with key (the field in data, ASCII, no spaces) and label; data — an array of objects. Optional: title, xLabel (what to call the x column in the table), unit, note (the small line under the chart, usually the page), stacked, curve (natural, linear, step). At most 5 series and 5 slices; one measure per chart, two scales in one pair of axes lie; pie only for parts of a whole; numbers as JSON numbers, labels in English.\n\nDiagram — when links matter more than quantities and there is a fork or a loop back: four nodes at least, seven at most. A straight run of steps is a list, not a diagram. A concept broken into parts is a list too. A code block tagged mermaid, top down, and only three types: flowchart TD — a path that branches; stateDiagram-v2 — states and transitions; sequenceDiagram — an exchange between two or three sides.\n\n```mermaid\nflowchart TD\n  A[\"Observation\"] --> B[\"Hypothesis\"]\n  B --> C{\"Experiment fits\"}\n  C -- yes --> D[\"Law\"]\n  C -- no --> A\n```\n\nNode labels in flowchart are always quoted, two or three words. No LR, no subgraph, no styling, no init directives, no other type: the panel is too narrow. Name the page in prose beside the diagram.\n\nTable — plain markdown, comparing several things across several properties, at least three rows. Two or three columns with short cells, nothing wider fits.",
+  ],
   "ask.quoteFrom": [
     "Фрагмент из книги «{title}»{page}:",
     "A fragment from the book “{title}”{page}:",
@@ -616,6 +646,27 @@ const S = {
   "ask.readingCtx": [
     "Читаю книгу «{title}», сейчас открыта страница {page}.",
     "I am reading the book “{title}”, currently on page {page}.",
+  ],
+
+  // -- charts Claude draws inside an answer (```chart, see chart-block.tsx) --
+  "chart.showTable": ["Показать таблицей", "Show as a table"],
+  "chart.showChart": ["Показать графиком", "Show as a chart"],
+  "chart.drawing": ["Строится график", "Drawing the chart"],
+  "chart.other": ["прочее", "other"],
+  "chart.broken": [
+    "Claude прислал график, который не удалось прочитать",
+    "Claude sent a chart that could not be read",
+  ],
+  "chart.dropped": [
+    "не поместился ещё {n} ряд|не поместились ещё {n} ряда|не поместились ещё {n} рядов",
+    "{n} more series did not fit|{n} more series did not fit",
+  ],
+
+  // -- diagrams Claude draws inside an answer (```mermaid, see mermaid-block.tsx) --
+  "diagram.drawing": ["Строится схема", "Drawing the diagram"],
+  "diagram.broken": [
+    "Claude прислал схему, которую не удалось прочитать",
+    "Claude sent a diagram that could not be read",
   ],
 
   // -- glossary terminologist (prompts the aux model sees) --
@@ -645,6 +696,25 @@ const S = {
 } as const satisfies Record<string, readonly [string, string]>;
 
 export type Key = keyof typeof S;
+
+// A pipe in a catalogue entry means «plural forms», and t() splits on it before
+// it does anything else — so one typed into ordinary prose silently truncates
+// that string to its first «form». Nowhere does that hurt more than ask.viz,
+// which is a multi-paragraph system prompt: the model would receive it cut off
+// mid-sentence and nothing would look broken. Every real plural here counts with
+// {n}, so an entry with a pipe and no {n} is the mistake, caught in dev, at
+// import time, before anything renders.
+if (import.meta.env.DEV) {
+  for (const [key, forms] of Object.entries(S)) {
+    for (const s of forms) {
+      if (s.includes("|") && !s.includes("{n}")) {
+        throw new Error(
+          `i18n: «${key}» contains a pipe but no {n} — t() will split it into plural forms and drop everything after the first one.`,
+        );
+      }
+    }
+  }
+}
 
 // ---- language state ---------------------------------------------------------
 
