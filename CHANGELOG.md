@@ -59,6 +59,56 @@
   that signal — `parseIncompleteMarkdown` closes an unterminated fence before the
   renderer sees it, so the flag is false for the whole stream — so both figure
   blocks now treat a failure as an error only once the text has stopped arriving.
+- **Fifteen page-parsing defects that shredded the translation.** The reader was
+  showing fragments — half-sentences, capitalised mid-phrase, invented endings —
+  and none of it came from the model: HY-MT never returned an empty translation
+  and never hit the context limit. Over the 838-page test book the defects left
+  12.0% of translated paragraphs as non-sentences; that is now 0.85%.
+  - `medianLineH` took the median fragment height over the WHOLE page, including
+    the 7–8pt labels inside diagrams. `growParagraph` merges lines only while
+    their gap stays under 1.6× lineH, and a body set at 9.96pt with 13.9pt
+    leading needs lineH ≥ 8.69 — 13% of headroom. On thirteen pages the labels
+    outvoted the body and every body line became its own one-line "paragraph",
+    each translated standalone; a line ending «quality fac-» came back as
+    «Торсы». The median is now weighted by fragment width: lineH moves on 19 of
+    820 pages, always up and always to the true body height, and furniture
+    detection over the whole book is bit-identical.
+  - The merge gap scales with the lines' own type size, so a chapter title set
+    at 29pt is no longer split in half.
+  - `itemWords` builds the rect from the transform's advance and ascent vectors
+    instead of assuming +x/−y, so 90° text stops being modelled as a short wide
+    box. A page that is mostly rotated — a landscape table — renders as the
+    original, since it has no reflowable measure at all.
+  - The back-of-book index and the contents join the bibliography as pages shown
+    untranslated. Both gates key on measured binding density: index pages run
+    15.9–41.6 «term, page» bindings per 1000 characters against 1.7 for the
+    densest other page in the book, contents 23.7–34.0 against 13.7.
+  - A welded table row no longer counts as body prose when bounding figure
+    material — the bound is the page's own measure, which a row never sits on.
+    Tables that used to leak their cells into the flow are cropped whole.
+  - `detectCellGrid` claims grids with no caption to hang a region on — SPARQL
+    result tables, piecewise braces, appendix formula tables — by row, by
+    column, by adjacency to display math, and by isolated notation.
+  - Query and code listings, catalogue identifier blocks (ISBN/ISSN/DOI) and
+    brace-piece maths classify as figure material rather than prose.
+  - The caption envelope is clamped below running headers: 55 pages had an
+    English running head and a foreign page number baked into a figure crop.
+  - The figure-containment invariant is two-sided, so a paragraph that stays in
+    the flow can no longer also be sliced into the crop above it.
+  - Footnote markers glued to «(ACRONYM)» or to a closing quote stop flowing
+    into the body as bare digits.
+  - `stitchModel` retries its column measure instead of silently leaving a page
+    out of cross-page stitching, and a full-page figure no longer blocks a
+    stitch across it.
+  - The furniture vote pool is warmed over the first 32 pages of a fresh run, so
+    translating a book from scratch is no longer strictly worse than updating it.
+- **A glossary term that rewrote 48% of the book's prompts.** The generator
+  mined the author surname «Li» as a term, and `matched()` tested for a raw
+  substring — «li» inside *applications*, *quality*, *online*, *click* — so
+  `Li 翻译成 инвертированные списки` was prepended to 1989 of 4129 prompts as an
+  authoritative instruction, and the model wrote it over «BOW encodings»,
+  «embeddings» and a variable name. Terms now match on word boundaries, which
+  leaves 37, and the generator no longer accepts two-letter surnames at all.
 
 ## 0.1.0 — 2026-08-20
 
