@@ -1,6 +1,10 @@
 @import "tailwindcss";
 @import "tw-animate-css";
 @import "shadcn/tailwind.css";
+/* KaTeX — the stylesheet and the fonts that render the maths Claude writes in
+   the «Спросить» answers. Vendored through node_modules on purpose: a reader
+   with no network still gets its formulas set properly. */
+@import "katex/dist/katex.min.css";
 /* streamdown (markdown renderer in AskSidebar) styles itself with tailwind
    classes inside its dist — they must be visible to the scanner */
 @source "../node_modules/streamdown/dist/*.js";
@@ -37,7 +41,15 @@
    the same warm neutral ramp above, the same single accent. Surfaces mirror
    the sidebar (neutral-50 / neutral-800), the primary button mirrors the send
    pill (ink on paper, paper on ink), hovers reuse the app's tint language
-   (900/5 light, 100/10 dark), the ring IS the accent. Charts unused. */
+   (900/5 light, 100/10 dark), the ring IS the accent.
+   --chart-1..5 are the categorical series slots the «Спросить» charts paint
+   with. They are NOT free colors: the five hues and their two steppings come
+   from the validated reference ramp (blue · orange · aqua · yellow · magenta),
+   in this fixed order, and every adjacent pair clears the colour-vision gate
+   on both of the chart card's surfaces (--card: #ffffff / #1c1917). Three of the light
+   steps sit under 3:1 against paper — which is why every chart ships a legend
+   and a table view, so a value is never carried by hue alone. Do not reorder,
+   do not extend past five: a sixth series folds into «прочее». */
 :root {
   color-scheme: light;
   --background: #fafaf9;
@@ -57,6 +69,11 @@
   --input: #e7e5e4;
   --ring: #3b82f6;
   --radius: 0.75rem;
+  --chart-1: #2a78d6;
+  --chart-2: #eb6834;
+  --chart-3: #1baf7a;
+  --chart-4: #eda100;
+  --chart-5: #e87ba4;
 }
 .dark {
   color-scheme: dark;
@@ -76,6 +93,12 @@
   --border: #44403c;
   --input: #44403c;
   --ring: #3b82f6;
+  /* the same five hues, re-stepped for ink — not an automatic flip */
+  --chart-1: #3987e5;
+  --chart-2: #d95926;
+  --chart-3: #199e70;
+  --chart-4: #c98500;
+  --chart-5: #d55181;
 }
 
 /* Keyboard focus: one 2px accent ring everywhere interactive. Text fields are
@@ -410,6 +433,14 @@
   margin: 0.7em auto;
 }
 
+/* Mermaid writes `style="max-width: NNNpx"` onto the root <svg> (useMaxWidth),
+   which in a 320 px panel has to be let go of. The diagram is inlined SVG with
+   no Tailwind classes of its own, so there is nothing here for the scanner. */
+[data-chitallo="mermaid"] svg {
+  max-width: 100%;
+  height: auto;
+}
+
 @theme inline {
   /* Deliberate deviations from the stock shadcn block:
      — no --font-sans override (the app font from @theme above must win;
@@ -434,6 +465,11 @@
   --color-card: var(--card);
   --color-foreground: var(--foreground);
   --color-background: var(--background);
+  --color-chart-1: var(--chart-1);
+  --color-chart-2: var(--chart-2);
+  --color-chart-3: var(--chart-3);
+  --color-chart-4: var(--chart-4);
+  --color-chart-5: var(--chart-5);
 }
 
 /* shadcn base: default border/outline color for the components (a no-op for

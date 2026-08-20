@@ -1,5 +1,65 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- **Formulas in «Ask» answers.** Claude writes maths in LaTeX and the panel sets
+  it with KaTeX — `$inline$` and `$$display$$`, the stylesheet and fonts
+  vendored so a reader with no network still gets them. A line that is nothing
+  but `$$…$$` is opened out into a proper display block, since that is how
+  models actually write a centred formula.
+- **Charts in «Ask» answers.** Claude draws a chart by writing a ```chart fence
+  holding a small JSON spec (`type` line/area/bar/pie, `x`, `series`, `data`,
+  plus optional title, unit, note, stacked, curve); the panel renders it through
+  shadcn's chart primitives on Recharts, in place, as the answer streams. The
+  system prompt carries the schema and the rules — numbers from the book only,
+  one measure per chart, at most five series.
+  - A five-slot categorical ramp (`--chart-1..5`) stepped separately for paper
+    and ink; every adjacent pair clears the colour-vision gate on both of the
+    panel's surfaces. A sixth series does not get an invented hue: cartesian
+    charts say how many did not fit, pie folds its tail into one neutral slice.
+  - Every chart has a **table view** one click away with the same numbers, so a
+    value is never carried by hue alone.
+  - A spec that will not parse shows what Claude actually wrote, rather than an
+    empty box.
+- **Diagrams in «Ask» answers.** A ```mermaid fence, rendered by MermaidBlock in
+  the same card a chart gets. Three types only — `flowchart TD`,
+  `stateDiagram-v2`, `sequenceDiagram` — because nothing else stays legible in a
+  320 px column, and because a mindmap is the most tempting wrong answer to
+  "what is X", where a nested list is better. Mermaid is loaded lazily: the main
+  bundle grows by 11 kB, and the 658 kB engine is fetched the first time a
+  diagram is actually shown.
+  - The palette is the app's own paper-and-ink, in two selected sets rather than
+    one flipped: mermaid bakes its colours into the SVG, so a diagram is
+    re-rendered on the theme switch through a subscription to the `dark` class.
+  - `securityLevel: "strict"` and an explicit `secure` list: the diagram source
+    is model output, so mermaid's own sanitiser stays on, `click` directives are
+    refused, and an `init` header inside the source cannot repaint the diagram.
+    `htmlLabels: false` keeps every label a plain SVG `<text>`.
+- **A rubric for choosing the shape of an answer**, replacing the two syntax
+  notes the system prompt used to carry. It leads with the default — prose,
+  nine times in ten — and one rule: draw only what you cannot say out loud.
+  Then thresholds that make it checkable: five numbers before a chart, four to
+  seven nodes before a diagram, one picture per answer and never instead of the
+  prose, and never a number the book does not contain.
+- **«Показать наглядно»** among the «Ask» quick commands (`/`), replacing
+  «Показать графиком»: it asks for the fitting shape — chart, diagram or table —
+  and explicitly licenses "none of them", so it cannot be read as an order to
+  draw something.
+- **A dev-time guard on the string catalogue.** `t()` splits any value on `|`
+  into plural forms, so a pipe typed into ordinary prose silently truncates that
+  string — which for a multi-paragraph system prompt would be invisible. An
+  entry with a pipe and no `{n}` now throws at import time in dev.
+
+### Fixed
+
+- A chart whose spec was still streaming showed "could not be read" on every
+  token instead of a quiet placeholder. Streamdown's `isIncomplete` cannot carry
+  that signal — `parseIncompleteMarkdown` closes an unterminated fence before the
+  renderer sees it, so the flag is false for the whole stream — so both figure
+  blocks now treat a failure as an error only once the text has stopped arriving.
+
 ## 0.1.0 — 2026-08-20
 
 First public release, and the first under the name **Chitallo** — the project was

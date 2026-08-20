@@ -35,7 +35,9 @@ English — you pick it on first launch and can change it in Settings.
 - **Export** — the finished translation to PDF (with the original's
   illustrations) or HTML, one click, straight to Downloads
 - **«Ask»** (Ctrl+J) — questions about the book you are reading, through Claude
-  Code. Optional, and the only feature that uses the network.
+  Code. An answer is prose unless a picture earns its place: it may carry typeset
+  LaTeX, a chart drawn from the book's own numbers (with a table view), or a
+  diagram. Optional, and the only feature that uses the network.
 
 ## Privacy
 
