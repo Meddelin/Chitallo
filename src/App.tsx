@@ -571,13 +571,52 @@ function matchHeadingTr(paras: TrParagraph[] | undefined, bodyFh: number, title:
   return best >= OUT_MATCH ? bestTr : null;
 }
 
+// Content signature of everything ONE page's render reads out of the
+// translation store. In translation mode this is the render effect's
+// dependency, in place of the run's global progress counter.
+//
+// The counter bumps once per completed page, so «Обновить перевод» bumped it
+// 838 times — and every bump re-ran the render effect for EVERY mounted page.
+// Each re-run tears the page down and rebuilds it: the reflow swaps in
+// synchronously but its crops are rasterized from an offscreen render of the
+// ORIGINAL and painted a frame or two later, so the whole viewport flickered
+// between the reflow and the original for the entire run. Keyed on its own
+// content, a page re-renders only when that content actually changed.
+//
+// Deliberately cheap — this runs for every page of the book on every progress
+// event, so it samples the translated text rather than reading all of it: each
+// paragraph contributes its kind, its continuation mark, its length and a
+// rolling code over every 32nd character. Checked against two full stores of
+// the same book produced by different engine versions: of 605 pages that
+// genuinely differ it separates 604, with no false alarm. The one it does not
+// is a reference page, whose paragraphs are never rendered anyway.
+// bodyFh is quantized: it is a median over completed pages and drifts by
+// hundredths early in a fresh run, which is invisible and must not invalidate
+// every page in the book.
+const TR_SIG_STRIDE = 32;
+function trPageSig(
+  paras: TrParagraph[] | undefined,
+  figs: readonly FigureRegion[],
+  bodyFh: number,
+  refPage: boolean,
+): string {
+  if (refPage) return `ref|${figs.length}`;
+  if (!paras?.length) return `orig|${figs.length}`;
+  let s = `${paras.length}|${Math.round(bodyFh * 10)}|${figs.length}`;
+  for (const p of paras) {
+    let k = 0;
+    for (let i = 0; i < p.tr.length; i += TR_SIG_STRIDE) k = (k * 31 + p.tr.charCodeAt(i)) >>> 0;
+    s += `|${p.kind[0]}${p.contOf ? "c" : ""}${p.tr.length}.${k.toString(36)}`;
+  }
+  return s;
+}
+
 function Page({
   doc,
   num,
   scale,
   baseSize,
   viewMode,
-  trVersion,
   getTrPage,
   getTrFigs,
   getBodyFh,
@@ -589,7 +628,6 @@ function Page({
   scale: number;
   baseSize: Size;
   viewMode: ViewMode;
-  trVersion: number;
   getTrPage: (n: number) => TrParagraph[] | undefined;
   getTrFigs: (n: number) => FigureRegion[];
   getBodyFh: () => number;
@@ -614,12 +652,6 @@ function Page({
   // stale-content policy (WP-K): which doc/page the CURRENT children belong to
   const staleKeyRef = useRef<{ doc: PDFDocumentProxy; num: number } | null>(null);
 
-  // trVersion joins the effect deps ONLY in translation mode: while the engine
-  // runs, every finished page bumps it and re-runs the effect (a full page
-  // re-render — accepted cost during active translation) so visible pages gain
-  // their reflowed translation live, without a manual toggle. In orig mode the
-  // dep is pinned to -1, so translation progress never re-renders pages.
-  const trDep = viewMode === "tr" ? trVersion : -1;
   // bibliography/reference pages (store.refPages, set by the engine's isRefPage
   // classifier) keep the ORIGINAL render even in translation mode — translated
   // reference entries come out corrupted, the original is strictly better
@@ -627,6 +659,13 @@ function Page({
   // reflow pages own their height: natural flow height, but never shorter than
   // the original render (min-height), so virtualization placeholders keep size
   const reflow = viewMode === "tr" && !refPage && !!getTrPage(num)?.length;
+  // The render effect's translation dependency: THIS page's own store content
+  // (see trPageSig), recomputed on every progress event but only re-running the
+  // effect when this page changed. So a page gains its reflowed translation the
+  // moment the engine finishes it — no manual toggle — while the rest of the
+  // viewport is left alone. In orig mode the dep is pinned, exactly as before:
+  // translation progress never re-renders an untranslated view.
+  const trSig = viewMode === "tr" ? trPageSig(getTrPage(num), getTrFigs(num), getBodyFh(), refPage) : "";
 
   useEffect(() => {
     const el = ref.current!;
@@ -825,7 +864,7 @@ function Page({
       // NOTE: `rendered` (the page's true base size) is also NOT reset —
       // see the placeholder comment above.
     };
-  }, [doc, num, scale, viewMode, trDep, getTrPage, getTrFigs, getBodyFh, isRefPage, linkService]);
+  }, [doc, num, scale, viewMode, trSig, getTrPage, getTrFigs, getBodyFh, isRefPage, linkService]);
 
   return (
     <div
@@ -1184,7 +1223,15 @@ export default function App() {
       booktranslate.loadBookTranslation(p).then((st) => {
         if (st && pathRef.current === p) {
           trStoreRef.current = st;
-          setTrInfo({ done: st.donePages.length, total: st.total });
+          // referential bail-out, like setRun/setAnyStall above: an update run
+          // re-sweeps pages that are already done, so donePages does not move
+          // for the whole sweep and a fresh object here would re-render the
+          // page grid ~838 times for nothing
+          setTrInfo((prev) =>
+            prev && prev.done === st.donePages.length && prev.total === st.total
+              ? prev
+              : { done: st.donePages.length, total: st.total },
+          );
           setTrVersion((v) => v + 1);
         }
       });
@@ -2864,7 +2911,6 @@ export default function App() {
                   scale={scale}
                   baseSize={baseSize}
                   viewMode={viewMode}
-                  trVersion={trVersion}
                   getTrPage={getTrPage}
                   getTrFigs={getTrFigs}
                   getBodyFh={getBodyFh}
