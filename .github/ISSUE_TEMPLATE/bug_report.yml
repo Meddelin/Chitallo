@@ -1,0 +1,46 @@
+name: Bug report
+description: Something in Chitallo does not work
+labels: [bug]
+body:
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: What you did, what you expected, and what happened instead.
+    validations:
+      required: true
+
+  - type: input
+    id: version
+    attributes:
+      label: Chitallo version
+      description: From «Translation ▾» → «About Chitallo».
+      placeholder: "0.1.0"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: platform
+    attributes:
+      label: Platform
+      options:
+        - Windows 11
+        - Windows 10
+        - macOS (Apple silicon)
+        - macOS (Intel)
+        - Other
+    validations:
+      required: true
+
+  - type: textarea
+    id: stack
+    attributes:
+      label: Translation stack
+      description: >
+        Only if translation is involved. Settings shows whether Chitallo found
+        llama.cpp and where; `llama-server --version` in a terminal tells the
+        rest. If a specific PDF is involved, say whether it has a text layer
+        (the app says so when it does not).
+      placeholder: |
+        Engine: llama.cpp found at /opt/homebrew/bin/llama-server, version ...
+        Model: downloaded / not downloaded

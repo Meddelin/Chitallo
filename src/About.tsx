@@ -1,13 +1,14 @@
-// «О pdfer» (WP-F): идентичность и юридика одним тихим экраном — глиф + версия
-// из package.json, строка приватности и скроллируемые third-party-уведомления.
-// Грамматика поверхности — solid-модалка как ModelSetupModal/ShortcutsOverlay.
+// «About Chitallo» (WP-F): identity and legalese on one quiet screen — the glyph,
+// the version from package.json, the privacy line, and scrollable third-party
+// notices. Surface grammar: a solid modal, like ModelSetupModal/ShortcutsOverlay.
 
 import { openUrl } from "@tauri-apps/plugin-opener";
 import pkg from "../package.json";
 import { IconClose } from "./icons";
+import { t } from "./i18n";
 
-// Инлайн-копия глифа приложения (src-tauri/icons/icon.svg) — те же формы и
-// цвета, что в таскбаре: страница в момент перевода.
+// Inline copy of the app glyph (src-tauri/icons/icon.svg) — the same shapes
+// and colours as in the taskbar: a page caught mid-translation.
 export function AppGlyph({ size = 40 }: { size?: number }) {
   return (
     <svg width={size} height={size} viewBox="0 0 1024 1024" aria-hidden="true" className="shrink-0">
@@ -30,26 +31,29 @@ export function AppGlyph({ size = 40 }: { size?: number }) {
 
 type Notice = { name: string; license: string; url: string; note?: string };
 
-// Кураторский список: рантайм, движки и модели. Полные тексты лицензий — по
-// ссылкам (в дистрибутиве добираются cargo-about/license-checker, WP-N).
-const NOTICES: Notice[] = [
-  { name: "pdf.js", license: "Apache-2.0", url: "https://github.com/mozilla/pdf.js" },
-  { name: "Tauri", license: "MIT / Apache-2.0", url: "https://github.com/tauri-apps/tauri" },
-  { name: "llama.cpp", license: "MIT", url: "https://github.com/ggml-org/llama.cpp" },
-  { name: "React", license: "MIT", url: "https://github.com/facebook/react" },
-  { name: "Tailwind CSS", license: "MIT", url: "https://github.com/tailwindlabs/tailwindcss" },
-  {
-    name: "Модель HY-MT1.5-7B · Tencent",
-    license: "Hunyuan Community License",
-    url: "https://huggingface.co/tencent/HY-MT1.5-7B-GGUF/blob/main/License.txt",
-    note: "Бесплатно, в том числе для коммерческого использования; не действует в ЕС, Великобритании и Южной Корее",
-  },
-  {
-    name: "Модель Qwen3.5-4B · Alibaba",
-    license: "Apache-2.0",
-    url: "https://huggingface.co/unsloth/Qwen3.5-4B-GGUF",
-  },
-];
+// A curated list: runtime, engines and models. Full licence texts live behind
+// the links (a distribution collects them with cargo-about/license-checker).
+function notices(): Notice[] {
+  return [
+    { name: "pdf.js", license: "Apache-2.0", url: "https://github.com/mozilla/pdf.js" },
+    { name: "Tauri", license: "MIT / Apache-2.0", url: "https://github.com/tauri-apps/tauri" },
+    { name: "llama.cpp", license: "MIT", url: "https://github.com/ggml-org/llama.cpp" },
+    { name: "Claude Code", license: "Anthropic Commercial Terms", url: "https://code.claude.com/docs/en/setup" },
+    { name: "React", license: "MIT", url: "https://github.com/facebook/react" },
+    { name: "Tailwind CSS", license: "MIT", url: "https://github.com/tailwindlabs/tailwindcss" },
+    {
+      name: t("about.modelHy"),
+      license: "Hunyuan Community License",
+      url: "https://huggingface.co/tencent/HY-MT1.5-7B-GGUF/blob/main/License.txt",
+      note: t("about.hyLicense"),
+    },
+    {
+      name: t("about.modelQwen"),
+      license: "Apache-2.0",
+      url: "https://huggingface.co/unsloth/Qwen3.5-4B-GGUF",
+    },
+  ];
+}
 
 const link = (url: string) => openUrl(url).catch(() => window.open(url, "_blank", "noopener"));
 
@@ -63,39 +67,37 @@ export function AboutModal({ onClose }: { onClose: () => void }) {
     >
       <div className="modal-panel w-[min(26rem,90vw)] rounded-xl bg-white p-4 text-sm text-neutral-800 shadow-2xl dark:bg-neutral-800 dark:text-neutral-100 select-none">
         <div className="mb-3 flex items-center text-xs text-neutral-500 dark:text-neutral-400">
-          <span>О программе</span>
+          <span>{t("about.title")}</span>
           <span className="flex-1" />
           <button
             className="px-0.5 transition-colors hover:text-neutral-800 dark:hover:text-neutral-100"
             onClick={onClose}
-            title="Закрыть (Esc)"
+            title={t("ui.close")}
           >
             <IconClose />
           </button>
         </div>
 
-        {/* локап: глиф + строчное «pdfer» (Р-8) + версия из package.json */}
+        {/* lockup: glyph + «Chitallo» + the version from package.json */}
         <div className="flex items-center gap-3">
           <AppGlyph size={40} />
           <div className="min-w-0">
             <div className="text-base font-medium leading-tight">
-              pdfer <span className="ml-1 text-xs font-normal tabular-nums text-neutral-500 dark:text-neutral-400">{pkg.version}</span>
+              Chitallo <span className="ml-1 text-xs font-normal tabular-nums text-neutral-500 dark:text-neutral-400">{pkg.version}</span>
             </div>
-            <div className="text-xs text-neutral-500 dark:text-neutral-400">Читалка с локальным переводом EN→RU</div>
+            <div className="text-xs text-neutral-500 dark:text-neutral-400">{t("app.tagline")}</div>
           </div>
         </div>
 
-        <p className="mt-3 leading-relaxed">
-          Работает полностью офлайн. Книги и переводы не покидают ваш компьютер.
-        </p>
+        <p className="mt-3 leading-relaxed">{t("app.privacy")}.</p>
         <p className="mt-1 text-xs leading-relaxed text-neutral-500 dark:text-neutral-400">
-          Исключение — «Спросить»: вопрос и фрагмент книги отправляются в Claude.
+          {t("app.privacyAsk")}
         </p>
 
         <div className="mt-3 border-t border-neutral-200 pt-2 dark:border-neutral-700">
-          <div className="mb-1 text-xs text-neutral-500 dark:text-neutral-400">Сторонние компоненты</div>
+          <div className="mb-1 text-xs text-neutral-500 dark:text-neutral-400">{t("about.thirdParty")}</div>
           <div className="-mx-1 max-h-[38vh] overflow-y-auto overscroll-contain px-1">
-            {NOTICES.map((n) => (
+            {notices().map((n) => (
               <div key={n.name} className="py-1">
                 <div className="flex items-baseline gap-3">
                   <button

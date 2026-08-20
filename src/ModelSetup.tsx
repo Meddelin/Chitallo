@@ -1,8 +1,11 @@
-import { useEffect, useState, useSyncExternalStore } from "react";
+import { useCallback, useEffect, useState, useSyncExternalStore } from "react";
 import { Channel, invoke } from "@tauri-apps/api/core";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import { isServerUp } from "./translate";
 import { IconClose } from "./icons";
+import { EngineInstall } from "./Depends";
+import { engineStatus, joinPath, type ToolStatus } from "./host";
+import { fmtGb, fmtMbps, fmtNum, t } from "./i18n";
 
 // ---- model onboarding + the single status vocabulary (WP-B) -----------------
 //
@@ -10,12 +13,16 @@ import { IconClose } from "./icons";
 // popover, glossary modal, library card) reads the SAME status source and the
 // SAME download store from here, so one state never has three names.
 //
-// Status source: Tauri `translation_status` — "none" | "external" | "starting"
-// | "spawned" | "dead". A bare /health probe cannot be the source of truth:
-// llama-server answers 503 while the model loads, which must read as
-// «запускается», never as «не запущена».
+// Status source: Tauri `translation_status` — "noengine" | "none" |
+// "external" | "starting" | "spawned" | "dead". A bare /health probe cannot be
+// the source of truth: llama-server answers 503 while the model loads, which
+// must read as «starting», never as «not running».
+//
+// "noengine" and "none" are two different problems with two different fixes:
+// llama.cpp is not installed (install it), versus the weights are not
+// downloaded (download them). Every surface keeps them apart.
 
-export type ModelStatus = "none" | "external" | "starting" | "spawned" | "dead";
+export type ModelStatus = "noengine" | "none" | "external" | "starting" | "spawned" | "dead";
 
 export const statusUp = (s: string | null | undefined): boolean => s === "spawned" || s === "external";
 
@@ -58,14 +65,17 @@ export type Dl = {
   error?: string | null;
 };
 
-export const MODEL_META: Record<ModelKey, { size: number; sizeLabel: string }> = {
-  main: { size: 4_624_649_312, sizeLabel: "4,6 ГБ" },
-  aux: { size: 2_740_937_888, sizeLabel: "2,7 ГБ" },
+export const MODEL_SIZE: Record<ModelKey, number> = {
+  main: 4_624_649_312,
+  aux: 2_740_937_888,
 };
 
+/// «4,6 ГБ» / «4.6 GB» — recomputed per call so a language switch is picked up.
+export const sizeLabel = (m: ModelKey): string => fmtGb(MODEL_SIZE[m]);
+
 const dlState: Record<ModelKey, Dl> = {
-  main: { status: "idle", received: 0, total: MODEL_META.main.size, bps: 0 },
-  aux: { status: "idle", received: 0, total: MODEL_META.aux.size, bps: 0 },
+  main: { status: "idle", received: 0, total: MODEL_SIZE.main, bps: 0 },
+  aux: { status: "idle", received: 0, total: MODEL_SIZE.aux, bps: 0 },
 };
 const listeners = new Set<() => void>();
 const setDl = (m: ModelKey, dl: Dl) => {
@@ -126,10 +136,10 @@ export function cancelDownload(model: ModelKey): void {
 }
 
 /// After delete_model (Settings): the shared snapshot must go back to a blank
-/// «Скачать», not linger on "done"/"cancelled" from the previous life —
-/// a stale "done" would read as «модель запускается…» in the menu row.
+/// «Download», not linger on "done"/"cancelled" from the previous life — a
+/// stale "done" would read as «the model is starting…» in the menu row.
 export function resetDownload(model: ModelKey): void {
-  setDl(model, { status: "idle", received: 0, total: MODEL_META[model].size, bps: 0 });
+  setDl(model, { status: "idle", received: 0, total: MODEL_SIZE[model], bps: 0 });
 }
 
 // after a webview reload: if Rust still runs a download, re-subscribe; if a
@@ -201,30 +211,28 @@ export async function modelFileReady(model: ModelKey): Promise<boolean | null> {
   }
 }
 
-// ---- formatting (voice rules: decimal comma, «осталось …») ------------------
-
-export function fmtGb(bytes: number): string {
-  return `${(bytes / 1e9).toFixed(1).replace(".", ",")} ГБ`;
-}
+// ---- formatting -------------------------------------------------------------
 
 function fmtLeft(ms: number): string {
   const min = Math.round(ms / 60000);
-  if (min < 1) return "осталось <1 мин";
-  if (min < 60) return `осталось ~${min} мин`;
+  // the ETA strings carry a leading separator for the run menu; here it is
+  // trimmed off, because the progress line supplies its own «·»
+  if (min < 1) return t("tr.etaMinSub").trim().replace(/^·\s*/, "");
+  if (min < 60) return t("tr.etaMin", { n: min }).trim().replace(/^·\s*/, "");
   const h = ms / 3600000;
-  return `осталось ~${(h < 10 ? h.toFixed(1) : String(Math.round(h))).replace(".", ",")} ч`;
+  return t("tr.etaHour", { n: h < 10 ? fmtNum(h) : Math.round(h) }).trim().replace(/^·\s*/, "");
 }
 
 export function dlPct(dl: Dl): number {
   return Math.floor((100 * dl.received) / Math.max(1, dl.total));
 }
 
-/// «42% · 11 МБ/с · осталось ~6 мин» (speed/ETA only once measured)
+/// «42% · 11 MB/s · ~6 min left» (speed/ETA only once measured)
 export function dlProgressLine(dl: Dl): string {
-  if (dl.status === "verifying") return "Проверка файла…";
+  if (dl.status === "verifying") return t("model.verifying");
   const parts = [`${dlPct(dl)}%`];
   if (dl.bps > 500_000) {
-    parts.push(`${Math.max(1, Math.round(dl.bps / 1e6))} МБ/с`);
+    parts.push(fmtMbps(dl.bps));
     parts.push(fmtLeft(((dl.total - dl.received) / dl.bps) * 1000));
   }
   return parts.join(" · ");
@@ -233,10 +241,10 @@ export function dlProgressLine(dl: Dl): string {
 export function dlErrorLine(err?: string | null): string {
   if (err && err.startsWith("no_space:")) {
     const missing = Number(err.slice("no_space:".length));
-    return `Недостаточно места на диске — нужно ещё ${fmtGb(Math.max(missing || 0, 1e8))}`;
+    return t("model.noSpace", { size: fmtGb(Math.max(missing || 0, 1e8)) });
   }
-  if (err === "checksum") return "Файл повреждён при скачивании — попробуйте ещё раз";
-  return "Скачивание прервалось — можно продолжить с того же места";
+  if (err === "checksum") return t("model.checksum");
+  return t("model.interrupted");
 }
 
 // ---- shared primitives ------------------------------------------------------
@@ -258,7 +266,7 @@ export function Progress({ dl, onCancel }: { dl: Dl; onCancel: () => void }) {
         <span className="flex-1" />
         {dl.status === "running" && (
           <button className="transition-colors hover:text-neutral-700 dark:hover:text-neutral-200" onClick={onCancel}>
-            Отменить
+            {t("ui.cancel")}
           </button>
         )}
       </div>
@@ -266,20 +274,19 @@ export function Progress({ dl, onCancel }: { dl: Dl; onCancel: () => void }) {
   );
 }
 
-// Р-3: download is user-initiated and the model license is visible next to
-// every «Скачать» for the HY-MT weights.
+// The download is user-initiated and the model licence is visible next to
+// every «Download» of the HY-MT weights.
 const LICENSE_URL = "https://huggingface.co/tencent/HY-MT1.5-7B-GGUF/blob/main/License.txt";
 
 function LicenseNote() {
   return (
     <p className="text-xs leading-relaxed text-neutral-500 dark:text-neutral-400">
-      Модель HY-MT1.5 (Tencent) — лицензия Hunyuan Community: бесплатно, в том числе для коммерческого
-      использования; не действует в ЕС, Великобритании и Южной Корее.{" "}
+      {t("model.license")}{" "}
       <button
         className="underline underline-offset-2 transition-colors hover:text-neutral-700 dark:hover:text-neutral-200"
         onClick={() => openUrl(LICENSE_URL).catch(() => window.open(LICENSE_URL, "_blank"))}
       >
-        Условия
+        {t("model.licenseTerms")}
       </button>
     </p>
   );
@@ -287,6 +294,27 @@ function LicenseNote() {
 
 const PRIMARY_BTN =
   "mt-3 w-full rounded-lg bg-neutral-900 px-3 py-2 text-white transition-colors hover:bg-neutral-700 dark:bg-neutral-100 dark:text-neutral-900 dark:hover:bg-white";
+
+/// llama.cpp's presence, probed only when the status says it is missing —
+/// the probe costs a PATH walk plus a `--version` spawn, so it is never a poll.
+function useEngineProbe(active: boolean): { status: ToolStatus | null; probe: () => void; busy: boolean } {
+  const [status, setStatus] = useState<ToolStatus | null>(null);
+  const [busy, setBusy] = useState(false);
+  const probe = useCallback(() => {
+    setBusy(true);
+    void engineStatus().then((s) => {
+      setStatus(s);
+      setBusy(false);
+      // the engine appeared: let the backend try to start the server again,
+      // so the status row stops saying «not installed» on its own
+      if (s.installed) void restartModel();
+    });
+  }, []);
+  useEffect(() => {
+    if (active) probe();
+  }, [active, probe]);
+  return { status, probe, busy };
+}
 
 /// poll the model status while a surface is visible
 function useModelStatus(intervalMs = 2000): ModelStatus | null {
@@ -311,7 +339,7 @@ function useModelStatus(intervalMs = 2000): ModelStatus | null {
 // (dormant unless the marker file exists at load)
 // The browser pane cannot reach Tauri commands; the REAL webview executes this
 // instead (same pattern as the autotranslate.json dev marker). Marker
-// %APPDATA%/devdl.json: { id, model, destDir, cancelAtBytes? } — every id runs
+// <appData>/devdl.json: { id, model, destDir, cancelAtBytes? } — every id runs
 // once (remembered in localStorage), progress + terminal events are appended
 // to devdl.log next to the marker. Dead code in production builds.
 if (import.meta.env.DEV) {
@@ -321,14 +349,14 @@ if (import.meta.env.DEV) {
     try {
       fs = await import("@tauri-apps/plugin-fs");
       dir = await (await import("@tauri-apps/api/path")).appDataDir();
-      await fs.readFile(`${dir}\\devdl.json`); // no marker → stay dormant
+      await fs.readFile(joinPath(dir, "devdl.json")); // no marker → stay dormant
     } catch {
       return; // plain browser or no marker
     }
     const tick = async () => {
       let cfg: { id: string; model: ModelKey; destDir: string; cancelAtBytes?: number };
       try {
-        cfg = JSON.parse(new TextDecoder().decode(await fs.readFile(`${dir}\\devdl.json`)));
+        cfg = JSON.parse(new TextDecoder().decode(await fs.readFile(joinPath(dir, "devdl.json"))));
       } catch {
         return;
       }
@@ -337,7 +365,7 @@ if (import.meta.env.DEV) {
       const log: string[] = [];
       const put = (m: string) => log.push(`${new Date().toISOString()} ${m}`);
       const flush = () =>
-        fs.writeFile(`${dir}\\devdl.log`, new TextEncoder().encode(log.join("\n") + "\n")).catch(() => {});
+        fs.writeFile(joinPath(dir, "devdl.log"), new TextEncoder().encode(log.join("\n") + "\n")).catch(() => {});
       let cancelSent = false;
       let lastBand = -1;
       const ch = new Channel<Dl>();
@@ -383,6 +411,7 @@ export function ModelSetupModal({ onClose }: { onClose: () => void }) {
   const status = useModelStatus();
   const busy = dlBusy(dl);
   const resumable = (dl.status === "cancelled" || dl.status === "error") && dl.received > 0;
+  const engine = useEngineProbe(status === "noengine");
 
   return (
     <div
@@ -393,56 +422,51 @@ export function ModelSetupModal({ onClose }: { onClose: () => void }) {
     >
       <div className="modal-panel w-[min(24rem,90vw)] rounded-xl bg-white p-4 text-sm text-neutral-800 shadow-2xl dark:bg-neutral-800 dark:text-neutral-100">
         <div className="mb-2 flex items-center text-xs text-neutral-500 select-none dark:text-neutral-400">
-          <span>Модель перевода</span>
+          <span>{t("model.title")}</span>
           <span className="flex-1" />
           <button
             className="px-0.5 transition-colors hover:text-neutral-800 dark:hover:text-neutral-100"
             onClick={onClose}
-            title="Закрыть (Esc)"
+            title={t("ui.close")}
           >
             <IconClose />
           </button>
         </div>
-        {busy ? (
+        {status === "noengine" ? (
+          <EngineInstall status={engine.status} onRecheck={engine.probe} busy={engine.busy} />
+        ) : busy ? (
           <>
-            <p className="leading-relaxed">
-              Модель скачивается — можно читать, скачивание продолжится в фоне.
-            </p>
+            <p className="leading-relaxed">{t("model.downloadingBg")}</p>
             <div className="mt-3">
               <Progress dl={dl} onCancel={() => cancelDownload("main")} />
             </div>
           </>
         ) : statusUp(status) ? (
-          <p className="leading-relaxed">
-            Модель перевода: готова. Выделите текст или Alt+кликните по абзацу — перевод появится рядом.
-          </p>
+          <p className="leading-relaxed">{t("model.readyHint")}</p>
         ) : status === "starting" || dl.status === "done" ? (
           <p className="flex items-center gap-2 leading-relaxed">
-            <Spinner /> Модель запускается… ≈20 с
+            <Spinner /> {t("model.startingShort")}
           </p>
         ) : status === "dead" ? (
           <>
-            <p className="leading-relaxed">Модель не отвечает.</p>
+            <p className="leading-relaxed">{t("model.dead")}</p>
             <button className={PRIMARY_BTN} onClick={() => void restartModel()}>
-              Перезапустить
+              {t("ui.restart")}
             </button>
           </>
         ) : (
           <>
-            <p className="leading-relaxed">
-              pdfer переводит книги локально, без интернета и подписок. Нужна модель перевода — она
-              скачивается один раз и остаётся на компьютере.
-            </p>
+            <p className="leading-relaxed">{t("model.pitch")}</p>
             <p className="mt-2 text-xs text-neutral-500 dark:text-neutral-400">
-              HY-MT1.5 · {MODEL_META.main.sizeLabel} · перевод EN→RU офлайн
+              {t("model.line", { size: sizeLabel("main") })}
             </p>
             {dl.status === "error" && (
               <p className="mt-2 text-xs text-red-600 dark:text-red-400">{dlErrorLine(dl.error)}</p>
             )}
             <button className={PRIMARY_BTN} onClick={() => startDownload("main")}>
               {resumable
-                ? `Продолжить скачивание · ${dlPct(dl)}%`
-                : `Скачать модель перевода (${MODEL_META.main.sizeLabel})`}
+                ? t("model.resumeCta", { pct: dlPct(dl) })
+                : t("model.downloadCta", { size: sizeLabel("main") })}
             </button>
             <div className="mt-3">
               <LicenseNote />
@@ -455,9 +479,9 @@ export function ModelSetupModal({ onClose }: { onClose: () => void }) {
 }
 
 // ---- library empty-state card -----------------------------------------------
-// Тихий онбординг (Р-2): the first-launch screen carries the value line and
-// the user-initiated download; «Позже — просто читать» dismisses for good
-// (the menu status row still offers the download any time).
+// Quiet onboarding: the empty-library screen carries the value line and the
+// user-initiated download; «Later — just read» dismisses it for good (the menu
+// status row still offers the download any time).
 
 export function ModelSetupCard() {
   const dl = useDownload("main");
@@ -465,6 +489,7 @@ export function ModelSetupCard() {
   const [later, setLater] = useState(() => localStorage.getItem("pdfer:modellater") === "1");
   const busy = dlBusy(dl);
   const resumable = (dl.status === "cancelled" || dl.status === "error") && dl.received > 0;
+  const engine = useEngineProbe(status === "noengine");
 
   if (status === null) return null; // not yet known — no flash of the card
   if (later && !busy) return null;
@@ -472,23 +497,27 @@ export function ModelSetupCard() {
 
   return (
     <div className="w-[22rem] max-w-[92vw] rounded-xl border border-neutral-300 bg-white/60 p-4 text-left text-sm text-neutral-700 dark:border-neutral-700 dark:bg-neutral-800/60 dark:text-neutral-300">
-      <div className="leading-relaxed">pdfer переводит книги локально, без интернета и подписок</div>
-      {busy ? (
+      <div className="leading-relaxed">{t("model.pitchShort")}</div>
+      {status === "noengine" ? (
+        <div className="mt-3">
+          <EngineInstall status={engine.status} onRecheck={engine.probe} busy={engine.busy} />
+        </div>
+      ) : busy ? (
         <div className="mt-3">
           <Progress dl={dl} onCancel={() => cancelDownload("main")} />
         </div>
       ) : status === "starting" || dl.status === "done" ? (
         <div className="mt-3 flex items-center gap-2 text-xs text-neutral-500 dark:text-neutral-400">
-          <Spinner /> Модель перевода: запускается…
+          <Spinner /> {t("model.starting")}
         </div>
       ) : status === "dead" ? (
         <div className="mt-3 flex items-center gap-2 text-xs text-neutral-500 dark:text-neutral-400">
-          <span>Модель не отвечает</span>
+          <span>{t("model.dead")}</span>
           <button
             className="underline underline-offset-2 transition-colors hover:text-neutral-700 dark:hover:text-neutral-200"
             onClick={() => void restartModel()}
           >
-            Перезапустить
+            {t("ui.restart")}
           </button>
         </div>
       ) : (
@@ -498,8 +527,8 @@ export function ModelSetupCard() {
           )}
           <button className={PRIMARY_BTN} onClick={() => startDownload("main")}>
             {resumable
-              ? `Продолжить скачивание · ${dlPct(dl)}%`
-              : `Скачать модель перевода (${MODEL_META.main.sizeLabel})`}
+              ? t("model.resumeCta", { pct: dlPct(dl) })
+              : t("model.downloadCta", { size: sizeLabel("main") })}
           </button>
           <div className="mt-2 text-center">
             <button
@@ -509,7 +538,7 @@ export function ModelSetupCard() {
                 setLater(true);
               }}
             >
-              Позже — просто читать
+              {t("model.later")}
             </button>
           </div>
           <div className="mt-3">

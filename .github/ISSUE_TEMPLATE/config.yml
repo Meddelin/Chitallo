@@ -1,0 +1,8 @@
+blank_issues_enabled: true
+contact_links:
+  - name: llama.cpp installation
+    url: https://github.com/ggml-org/llama.cpp/blob/master/docs/install.md
+    about: Chitallo does not ship the inference engine — install issues belong upstream.
+  - name: Claude Code installation
+    url: https://code.claude.com/docs/en/setup
+    about: The optional «Ask» sidebar needs the Claude Code CLI and a Claude plan.

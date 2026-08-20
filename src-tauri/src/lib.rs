@@ -4,7 +4,7 @@ use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -12,13 +12,11 @@ use sha2::{Digest, Sha256};
 use tauri::ipc::Channel;
 use tauri::Manager;
 
-#[cfg(windows)]
-use std::os::windows::process::CommandExt;
+mod platform;
+mod print;
 
 const LLAMA_PORT: u16 = 11544;
 const AUX_PORT: u16 = 11545;
-#[cfg(windows)]
-const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
 /// Common shape of a managed llama-server instance so the spawn/poll logic is
 /// shared between the main translator (11544) and the aux terminologist (11545).
@@ -100,7 +98,41 @@ fn port_open(port: u16) -> bool {
     TcpStream::connect_timeout(&addr, Duration::from_millis(400)).is_ok()
 }
 
-/// Run `llama-server.exe --list-devices` and pick the best GPU:
+/// How to ask llama-server for GPU offload on this machine.
+enum Offload {
+    /// Put every layer on this specific device (`-ngl 99 --device <id>`).
+    Device(String),
+    /// Put every layer on whatever GPU backend the build has, without naming
+    /// one (`-ngl 99`). llama.cpp clamps the count to the layers that exist and
+    /// falls back to the CPU when no GPU backend is compiled in.
+    All,
+    /// No usable GPU: omit `-ngl` entirely.
+    Cpu,
+}
+
+/// Which GPU (if any) the model should be offloaded to.
+///
+/// macOS is a separate case on purpose. There is exactly one GPU to choose
+/// from, so a selector buys nothing — and the Metal backend's id in
+/// `--list-devices` is not something worth parsing for a choice that has no
+/// alternatives. Asking for full offload without naming a device is both
+/// simpler and correct whether or not the build has Metal in it.
+///
+/// Everywhere else the machine may genuinely have several devices, and the
+/// wrong one (an integrated GPU next to a discrete one) is much slower than the
+/// right one, so the list is parsed and a device is named.
+fn pick_offload(exe: &Path, label: &str) -> Offload {
+    if cfg!(target_os = "macos") {
+        eprintln!("[{label}] macOS: full offload to the single GPU, no device selector");
+        return Offload::All;
+    }
+    match pick_device(exe, label) {
+        Some(id) => Offload::Device(id),
+        None => Offload::Cpu,
+    }
+}
+
+/// Run `llama-server --list-devices` and pick the best GPU:
 /// prefer NVIDIA, else the first non-integrated device. None => CPU mode.
 fn pick_device(exe: &Path, label: &str) -> Option<String> {
     let mut cmd = Command::new(exe);
@@ -108,8 +140,7 @@ fn pick_device(exe: &Path, label: &str) -> Option<String> {
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    #[cfg(windows)]
-    cmd.creation_flags(CREATE_NO_WINDOW);
+    platform::quiet(&mut cmd);
     let out = match cmd.output() {
         Ok(o) => o,
         Err(e) => {
@@ -162,27 +193,57 @@ fn set_status<S: LlamaSrv>(app: &tauri::AppHandle, s: &str) {
     *state.status().lock().unwrap() = s.into();
 }
 
-/// Resolve llama-server.exe: the copy bundled as an installer resource wins
-/// (решение Р-5 — the installer ships the engine, only weights are
-/// downloaded); the appData copy remains as a fallback for dev setups and
-/// manual installs. The DLLs live next to the exe either way, so spawning
-/// from the returned path always finds them.
-fn llama_server_exe(app: &tauri::AppHandle, data_dir: &Path) -> PathBuf {
-    if let Ok(res) = app.path().resource_dir() {
-        let bundled = res.join("llama").join("llama-server.exe");
-        if bundled.exists() {
-            return bundled;
-        }
-    }
-    data_dir.join("llama").join("llama-server.exe")
+/// Where this app looks for a manually placed llama.cpp build. Anything
+/// dropped here wins over a package-manager install, and its runtime libraries
+/// are found next to it, exactly as llama.cpp ships them.
+fn app_llama_dir(data_dir: &Path) -> PathBuf {
+    data_dir.join("llama")
+}
+
+/// Resolve `llama-server`. Chitallo ships no engine of its own (see README
+/// «Dependencies»): the user installs llama.cpp with one command, and we find
+/// it. `None` means "not installed" and the UI says which command installs it.
+fn llama_server_exe(data_dir: &Path) -> Option<PathBuf> {
+    platform::llama_server(&app_llama_dir(data_dir))
+}
+
+/// What the engine screens (onboarding, settings) need to know: is the
+/// llama.cpp binary installed, and where did we find it.
+#[derive(serde::Serialize)]
+struct EngineStatus {
+    installed: bool,
+    path: Option<String>,
+    version: Option<String>,
+}
+
+#[tauri::command]
+async fn engine_status(app: tauri::AppHandle) -> Result<EngineStatus, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let data_dir = app.path().app_data_dir().map_err(|e| e.to_string())?;
+        Ok(match llama_server_exe(&data_dir) {
+            Some(exe) => EngineStatus {
+                installed: true,
+                version: platform::probe_version(&exe),
+                path: Some(exe.display().to_string()),
+            },
+            None => EngineStatus { installed: false, path: None, version: None },
+        })
+    })
+    .await
+    .map_err(|e| format!("engine_status task failed: {e}"))?
 }
 
 /// Spawn (or attach to) a llama-server instance for S. Blocking: run on a
 /// background thread. Status transitions:
-///   model missing / exe missing -> "none"
 ///   port already answering      -> "external" (reused, never killed)
+///   llama.cpp not installed     -> "noengine"
+///   weights not downloaded      -> "none"
 ///   spawn failed / died early / no answer in 120s -> "dead"
 ///   port answers                -> S::UP
+///
+/// The port is probed first on purpose: a llama-server the user started
+/// themselves makes both local prerequisites irrelevant, so we must not report
+/// a missing engine or missing weights while a perfectly good server answers.
 fn init_llama_server<S: LlamaSrv>(app: tauri::AppHandle) {
     let label = S::LABEL;
     let data_dir = match app.path().app_data_dir() {
@@ -194,13 +255,7 @@ fn init_llama_server<S: LlamaSrv>(app: tauri::AppHandle) {
         }
     };
     let model = data_dir.join("models").join(S::MODEL_FILE);
-    let exe = llama_server_exe(&app, &data_dir);
 
-    if !model.exists() {
-        eprintln!("[{label}] model not found at {} -> status none", model.display());
-        set_status::<S>(&app, "none");
-        return;
-    }
     if port_open(S::PORT) {
         eprintln!(
             "[{label}] port {} already answering -> reusing external llama-server (no spawn, will never kill it)",
@@ -209,14 +264,19 @@ fn init_llama_server<S: LlamaSrv>(app: tauri::AppHandle) {
         set_status::<S>(&app, "external");
         return;
     }
-    if !exe.exists() {
-        eprintln!("[{label}] llama-server.exe not found at {} -> status none", exe.display());
+    let Some(exe) = llama_server_exe(&data_dir) else {
+        eprintln!("[{label}] llama-server not found on PATH or in the app dir -> status noengine");
+        set_status::<S>(&app, "noengine");
+        return;
+    };
+    if !model.exists() {
+        eprintln!("[{label}] model not found at {} -> status none", model.display());
         set_status::<S>(&app, "none");
         return;
     }
 
     set_status::<S>(&app, "starting");
-    let device = pick_device(&exe, label);
+    let offload = pick_offload(&exe, label);
 
     let mut cmd = Command::new(&exe);
     cmd.arg("-m")
@@ -230,11 +290,16 @@ fn init_llama_server<S: LlamaSrv>(app: tauri::AppHandle) {
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
-    if let Some(id) = &device {
-        cmd.arg("-ngl").arg("99").arg("--device").arg(id);
-    } // else: CPU mode, omit -ngl entirely
-    #[cfg(windows)]
-    cmd.creation_flags(CREATE_NO_WINDOW);
+    match &offload {
+        Offload::Device(id) => {
+            cmd.arg("-ngl").arg("99").arg("--device").arg(id);
+        }
+        Offload::All => {
+            cmd.arg("-ngl").arg("99");
+        }
+        Offload::Cpu => {} // omit -ngl entirely
+    }
+    platform::quiet(&mut cmd);
 
     let child = match cmd.spawn() {
         Ok(c) => c,
@@ -246,9 +311,13 @@ fn init_llama_server<S: LlamaSrv>(app: tauri::AppHandle) {
     };
     let pid = child.id();
     eprintln!(
-        "[{label}] spawned llama-server pid {pid} on port {} (device: {})",
+        "[{label}] spawned llama-server pid {pid} on port {} (offload: {})",
         S::PORT,
-        device.as_deref().unwrap_or("CPU")
+        match &offload {
+            Offload::Device(id) => id.as_str(),
+            Offload::All => "all layers, default device",
+            Offload::Cpu => "CPU",
+        }
     );
     {
         let state = app.state::<S>();
@@ -423,16 +492,64 @@ struct AskState {
     inner: Mutex<AskInner>,
 }
 
-/// Resolve the Claude Code CLI binary: %USERPROFILE%\.local\bin\claude.exe
-/// if present, else bare "claude.exe" (PATH lookup at spawn time).
+/// Resolve the Claude Code CLI. The native installer puts it in
+/// `~/.local/bin` on every platform; Homebrew and WinGet put it on the PATH.
+/// If none of those has it, fall back to the bare name so the spawn error is
+/// the familiar "not found" rather than a path we invented.
 fn claude_exe_path() -> PathBuf {
-    if let Ok(profile) = std::env::var("USERPROFILE") {
-        let p = Path::new(&profile).join(".local").join("bin").join("claude.exe");
-        if p.exists() {
-            return p;
+    platform::claude_cli()
+        .unwrap_or_else(|| PathBuf::from(if cfg!(windows) { "claude.exe" } else { "claude" }))
+}
+
+/// What the «Ask» onboarding step needs: is the Claude Code CLI installed,
+/// where, and which version. Probing costs a process spawn, so this is a
+/// command the UI calls on demand rather than a poll.
+#[derive(serde::Serialize)]
+struct ClaudeStatus {
+    installed: bool,
+    path: Option<String>,
+    version: Option<String>,
+}
+
+#[tauri::command]
+async fn claude_status() -> Result<ClaudeStatus, String> {
+    tauri::async_runtime::spawn_blocking(|| match platform::claude_cli() {
+        Some(exe) => ClaudeStatus {
+            installed: true,
+            version: platform::probe_version(&exe),
+            path: Some(exe.display().to_string()),
+        },
+        None => ClaudeStatus { installed: false, path: None, version: None },
+    })
+    .await
+    .map_err(|e| format!("claude_status task failed: {e}"))
+}
+
+/// Host facts the frontend cannot get on its own and that decide what it
+/// shows: which install command to print, whether the shortcut hints say Cmd
+/// or Ctrl, and whether PDF export exists on this platform at all.
+#[derive(serde::Serialize)]
+struct HostInfo {
+    /// "windows" | "macos" | "linux"
+    os: String,
+    pdf_export: bool,
+    version: String,
+}
+
+#[tauri::command]
+fn host_info() -> HostInfo {
+    HostInfo {
+        os: if cfg!(windows) {
+            "windows"
+        } else if cfg!(target_os = "macos") {
+            "macos"
+        } else {
+            "linux"
         }
+        .into(),
+        pdf_export: print::SUPPORTED,
+        version: env!("CARGO_PKG_VERSION").into(),
     }
-    PathBuf::from("claude.exe")
 }
 
 /// Stable working directory for every claude.exe invocation. Claude Code
@@ -501,8 +618,7 @@ fn run_ask(
         cmd.stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
-        #[cfg(windows)]
-        cmd.creation_flags(CREATE_NO_WINDOW);
+        platform::quiet(&mut cmd);
 
         let mut child = cmd.spawn().map_err(|e| {
             if e.kind() == std::io::ErrorKind::NotFound {
@@ -511,7 +627,7 @@ fn run_ask(
                 format!("spawn_failed: {e}")
             }
         })?;
-        eprintln!("[ask] spawned claude.exe pid {}", child.id());
+        eprintln!("[ask] spawned claude pid {}", child.id());
         let stdin = child.stdin.take();
         let stdout = child.stdout.take();
         let stderr = child.stderr.take();
@@ -522,7 +638,7 @@ fn run_ask(
     };
 
     // Write the prompt on its own thread (avoids pipe deadlock on large
-    // prompts), then close stdin so claude.exe starts the turn.
+    // prompts), then close stdin so the CLI starts the turn.
     if let Some(mut si) = stdin {
         std::thread::spawn(move || {
             let _ = si.write_all(prompt.as_bytes());
@@ -582,7 +698,7 @@ fn run_ask(
     if !saw_result {
         // Synthesize a terminal result line so the frontend always settles.
         let (subtype, msg) = if cancelled {
-            ("cancelled".to_string(), "Запрос отменён".to_string())
+            ("cancelled".to_string(), String::new())
         } else {
             let tail: String = {
                 let t = stderr_text.trim();
@@ -594,12 +710,15 @@ fn run_ask(
                 }
             };
             let msg = if tail.is_empty() {
-                format!("claude.exe завершился без ответа ({exit_desc})")
+                exit_desc.clone()
             } else {
-                format!("claude.exe завершился без ответа ({exit_desc}): {tail}")
+                format!("{exit_desc}: {tail}")
             };
             ("error_process".to_string(), msg)
         };
+        // `result` carries only the raw process detail (possibly empty): the
+        // sentence the user reads is composed in the frontend, in the
+        // interface language. Nothing user-facing is worded here.
         let synth = serde_json::json!({
             "type": "result",
             "subtype": subtype,
@@ -609,7 +728,7 @@ fn run_ask(
         });
         let _ = on_event.send(synth.to_string());
     } else if !exit_desc.is_empty() && !cancelled {
-        eprintln!("[ask] claude.exe non-zero exit after result line: {exit_desc}");
+        eprintln!("[ask] claude non-zero exit after result line: {exit_desc}");
     }
     Ok(())
 }
@@ -633,13 +752,13 @@ async fn ask_claude(
     .map_err(|e| format!("ask task failed: {e}"))?
 }
 
-/// Kill the in-flight claude.exe, if any. The streaming ask_claude call then
+/// Kill the in-flight claude process, if any. The streaming ask_claude call then
 /// finishes with a synthetic {"type":"result","subtype":"cancelled"} line.
 #[tauri::command]
 fn ask_claude_cancel(state: tauri::State<'_, AskState>) {
     let taken = state.inner.lock().unwrap().child.take();
     if let Some(mut child) = taken {
-        eprintln!("[ask] cancel -> killing claude.exe pid {}", child.id());
+        eprintln!("[ask] cancel -> killing claude pid {}", child.id());
         let _ = child.kill();
         let _ = child.wait();
     }
@@ -649,7 +768,7 @@ fn kill_ask_child(app: &tauri::AppHandle) {
     let state = app.state::<AskState>();
     let taken = state.inner.lock().unwrap().child.take();
     if let Some(mut child) = taken {
-        eprintln!("[ask] app exit -> killing claude.exe pid {}", child.id());
+        eprintln!("[ask] app exit -> killing claude pid {}", child.id());
         let _ = child.kill();
         let _ = child.wait();
     }
@@ -748,30 +867,6 @@ fn dl_emit(app: &tauri::AppHandle, key: &str, ev: DlEvent) {
     }
 }
 
-/// Free bytes available on the volume holding `dir` (which must exist).
-/// None = unknown (non-Windows or API failure) — the space check is skipped.
-#[cfg(windows)]
-fn free_disk_space(dir: &Path) -> Option<u64> {
-    use std::os::windows::ffi::OsStrExt;
-    let mut wide: Vec<u16> = dir.as_os_str().encode_wide().collect();
-    wide.push(0);
-    let mut avail: u64 = 0;
-    let ok = unsafe {
-        windows_sys::Win32::Storage::FileSystem::GetDiskFreeSpaceExW(
-            wide.as_ptr(),
-            &mut avail,
-            std::ptr::null_mut(),
-            std::ptr::null_mut(),
-        )
-    };
-    (ok != 0).then_some(avail)
-}
-
-#[cfg(not(windows))]
-fn free_disk_space(_dir: &Path) -> Option<u64> {
-    None
-}
-
 fn resolve_location(base: &str, loc: &str) -> String {
     if loc.starts_with("http://") || loc.starts_with("https://") {
         return loc.to_string();
@@ -846,7 +941,7 @@ fn do_download(
     }
 
     if offset < spec.size {
-        if let Some(free) = free_disk_space(dir) {
+        if let Some(free) = platform::free_disk_space(dir) {
             let need = spec.size - offset + DL_MARGIN;
             if free < need {
                 return Err(format!("no_space:{}", need - free));
@@ -1138,230 +1233,6 @@ fn delete_model(
     Ok(())
 }
 
-// ---------------------------------------------------------------------------
-// PDF export: print a local HTML file to PDF through WebView2's PrintToPdf.
-//
-// Flow: a hidden WebviewWindow navigates to file://<html_path>; once the page
-// (including its data-URI images) fires the load event, PrintToPdf renders it
-// to <pdf_path> silently — no print dialog, no visible window. The command
-// resolves when the COM completion handler reports the outcome.
-//
-// Threading: WebView2 is single-threaded (STA on the app's main/UI thread).
-// The command runs async on the tokio pool, so the main thread stays free to
-// pump Windows messages — that pump is exactly what delivers both the
-// with_webview closure and the PrintToPdf completion callback. We therefore
-// do NOT need webview2_com::wait_with_pump (that is for apps whose UI thread
-// blocks before an event loop exists); plain mpsc channels + recv_timeout on
-// a blocking-pool thread are enough and cannot deadlock the UI.
-//
-// Teardown: the hidden window is destroyed on every exit path (success,
-// setup error, COM error, timeout) — `drive_print` is the only thing between
-// window creation and the unconditional destroy() below it. If a timeout
-// fires while PrintToPdf is still running, destroying the window tears down
-// the WebView2 controller, which cancels the print job; a completion callback
-// that races the teardown sends into a dropped Receiver and is ignored.
-
-/// JS contract: invoke("print_html_to_pdf", { htmlPath, pdfPath,
-///   pageWidthMm?, pageHeightMm?, marginMm? })
-/// Defaults: A4 portrait (210×297 mm), 12 mm margins on all sides, scale 1.0,
-/// backgrounds printed, no browser headers/footers. Both paths must be
-/// absolute; the output directory is created if missing.
-#[cfg(windows)]
-#[tauri::command]
-async fn print_html_to_pdf(
-    app: tauri::AppHandle,
-    html_path: String,
-    pdf_path: String,
-    page_width_mm: Option<f64>,
-    page_height_mm: Option<f64>,
-    margin_mm: Option<f64>,
-) -> Result<(), String> {
-    let html = PathBuf::from(&html_path);
-    if !html.is_file() {
-        return Err(format!("html file not found: {html_path}"));
-    }
-    let url = tauri::Url::from_file_path(&html)
-        .map_err(|_| format!("cannot build a file:// url from {html_path} (must be absolute)"))?;
-    if !Path::new(&pdf_path).is_absolute() {
-        return Err("pdf_path must be absolute".into());
-    }
-    if let Some(parent) = Path::new(&pdf_path).parent() {
-        if !parent.as_os_str().is_empty() {
-            std::fs::create_dir_all(parent).map_err(|e| format!("cannot create output dir: {e}"))?;
-        }
-    }
-
-    const MM_PER_INCH: f64 = 25.4;
-    let page_w_in = page_width_mm.unwrap_or(210.0) / MM_PER_INCH;
-    let page_h_in = page_height_mm.unwrap_or(297.0) / MM_PER_INCH;
-    let margin_in = margin_mm.unwrap_or(12.0) / MM_PER_INCH;
-
-    // Unique label per call: a lagging teardown of a previous export can never
-    // collide with (and thus fail) the next one.
-    static PRINT_SEQ: AtomicU64 = AtomicU64::new(0);
-    let label = format!("pdf-print-{}", PRINT_SEQ.fetch_add(1, Ordering::Relaxed));
-
-    let (load_tx, load_rx) = std::sync::mpsc::channel::<()>();
-    let window = tauri::WebviewWindowBuilder::new(&app, &label, tauri::WebviewUrl::External(url))
-        .title("Экспорт в PDF")
-        .visible(false)
-        .focused(false)
-        .skip_taskbar(true)
-        .inner_size(900.0, 1200.0)
-        .on_page_load(move |_win, payload| {
-            // Finished == wry's NavigationCompleted == the document's load
-            // event, which waits for <img> decoding incl. data: URIs.
-            if matches!(payload.event(), tauri::webview::PageLoadEvent::Finished) {
-                let _ = load_tx.send(());
-            }
-        })
-        .build()
-        .map_err(|e| format!("failed to create hidden print window: {e}"))?;
-
-    // From here the hidden window exists: whatever happens, destroy it.
-    let result = drive_print(&window, &pdf_path, page_w_in, page_h_in, margin_in, load_rx).await;
-    let _ = window.destroy();
-    result
-}
-
-#[cfg(not(windows))]
-#[tauri::command]
-async fn print_html_to_pdf(
-    _app: tauri::AppHandle,
-    _html_path: String,
-    _pdf_path: String,
-    _page_width_mm: Option<f64>,
-    _page_height_mm: Option<f64>,
-    _margin_mm: Option<f64>,
-) -> Result<(), String> {
-    Err("PDF export via WebView2 is only available on Windows".into())
-}
-
-/// Everything between window creation and teardown, so the caller can
-/// unconditionally destroy() no matter where this errors out.
-#[cfg(windows)]
-async fn drive_print(
-    window: &tauri::WebviewWindow,
-    pdf_path: &str,
-    page_w_in: f64,
-    page_h_in: f64,
-    margin_in: f64,
-    load_rx: std::sync::mpsc::Receiver<()>,
-) -> Result<(), String> {
-    // Big books arrive as one HTML file with many MB of data-URI images;
-    // parsing + decoding can be slow, hence the generous load budget.
-    recv_off_thread(load_rx, 120, "page load in the hidden print window").await?;
-
-    let (done_tx, done_rx) = std::sync::mpsc::channel::<Result<(), String>>();
-    let pdf = pdf_path.to_string();
-    window
-        .with_webview(move |wv| {
-            // Runs on the UI thread. Synchronous COM failures are reported
-            // through the same channel the completion handler uses.
-            if let Err(e) =
-                start_print_to_pdf(&wv, &pdf, page_w_in, page_h_in, margin_in, done_tx.clone())
-            {
-                let _ = done_tx.send(Err(e));
-            }
-        })
-        .map_err(|e| format!("with_webview: {e}"))?;
-
-    recv_off_thread(done_rx, 600, "PrintToPdf completion").await??;
-
-    if !Path::new(pdf_path).is_file() {
-        return Err("PrintToPdf reported success but no file appeared".into());
-    }
-    Ok(())
-}
-
-/// Wait for a channel message on the blocking pool so neither the async
-/// runtime nor the main thread stalls — the main thread must keep pumping
-/// Windows messages, because that is what delivers WebView2's callbacks.
-#[cfg(windows)]
-async fn recv_off_thread<T: Send + 'static>(
-    rx: std::sync::mpsc::Receiver<T>,
-    secs: u64,
-    what: &'static str,
-) -> Result<T, String> {
-    tauri::async_runtime::spawn_blocking(move || {
-        rx.recv_timeout(Duration::from_secs(secs)).map_err(|e| match e {
-            std::sync::mpsc::RecvTimeoutError::Timeout => {
-                format!("timeout ({secs}s) waiting for {what}")
-            }
-            std::sync::mpsc::RecvTimeoutError::Disconnected => {
-                format!("hidden print window died while waiting for {what}")
-            }
-        })
-    })
-    .await
-    .map_err(|e| format!("blocking task join: {e}"))?
-}
-
-/// UI-thread half: configure ICoreWebView2PrintSettings and kick off
-/// PrintToPdf. The completion handler (invoked later, also on the UI thread,
-/// via the app's normal message loop) reports the outcome through `done`.
-#[cfg(windows)]
-fn start_print_to_pdf(
-    wv: &tauri::webview::PlatformWebview,
-    pdf_path: &str,
-    page_w_in: f64,
-    page_h_in: f64,
-    margin_in: f64,
-    done: std::sync::mpsc::Sender<Result<(), String>>,
-) -> Result<(), String> {
-    use webview2_com::Microsoft::Web::WebView2::Win32::{
-        ICoreWebView2Environment6, ICoreWebView2_7, COREWEBVIEW2_PRINT_ORIENTATION_PORTRAIT,
-    };
-    use webview2_com::PrintToPdfCompletedHandler;
-    use windows_core::{Interface, PCWSTR};
-
-    let core = unsafe { wv.controller().CoreWebView2() }.map_err(|e| format!("CoreWebView2: {e}"))?;
-    let wv7: ICoreWebView2_7 = core
-        .cast()
-        .map_err(|e| format!("WebView2 runtime too old for PrintToPdf (needs ICoreWebView2_7): {e}"))?;
-    let env6: ICoreWebView2Environment6 = wv
-        .environment()
-        .cast()
-        .map_err(|e| format!("WebView2 runtime too old (needs ICoreWebView2Environment6): {e}"))?;
-
-    let settings =
-        unsafe { env6.CreatePrintSettings() }.map_err(|e| format!("CreatePrintSettings: {e}"))?;
-    unsafe {
-        settings
-            .SetOrientation(COREWEBVIEW2_PRINT_ORIENTATION_PORTRAIT)
-            .and_then(|_| settings.SetScaleFactor(1.0))
-            .and_then(|_| settings.SetPageWidth(page_w_in))
-            .and_then(|_| settings.SetPageHeight(page_h_in))
-            .and_then(|_| settings.SetMarginTop(margin_in))
-            .and_then(|_| settings.SetMarginBottom(margin_in))
-            .and_then(|_| settings.SetMarginLeft(margin_in))
-            .and_then(|_| settings.SetMarginRight(margin_in))
-            .and_then(|_| settings.SetShouldPrintBackgrounds(true))
-            .and_then(|_| settings.SetShouldPrintSelectionOnly(false))
-            .and_then(|_| settings.SetShouldPrintHeaderAndFooter(false))
-            .map_err(|e| format!("print settings: {e}"))?;
-    }
-
-    let handler = PrintToPdfCompletedHandler::create(Box::new(
-        move |result: windows_core::Result<()>, is_success: bool| {
-            let outcome = match result {
-                Err(e) => Err(format!("PrintToPdf failed: {e}")),
-                Ok(()) if !is_success => Err(
-                    "PrintToPdf reported failure (target file locked, or path invalid?)".into(),
-                ),
-                Ok(()) => Ok(()),
-            };
-            let _ = done.send(outcome);
-            Ok(())
-        },
-    ));
-
-    // UTF-16 buffer only needs to outlive the synchronous call below:
-    // WebView2 copies the string before PrintToPdf returns.
-    let path_w: Vec<u16> = pdf_path.encode_utf16().chain(std::iter::once(0)).collect();
-    unsafe { wv7.PrintToPdf(PCWSTR::from_raw(path_w.as_ptr()), &settings, &handler) }
-        .map_err(|e| format!("PrintToPdf call: {e}"))
-}
 
 /// Kill only the children we spawned ourselves. An llama-server we merely
 /// *reused* (external instance, already listening when we started) is not in
@@ -1393,7 +1264,7 @@ fn kill_children(app: &tauri::AppHandle) {
 ///     the root cause of «крестик не работает».
 ///  2. Even with destroy() working, it closes only the *main* window. With a
 ///     PDF export in flight the hidden `pdf-print-N` window survives, so the
-///     window vanishes but pdfer.exe (and the llama-server it owns) linger with
+///     window vanishes but Chitallo.exe (and the llama-server it owns) linger with
 ///     nothing on screen — measured at 20s+ before the run was killed.
 ///
 /// A busy webview is a third way to strand the same route: the JS handler
@@ -1403,7 +1274,7 @@ fn kill_children(app: &tauri::AppHandle) {
 /// the frontend a short grace period to persist its position, then exit the app
 /// — not just the window — whatever the webview is doing. If even the event
 /// loop cannot service that exit, reap our children directly and leave, so no
-/// orphan pdfer.exe / llama-server.exe survives. destroy() stays permitted as
+/// orphan Chitallo.exe / llama-server.exe survives. destroy() stays permitted as
 /// the fast path: when the webview is responsive it wins the race and the
 /// process is gone in well under the grace period.
 fn own_shutdown(window: &tauri::Window) {
@@ -1478,6 +1349,9 @@ pub fn run() {
         .manage(AskState::default())
         .manage(DownloadsState::default())
         .invoke_handler(tauri::generate_handler![
+            host_info,
+            engine_status,
+            claude_status,
             translation_status,
             restart_translation,
             aux_model_start,
@@ -1489,7 +1363,7 @@ pub fn run() {
             delete_model,
             ask_claude,
             ask_claude_cancel,
-            print_html_to_pdf
+            print::print_html_to_pdf
         ])
         .setup(|app| {
             sweep_stale_export_temps(app.handle());

@@ -40,6 +40,8 @@ import type { PDFDocumentProxy } from "pdfjs-dist";
 import { loadBookTranslation } from "./booktranslate";
 import type { BookTranslation, TrParagraph } from "./booktranslate";
 import { splitCitations } from "./cite";
+import { joinPath } from "./host";
+import { getLang, t } from "./i18n";
 import { FIG_CONTAIN, interArea } from "./paragraphs";
 import type { FigureRegion } from "./paragraphs";
 import type { Rect, Src } from "./crops";
@@ -135,19 +137,19 @@ function pageItems(paras: TrParagraph[], figures: readonly FigureRegion[], bodyF
   return items;
 }
 
-const gapRu = (a: number, b: number) =>
-  a === b ? `страница ${a} не переведена` : `страницы ${a}–${b} не переведены`;
+const gapNote = (a: number, b: number) =>
+  a === b ? t("exp.pageNotTr", { n: a }) : t("exp.pagesNotTr", { a, b });
 
-// refPages (библиография): в приложении такая страница рендерится оригиналом;
-// в TXT/HTML идёт пометка — полностраничный скрин весил бы мегабайты на
-// страницу и не читался бы как текст; PDF-экспорт (печать) встраивает
-// оригинальную страницу картинкой (refPageImgHtml), пометка — его fallback
-const refRu = (n: number) => `страница ${n} — оригинал без перевода`;
+// refPages (bibliography): in the app such a page renders as the original; in
+// TXT/HTML it becomes a note — a full-page screenshot would weigh megabytes a
+// page and would not read as text; the PDF export (printing) embeds the
+// original page as an image (refPageImgHtml), with the note as its fallback
+const refNote = (n: number) => t("exp.refPage", { n });
 
 function metaLine(store: BookTranslation): string {
   const done = store.donePages.length;
-  const partial = done < store.total ? ` · готово ${done} из ${store.total} страниц` : "";
-  return `Машинный перевод EN→RU · pdfer${partial}`;
+  const partial = done < store.total ? t("exp.partial", { done, total: store.total }) : "";
+  return t("exp.machineTr", { partial });
 }
 
 // ---- TXT --------------------------------------------------------------------
@@ -163,12 +165,13 @@ export function assembleTxt(store: BookTranslation, title: string): string {
       continue;
     }
     if (gapStart !== null) {
-      lines.push("", `[${gapRu(gapStart, n - 1)}]`);
+      lines.push("", `[${gapNote(gapStart, n - 1)}]`);
       gapStart = null;
     }
     if (refs.has(n)) {
-      // refPage завершена без перевода (все tr "") — вместо сырого оригинала
-      lines.push("", `[${refRu(n)}]`);
+      // a refPage finished with no translation (every tr "") — a note beats
+      // dumping the raw original
+      lines.push("", `[${refNote(n)}]`);
       continue;
     }
     for (const it of pageItems(store.pages[n] ?? [], store.figures[n] ?? [], store.bodyFh)) {
@@ -177,11 +180,11 @@ export function assembleTxt(store: BookTranslation, title: string): string {
         // only caption-bearing regions are marked: uncaptioned candidates are
         // frequently blank margins, and TXT has no pixels to verify against
         if (it.caption) lines.push("", `[${it.caption}]`);
-      } else if (it.para && it.para.kind !== "prose") lines.push("", "[таблица или формула]");
+      } else if (it.para && it.para.kind !== "prose") lines.push("", `[${t("exp.placeholder")}]`);
       else if (it.para) lines.push("", it.para.text); // failed prose: original text
     }
   }
-  if (gapStart !== null) lines.push("", `[${gapRu(gapStart, store.total)}]`);
+  if (gapStart !== null) lines.push("", `[${gapNote(gapStart, store.total)}]`);
   return lines.join("\n") + "\n";
 }
 
@@ -324,7 +327,7 @@ async function refPageImgHtml(doc: PDFDocumentProxy, n: number): Promise<string 
     c.height = Math.floor(vp.height);
     await page.render({ canvas: c, viewport: vp }).promise;
     page.cleanup();
-    return `<img class="refpg" alt="Страница ${n} оригинала" src="${c.toDataURL("image/jpeg", 0.9)}">`;
+    return `<img class="refpg" alt="${esc(t("exp.origPage", { n }))}" src="${c.toDataURL("image/jpeg", 0.9)}">`;
   } catch {
     return null;
   }
@@ -333,7 +336,7 @@ async function refPageImgHtml(doc: PDFDocumentProxy, n: number): Promise<string 
 // crop item without pixels (no doc / render failure) → honest text fallback
 function cropFallbackHtml(it: CropItem): string {
   if (it.fig) return it.caption ? `<p class="ph">[${esc(it.caption)}]</p>` : "";
-  if (it.para && it.para.kind !== "prose") return `<p class="ph">[таблица или формула]</p>`;
+  if (it.para && it.para.kind !== "prose") return `<p class="ph">[${esc(t("exp.placeholder"))}]</p>`;
   return it.para ? `<p>${esc(it.para.text)}</p>` : "";
 }
 
@@ -369,7 +372,7 @@ async function assembleDoc(
   const chunks: string[] = [];
   let processed = 0;
   const gapHtml = (a: number, b: number) => {
-    const t = gapRu(a, b);
+    const t = gapNote(a, b);
     return `<p class="gap">${esc(t[0].toUpperCase() + t.slice(1))}</p>`;
   };
   try {
@@ -387,7 +390,7 @@ async function assembleDoc(
         const ref = print && doc ? await refPageImgHtml(doc, n) : null;
         if (ref) chunks.push(`<div class="pg">${n}</div>`, ref);
         else {
-          const t = refRu(n);
+          const t = refNote(n);
           chunks.push(`<p class="gap">${esc(t[0].toUpperCase() + t.slice(1))}</p>`);
         }
         onProgress?.(++processed, store.donePages.length);
@@ -445,7 +448,7 @@ async function assembleDoc(
           const others = srcs.slice(0, k).concat(srcs.slice(k + 1), textSrcs);
           const crop = cropDataUrl(off, win, it, pageW, probe, print, ink, others);
           if (crop) {
-            const alt = it.fig ? (it.caption ? esc(it.caption) : "Рисунок") : "Фрагмент оригинала";
+            const alt = esc(it.fig ? (it.caption ?? t("exp.figure")) : t("exp.fragment"));
             // печать: ширина в % от исходной страницы — пропорции оригинала
             // сохраняются на любом листе; экран: прежние px
             const wStyle = print ? `width:${(100 * crop.frac).toFixed(2)}%` : `width:${crop.w}px`;
@@ -457,7 +460,7 @@ async function assembleDoc(
           if (fb) pageChunks.push(fb);
         }
       }
-      if (off) releaseCanvas(off); // окно страницы — десятки МБ RGBA, не ждём GC
+      if (off) releaseCanvas(off); // a page window is tens of MB of RGBA — do not wait for GC
       if (pageChunks.length) chunks.push(`<div class="pg">${n}</div>`, ...pageChunks);
       onProgress?.(++processed, store.donePages.length);
     }
@@ -467,11 +470,11 @@ async function assembleDoc(
   }
 
   return `<!doctype html>
-<html lang="ru">
+<html lang="${getLang()}">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>${esc(title)} — перевод</title>
+<title>${esc(t("exp.docTitle", { title }))}</title>
 <style>${print ? PRINT_CSS : HTML_CSS}</style>
 </head>
 <body>
@@ -506,12 +509,17 @@ export function buildPrintHtml(
 
 // ---- entry ------------------------------------------------------------------
 
-const safeName = (s: string) => s.replace(/[\\/:*?"<>|]/g, "-").trim() || "перевод";
+const safeName = (s: string) => s.replace(/[\\/:*?"<>|]/g, "-").trim() || t("tr.untitled");
 
-/// Одна кнопка (волна 3): HTML без диалога — сразу в «Загрузки» ($DOWNLOAD
-/// в fs:allow-write-file, см. заметку в capabilities/default.json). Имя
-/// «<книга> — перевод.html»; занято (stat успешен) — « (2)», « (3)», …
-/// "none" — для книги нет ни одной готовой страницы (меню и так скрывает пункт).
+/// The name of the exported file, «<book> — translation», in the Downloads
+/// folder ($DOWNLOAD in fs:allow-write-file — see the note in
+/// capabilities/default.json).
+const exportBase = (dir: string, title: string) =>
+  joinPath(dir, safeName(t("exp.docTitle", { title })));
+
+/// One click: HTML with no dialog, straight into Downloads. If the name is
+/// taken (stat succeeds), « (2)», « (3)», … "none" = the book has not a single
+/// finished page (the menu hides the item anyway).
 export async function exportTranslationToDownloads(
   bookPath: string,
   title: string,
@@ -521,21 +529,23 @@ export async function exportTranslationToDownloads(
   if (!store || store.donePages.length === 0) return "none";
   const html = await assembleHtml(store, title, bookPath, onProgress);
   const dir = await downloadDir();
-  const base = `${dir}\\${safeName(title)} — перевод`;
+  const base = exportBase(dir, title);
   let target = `${base}.html`;
   for (let i = 2; await stat(target).then(() => true, () => false); i++) target = `${base} (${i}).html`;
   await writeFile(target, new TextEncoder().encode(html));
   return { path: target };
 }
 
-/// Одна кнопка, главный путь: PDF без диалога — печатный HTML во временный
-/// файл $APPDATA (имя с Date.now(): параллельных экспортов нет, но след от
-/// упавшего не мешает следующему), скрытая печать print_html_to_pdf (Rust,
-/// WebView2 PrintToPdf: A4 портрет, поля 12 мм — умолчания команды), результат
-/// «<книга> — перевод.pdf» в «Загрузках», при коллизии — « (2)», « (3)», …
-/// Временный HTML удаляется в finally при любом исходе. onProgress покрывает
-/// сборку кропов (долгая фаза); сама печать прогресса не даёт — вызывающий
-/// держит на это время спиннер. "none" — нет ни одной готовой страницы.
+/// One click, the main path: PDF with no dialog. The print-flavoured HTML goes
+/// to a temp file in $APPDATA (named with Date.now(): exports never run in
+/// parallel, but a crashed one must not block the next), then the silent
+/// print_html_to_pdf (Rust — WebView2 PrintToPdf on Windows, NSPrintOperation
+/// on macOS: A4 portrait, 12 mm margins, the command's defaults), and the
+/// result lands as «<book> — translation.pdf» in Downloads, « (2)», « (3)», …
+/// on collision. The temp HTML is removed in a finally on every outcome.
+/// onProgress covers assembling the crops (the long phase); printing itself
+/// reports nothing — the caller holds a spinner for that. "none" = not one
+/// finished page.
 export async function exportTranslationPdf(
   bookPath: string,
   title: string,
@@ -544,11 +554,11 @@ export async function exportTranslationPdf(
   const store = await loadBookTranslation(bookPath);
   if (!store || store.donePages.length === 0) return "none";
   const html = await buildPrintHtml(store, title, bookPath, onProgress);
-  const tmp = `${await appDataDir()}\\pdf-export-${Date.now()}.html`;
+  const tmp = joinPath(await appDataDir(), `pdf-export-${Date.now()}.html`);
   await writeFile(tmp, new TextEncoder().encode(html));
   try {
     const dir = await downloadDir();
-    const base = `${dir}\\${safeName(title)} — перевод`;
+    const base = exportBase(dir, title);
     let target = `${base}.pdf`;
     for (let i = 2; await stat(target).then(() => true, () => false); i++) target = `${base} (${i}).pdf`;
     await invoke("print_html_to_pdf", { htmlPath: tmp, pdfPath: target });
@@ -558,14 +568,14 @@ export async function exportTranslationPdf(
   }
 }
 
-/// TXT — третий путь (Настройки), прежний системный диалог сохранения.
-/// "none" — для книги нет ни одной готовой страницы (кнопка и так скрыта).
+/// TXT — the third path (Settings), through the ordinary system save dialog.
+/// "none" = the book has not a single finished page (the button is hidden then).
 export async function exportTranslationTxt(bookPath: string, title: string): Promise<"saved" | "cancelled" | "none"> {
   const store = await loadBookTranslation(bookPath);
   if (!store || store.donePages.length === 0) return "none";
   const target = await save({
-    defaultPath: `${safeName(title)} — перевод.txt`,
-    filters: [{ name: "Текст", extensions: ["txt"] }],
+    defaultPath: `${safeName(t("exp.docTitle", { title }))}.txt`,
+    filters: [{ name: t("exp.txtFilter"), extensions: ["txt"] }],
   });
   if (!target) return "cancelled";
   await writeFile(target, new TextEncoder().encode(assembleTxt(store, title)));

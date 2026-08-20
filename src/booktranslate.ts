@@ -48,6 +48,7 @@ import { CITE_MARK } from "./glossarygen";
 import { ModelUnavailableError, hydrateGlossary, isServerUp, parseGlossary, translate } from "./translate";
 import type { GlossaryEntry } from "./translate";
 import { bookKey, contentKey, setBookKey } from "./bookid";
+import { joinPath } from "./host";
 
 // dev-console handle: __pdferDev spreads this module, so classification and
 // figure detection can be inspected in the browser without UI plumbing
@@ -135,9 +136,9 @@ const lsKey = (bookPath: string) => `pdfer:booktr:${storeKey(bookPath)}`;
 const lsLegacyKey = (bookPath: string) => `pdfer:booktr:${hash(bookPath)}`;
 
 let dirP: Promise<string> | null = null;
-const storeDir = () => (dirP ??= appDataDir().then((d) => `${d}\\translations`));
-const storeFile = async (bookPath: string) => `${await storeDir()}\\${storeKey(bookPath)}.json`;
-const legacyStoreFile = async (bookPath: string) => `${await storeDir()}\\${hash(bookPath)}.json`;
+const storeDir = () => (dirP ??= appDataDir().then((d) => joinPath(d, "translations")));
+const storeFile = async (bookPath: string) => joinPath(await storeDir(), `${storeKey(bookPath)}.json`);
+const legacyStoreFile = async (bookPath: string) => joinPath(await storeDir(), `${hash(bookPath)}.json`);
 
 async function readTextFile(path: string): Promise<string | null> {
   try {
@@ -246,7 +247,7 @@ export async function bindBook(bookPath: string, bytes: Uint8Array): Promise<voi
       return;
     }
     const dir = await storeDir();
-    const ckFile = `${dir}\\${ck}.json`;
+    const ckFile = joinPath(dir, `${ck}.json`);
     const json = await readTextFile(ckFile);
     if (json !== null) {
       const owner = headerBookPath(json);

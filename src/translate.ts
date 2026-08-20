@@ -8,6 +8,8 @@
 import { appDataDir } from "@tauri-apps/api/path";
 import { mkdir, readFile, remove, writeFile } from "@tauri-apps/plugin-fs";
 import { bookKey } from "./bookid";
+import { joinPath } from "./host";
+import { targetLanguage } from "./i18n";
 import { hash } from "./paragraphs";
 
 // Dev/test hook: lets a plain-browser engine run point at a controlled port
@@ -16,8 +18,10 @@ import { hash } from "./paragraphs";
 const DEV_BASE = import.meta.env.DEV ? localStorage.getItem("pdfer:dev:llamabase") : null;
 const BASE = DEV_BASE || "http://127.0.0.1:11544";
 const AUX_BASE = "http://127.0.0.1:11545"; // aux terminologist (Qwen3.5-4B), on-demand
-const TARGET_EN = "Russian"; // English-worded template
-const TARGET_ZH = "俄语"; // Chinese-worded templates (terminology/contextual are documented only in Chinese)
+// The target language follows the interface language: someone reading Chitallo in
+// Russian wants Russian pages. The model card words the basic template in
+// English and the terminology/contextual ones in Chinese, so both spellings of
+// the language name live side by side (see i18n's TARGET_LANGUAGE).
 
 export type GlossaryEntry = { src: string; dst: string };
 
@@ -69,9 +73,9 @@ export function isAuxUp(timeoutMs = 1200): Promise<boolean> {
 const IS_TAURI = typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
 const glossCache = new Map<string, string>();
 let glossDirP: Promise<string> | null = null;
-const glossDir = () => (glossDirP ??= appDataDir().then((d) => `${d}\\glossaries`));
+const glossDir = () => (glossDirP ??= appDataDir().then((d) => joinPath(d, "glossaries")));
 const glossFile = async (bookPath: string, key = bookKey(bookPath) ?? hash(bookPath)) =>
-  `${await glossDir()}\\${key}.txt`;
+  joinPath(await glossDir(), `${key}.txt`);
 const glossLsKey = (bookPath: string) => `pdfer:glossary:${bookPath}`;
 
 async function writeGlossFile(bookPath: string, text: string): Promise<void> {
@@ -176,12 +180,12 @@ export function buildPrompt(text: string, glossary: GlossaryEntry[], context?: s
     ? `参考下面的翻译：\n${terms.map((t) => `${t.src} 翻译成 ${t.dst}`).join("\n")}\n\n`
     : "";
   if (context) {
-    return `${termBlock}${context}\n参考上面的信息，把下面的文本翻译成${TARGET_ZH}，注意不需要翻译上文，也不要额外解释：\n${text}`;
+    return `${termBlock}${context}\n参考上面的信息，把下面的文本翻译成${targetLanguage().zh}，注意不需要翻译上文，也不要额外解释：\n${text}`;
   }
   if (termBlock) {
-    return `${termBlock}将以下文本翻译为${TARGET_ZH}，注意只需要输出翻译后的结果，不要额外解释：\n${text}`;
+    return `${termBlock}将以下文本翻译为${targetLanguage().zh}，注意只需要输出翻译后的结果，不要额外解释：\n${text}`;
   }
-  return `Translate the following segment into ${TARGET_EN}, without additional explanation.\n\n${text}`;
+  return `Translate the following segment into ${targetLanguage().en}, without additional explanation.\n\n${text}`;
 }
 
 // sampling per the HY-MT1.5 model card

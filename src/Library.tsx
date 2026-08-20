@@ -6,6 +6,8 @@ import * as pdfjs from "pdfjs-dist";
 import { ModelSetupCard } from "./ModelSetup";
 import { IconClose } from "./icons";
 import { listRuns, onRunsChange } from "./booktranslate";
+import { baseName, joinPath } from "./host";
+import { getLang, t } from "./i18n";
 import type { RunInfo } from "./booktranslate";
 
 type Book = {
@@ -25,7 +27,7 @@ const hash = (s: string) => {
   return h.toString(16);
 };
 
-const collator = new Intl.Collator("ru");
+const collator = new Intl.Collator(getLang());
 const labelOf = (b: Book) => b.title || b.name;
 
 async function scanPdfs(dir: string, depth = 0): Promise<string[]> {
@@ -33,7 +35,7 @@ async function scanPdfs(dir: string, depth = 0): Promise<string[]> {
   const out: string[] = [];
   for (const e of await readDir(dir)) {
     if (e.name.startsWith(".")) continue;
-    const p = `${dir}\\${e.name}`;
+    const p = joinPath(dir, e.name);
     if (e.isDirectory) out.push(...(await scanPdfs(p, depth + 1)));
     else if (e.name.toLowerCase().endsWith(".pdf")) out.push(p);
   }
@@ -54,12 +56,27 @@ async function makeCover(path: string, coversDir: string, mtime: number): Promis
     await page.render({ canvas, viewport: vp }).promise;
     const blob = await new Promise<Blob | null>((r) => canvas.toBlob(r, "image/jpeg", 0.8));
     const cover = blob ? `${hash(path)}.jpg` : "";
-    if (blob) await writeFile(`${coversDir}\\${cover}`, new Uint8Array(await blob.arrayBuffer()));
+    if (blob) await writeFile(joinPath(coversDir, cover), new Uint8Array(await blob.arrayBuffer()));
     const title = ((meta?.info as { Title?: string } | undefined)?.Title ?? "").trim();
     return { mtime, title, cover };
   } finally {
     doc.loadingTask.destroy().catch(() => {});
   }
+}
+
+/// «Select text — Translate · Alt+click — paragraph · T — translation/original»,
+/// with the two action words picked out. Split on the placeholders so word
+/// order stays the translator's business, not the layout's.
+function hintLine() {
+  const strong = (s: string) => (
+    <span key={s} className="text-neutral-700 dark:text-neutral-200">
+      {s}
+    </span>
+  );
+  const parts = t("lib.hint", { tr: "\u0000tr\u0000", t: "\u0000t\u0000" }).split("\u0000");
+  return parts.map((p, i) =>
+    p === "tr" ? strong(t("sel.translate")) : p === "t" ? strong("T") : <Fragment key={i}>{p}</Fragment>,
+  );
 }
 
 export default function Library({
@@ -142,7 +159,7 @@ export default function Library({
         const pos = posOf(p);
         return {
           path: p,
-          name: p.split(/[\\/]/).pop()!.replace(/\.pdf$/i, ""),
+          name: baseName(p).replace(/\.pdf$/i, ""),
           title: index[p]?.title || undefined,
           coverUrl: coverUrlsRef.current.get(p),
           progress: pos.progress,
@@ -151,7 +168,7 @@ export default function Library({
       }),
     );
 
-    const coversDir = `${await appDataDir()}\\covers`;
+    const coversDir = joinPath(await appDataDir(), "covers");
     await mkdir(coversDir, { recursive: true }).catch(() => {});
 
     // covers: cached from disk, missing/outdated ones generated one by one.
@@ -185,7 +202,7 @@ export default function Library({
       if (stale()) return;
       if (entry.cover) {
         try {
-          const bytes = await readFile(`${coversDir}\\${entry.cover}`);
+          const bytes = await readFile(joinPath(coversDir, entry.cover));
           if (stale()) return;
           const url = URL.createObjectURL(new Blob([bytes], { type: "image/jpeg" }));
           urlsRef.current.push(url);
@@ -211,7 +228,7 @@ export default function Library({
     for (const p of Object.keys(index)) {
       if (stale()) return;
       if (inScan.has(p) || (await stat(p).catch(() => null))) continue;
-      if (index[p].cover) await remove(`${coversDir}\\${index[p].cover}`).catch(() => {});
+      if (index[p].cover) await remove(joinPath(coversDir, index[p].cover)).catch(() => {});
       delete index[p];
       pruned = true;
     }
@@ -401,22 +418,20 @@ export default function Library({
   if (!dir) {
     return (
       <div className="h-full flex flex-col items-center justify-center gap-3 text-neutral-600 dark:text-neutral-300">
-        {/* тихий онбординг (Р-2): идентичность (Н1) и приватность (Н2) вместо welcome-экрана */}
+        {/* quiet onboarding: identity and privacy instead of a welcome screen */}
         <div className="text-center select-none">
-          <div className="text-2xl font-medium tracking-tight text-neutral-800 dark:text-neutral-200">pdfer</div>
-          <div className="mt-2 text-sm">Читалка с локальным переводом EN→RU</div>
-          <div className="mt-1 text-xs text-neutral-500 dark:text-neutral-400">
-            Работает полностью офлайн. Книги и переводы не покидают ваш компьютер
-          </div>
+          <div className="text-2xl font-medium tracking-tight text-neutral-800 dark:text-neutral-200">Chitallo</div>
+          <div className="mt-2 text-sm">{t("app.tagline")}</div>
+          <div className="mt-1 text-xs text-neutral-500 dark:text-neutral-400">{t("app.privacy")}</div>
         </div>
         <button
           className="mt-4 text-lg px-6 py-3 rounded-xl border border-neutral-300 dark:border-neutral-700 hover:bg-white dark:hover:bg-neutral-800 transition-colors text-neutral-700 dark:text-neutral-200"
           onClick={pickDir}
         >
-          Выбрать папку с книгами
+          {t("lib.pick")}
         </button>
-        <span className="text-sm text-neutral-500 dark:text-neutral-400">Включая все вложенные папки</span>
-        {/* модель перевода предлагается прямо здесь — скачивание по явному действию, с лицензией на виду */}
+        <span className="text-sm text-neutral-500 dark:text-neutral-400">{t("lib.pickNested")}</span>
+        {/* the translation model is offered right here — user-initiated, licence in plain sight */}
         <div className="mt-5">
           <ModelSetupCard />
         </div>
@@ -425,7 +440,7 @@ export default function Library({
             className="mt-2 text-xs text-neutral-500 dark:text-neutral-400 transition-colors hover:text-neutral-700 dark:hover:text-neutral-200"
             onClick={onAbout}
           >
-            О pdfer
+            {t("app.about")}
           </button>
         )}
       </div>
@@ -436,11 +451,11 @@ export default function Library({
     <div className="h-full overflow-y-auto">
       <div className="max-w-6xl mx-auto px-6 pt-16 pb-10">
         <div className="flex items-baseline justify-between mb-6 text-neutral-800 dark:text-neutral-200">
-          <h1 className="text-xl font-medium">Библиотека</h1>
+          <h1 className="text-xl font-medium">{t("lib.title")}</h1>
           <span className="flex items-baseline gap-4">
             {coverProg && (
               <span className="text-sm tabular-nums text-neutral-500 dark:text-neutral-400 select-none">
-                Обложки: {coverProg.done} из {coverProg.total}
+                {t("lib.covers", { done: coverProg.done, total: coverProg.total })}
               </span>
             )}
             {onAbout && (
@@ -448,7 +463,7 @@ export default function Library({
                 className="text-sm text-neutral-500 dark:text-neutral-400 transition-colors hover:text-neutral-800 dark:hover:text-neutral-100"
                 onClick={onAbout}
               >
-                О pdfer
+                {t("app.about")}
               </button>
             )}
             <button
@@ -456,7 +471,7 @@ export default function Library({
               onClick={pickDir}
               title={dir}
             >
-              Сменить папку
+              {t("lib.changeFolder")}
             </button>
           </span>
         </div>
@@ -470,24 +485,21 @@ export default function Library({
               setFocusIdx(0);
             }}
             onKeyDown={onInputKey}
-            placeholder="Найти книгу…"
+            placeholder={t("lib.search")}
             spellCheck={false}
             className="w-full mb-5 bg-transparent pb-2 text-sm text-neutral-800 dark:text-neutral-200 outline-none border-b border-neutral-900/10 dark:border-neutral-100/10 focus:border-neutral-900/30 dark:focus:border-neutral-100/30 placeholder:text-neutral-400 dark:placeholder:text-neutral-600 transition-colors"
           />
         )}
         {!hintDismissed && books !== null && books.length > 0 && (
           <div className="mb-6 flex items-center gap-3 rounded-xl bg-white dark:bg-neutral-800 shadow-sm px-4 py-2.5 text-sm text-neutral-500 dark:text-neutral-400 select-none">
-            <span className="flex-1">
-              Выделите текст — <span className="text-neutral-700 dark:text-neutral-200">Перевести</span> · Alt+клик —
-              абзац · <span className="text-neutral-700 dark:text-neutral-200">T</span> — перевод/оригинал
-            </span>
+            <span className="flex-1">{hintLine()}</span>
             <button
               className="px-0.5 text-neutral-500 dark:text-neutral-400 transition-colors hover:text-neutral-800 dark:hover:text-neutral-100"
               onClick={() => {
                 localStorage.setItem("pdfer:hint:strip", "1");
                 setHintDismissed(true);
               }}
-              title="Скрыть подсказку"
+              title={t("lib.hintHide")}
             >
               <IconClose />
             </button>
@@ -495,21 +507,21 @@ export default function Library({
         )}
         {books === null ? (
           <div className="py-24 text-center text-neutral-600 dark:text-neutral-300 select-none">
-            Поиск PDF…
+            {t("lib.scanning")}
           </div>
         ) : books.length === 0 ? (
           <div className="flex flex-col items-center gap-4 py-24 text-neutral-600 dark:text-neutral-300">
-            <span>В этой папке не нашлось PDF</span>
+            <span>{t("lib.empty")}</span>
             <button
               className="px-4 py-2 rounded-lg border border-neutral-300 dark:border-neutral-700 hover:bg-white dark:hover:bg-neutral-800 transition-colors text-neutral-700 dark:text-neutral-200"
               onClick={pickDir}
             >
-              Выбрать другую папку
+              {t("lib.pickOther")}
             </button>
           </div>
         ) : ordered.length === 0 ? (
           <div className="py-24 text-center text-neutral-600 dark:text-neutral-300 select-none">
-            Ничего не нашлось
+            {t("ui.notFound")}
           </div>
         ) : (
           <div
@@ -524,12 +536,12 @@ export default function Library({
               <Fragment key={b.path}>
                 {showSections && i === 0 && (
                   <div className="col-span-full text-xs font-medium text-neutral-400 dark:text-neutral-500 select-none">
-                    Читаю
+                    {t("lib.reading")}
                   </div>
                 )}
                 {showSections && i === reading.length && (
                   <div className="col-span-full mt-4 text-xs font-medium text-neutral-400 dark:text-neutral-500 select-none">
-                    Все книги
+                    {t("lib.all")}
                   </div>
                 )}
                 <button
@@ -556,16 +568,14 @@ export default function Library({
                       </div>
                     )}
                     {run && (
-                      // книга переводится в фоне — живой процент рана (Р-6);
-                      // янтарный = модель недоступна, движок ждёт и продолжит сам
+                      // the book is translating in the background — the run's live
+                      // percentage; amber = model unavailable, the engine waits and resumes
                       <div
                         className={`absolute top-1.5 right-1.5 rounded-full px-1.5 py-0.5 text-[10px] font-medium tabular-nums text-white select-none ${
                           run.stalled ? "bg-amber-500/90" : "bg-accent/90"
                         }`}
                         title={
-                          run.stalled
-                            ? "Модель недоступна — перевод приостановлен, готовые страницы сохранены"
-                            : "Книга переводится"
+                          run.stalled ? t("lib.stalled") : t("lib.translating")
                         }
                       >
                         {run.total ? Math.floor((100 * run.done) / run.total) : 0}%

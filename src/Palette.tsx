@@ -9,6 +9,8 @@
 
 import { useEffect, useMemo, useRef, useState } from "react";
 import { IconClose } from "./icons";
+import { baseName, isMac, macKeys } from "./host";
+import { t } from "./i18n";
 
 export type PaletteCommand = {
   id: string;
@@ -76,7 +78,7 @@ export function Palette({
       const idx = JSON.parse(localStorage.getItem("pdfer:books") ?? "{}") as Record<string, { title?: string }>;
       return Object.entries(idx).map(([path, e]) => ({
         path,
-        name: path.split(/[\\/]/).pop()!.replace(/\.pdf$/i, ""),
+        name: baseName(path).replace(/\.pdf$/i, ""),
         title: (e?.title ?? "").trim(),
       }));
     } catch {
@@ -87,12 +89,12 @@ export function Palette({
   const rows = useMemo<Row[]>(() => {
     const q = query.trim();
     const scored: { s: number; row: Row }[] = [];
-    // digits → «Страница N», always on top
+    // digits → «Page N», always on top
     if (q && /^\d+$/.test(q) && numPages) {
       const n = Math.min(numPages, Math.max(1, parseInt(q, 10)));
       scored.push({
         s: 1e6,
-        row: { key: "page", label: `Страница ${n}`, hint: `1–${numPages}`, run: () => onGoToPage(n) },
+        row: { key: "page", label: t("pal.page", { n }), hint: `1–${numPages}`, run: () => onGoToPage(n) },
       });
     }
     for (const c of commands) {
@@ -111,11 +113,11 @@ export function Palette({
         .forEach(({ b, s }) =>
           scored.push({
             s,
-            row: { key: `book:${b.path}`, label: b.title || b.name, tag: "книга", run: () => onOpenBook(b.path) },
+            row: { key: `book:${b.path}`, label: b.title || b.name, tag: t("pal.bookTag"), run: () => onOpenBook(b.path) },
           }),
         );
       // full-text fallback — always last (score below any match)
-      if (onFind) scored.push({ s: -1, row: { key: "findq", label: `Найти: «${q}»`, run: () => onFind(q) } });
+      if (onFind) scored.push({ s: -1, row: { key: "findq", label: t("pal.findQ", { q }), run: () => onFind(q) } });
     }
     return scored.sort((a, b) => b.s - a.s).map((x) => x.row);
   }, [query, commands, books, numPages, currentPath, onGoToPage, onOpenBook, onFind]);
@@ -162,7 +164,7 @@ export function Palette({
           value={query}
           onChange={(e) => setQuery(e.target.value)}
           onKeyDown={onKeyDown}
-          placeholder={numPages ? "Команда, страница или книга…" : "Команда или книга…"}
+          placeholder={numPages ? t("pal.placeholder") : t("pal.placeholderNoDoc")}
           spellCheck={false}
           className="w-full bg-transparent outline-none px-4 py-3 placeholder:text-neutral-400 dark:placeholder:text-neutral-500"
         />
@@ -171,7 +173,7 @@ export function Palette({
           className="border-t border-neutral-200 dark:border-neutral-700 max-h-[45vh] overflow-y-auto overscroll-contain p-1.5"
         >
           {rows.length === 0 ? (
-            <div className="px-2.5 py-1.5 text-neutral-500 dark:text-neutral-400 cursor-default">Ничего не нашлось</div>
+            <div className="px-2.5 py-1.5 text-neutral-500 dark:text-neutral-400 cursor-default">{t("ui.notFound")}</div>
           ) : (
             rows.map((r, i) => (
               <button
@@ -202,53 +204,61 @@ export function Palette({
   );
 }
 
-// ---- «?» / Ctrl+/ — все клавиши одним экраном -------------------------------
+// ---- «?» / Ctrl+/ — every key on one screen ---------------------------------
+//
+// Key names are written the Windows/Linux way; i18n's `t()` rewrites them to
+// ⌘/⌥ on macOS, so this table is single-sourced. `keys()` runs the same
+// rewrite over the literal names that never pass through the catalogue.
 
-const GROUPS: { name: string; rows: [string, string][] }[] = [
-  {
-    name: "Чтение",
-    rows: [
-      ["Space / PgDn", "Экран вперёд"],
-      ["Shift+Space / PgUp", "Экран назад"],
-      ["↓ / ↑", "Прокрутка"],
-      ["Home / End", "Начало и конец книги"],
-      ["Alt+← / Alt+→", "Назад и вперёд по переходам"],
-    ],
-  },
-  {
-    name: "Вид",
-    rows: [
-      ["Ctrl + / − / колесо", "Масштаб"],
-      ["Ctrl+0", "По ширине"],
-      ["Ctrl+1 / 2 / 3", "Колонки: одна, две, авто"],
-      ["D", "Тёмная тема"],
-    ],
-  },
-  {
-    name: "Книга",
-    rows: [
-      ["Ctrl+K", "Палитра команд"],
-      ["Ctrl+F", "Найти в книге"],
-      ["Ctrl+O", "Открыть файл"],
-      ["Ctrl+,", "Настройки"],
-      ["Esc", "Закрыть"],
-      ["? / Ctrl+/", "Клавиши"],
-    ],
-  },
-  {
-    name: "Перевод",
-    rows: [
-      ["T", "Перевод / оригинал"],
-      ["Alt+клик", "Перевод абзаца"],
-      ["O", "Оригинал выделенного"],
-      ["Enter", "Перевести выделенное"],
-      ["Ctrl+J", "Спросить"],
-      // composer-local, not a global binding — listed here because the panel
-      // it belongs to is opened by Ctrl+J right above
-      ["/", "Быстрые команды в «Спросить»"],
-    ],
-  },
-];
+const K = (s: string) => (isMac() ? macKeys(s) : s);
+
+function groups(): { name: string; rows: [string, string][] }[] {
+  return [
+    {
+      name: t("keys.reading"),
+      rows: [
+        ["Space / PgDn", t("keys.screenFwd")],
+        [K("Shift+Space / PgUp"), t("keys.screenBack")],
+        ["↓ / ↑", t("keys.scroll")],
+        ["Home / End", t("keys.ends")],
+        [K("Alt+← / Alt+→"), t("keys.jumps")],
+      ],
+    },
+    {
+      name: t("keys.view"),
+      rows: [
+        [K("Ctrl + / − / ") + t("keys.wheel"), t("keys.zoom")],
+        [K("Ctrl+0"), t("keys.fitWidth")],
+        [K("Ctrl+1 / 2 / 3"), t("keys.columns")],
+        ["D", t("keys.darkTheme")],
+      ],
+    },
+    {
+      name: t("keys.book"),
+      rows: [
+        [K("Ctrl+K"), t("keys.palette")],
+        [K("Ctrl+F"), t("keys.find")],
+        [K("Ctrl+O"), t("keys.openFile")],
+        [K("Ctrl+,"), t("keys.settings")],
+        ["Esc", t("keys.close")],
+        [K("? / Ctrl+/"), t("keys.keys")],
+      ],
+    },
+    {
+      name: t("keys.translation"),
+      rows: [
+        ["T", t("keys.trToggle")],
+        [K("Alt+") + t("keys.click"), t("keys.trPara")],
+        ["O", t("keys.origSel")],
+        ["Enter", t("keys.trSel")],
+        [K("Ctrl+J"), t("keys.ask")],
+        // composer-local, not a global binding — listed here because the panel
+        // it belongs to is opened by Ctrl+J right above
+        ["/", t("keys.askQuick")],
+      ],
+    },
+  ];
+}
 
 export function ShortcutsOverlay({ onClose }: { onClose: () => void }) {
   return (
@@ -261,18 +271,18 @@ export function ShortcutsOverlay({ onClose }: { onClose: () => void }) {
     >
       <div className="modal-panel rounded-xl bg-white dark:bg-neutral-800 shadow-2xl p-4 w-[min(36rem,92vw)] text-sm text-neutral-800 dark:text-neutral-100 select-none">
         <div className="flex items-center mb-3 text-xs text-neutral-500 dark:text-neutral-400">
-          <span>Клавиши</span>
+          <span>{t("keys.title")}</span>
           <span className="flex-1" />
           <button
             className="px-0.5 transition-colors hover:text-neutral-800 dark:hover:text-neutral-100"
             onClick={onClose}
-            title="Закрыть (Esc)"
+            title={t("ui.close")}
           >
             <IconClose />
           </button>
         </div>
         <div className="grid grid-cols-2 gap-x-10 gap-y-4">
-          {GROUPS.map((g) => (
+          {groups().map((g) => (
             <div key={g.name}>
               <div className="mb-1 text-xs font-medium text-neutral-500 dark:text-neutral-400">{g.name}</div>
               {g.rows.map(([keys, label]) => (

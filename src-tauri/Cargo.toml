@@ -1,8 +1,10 @@
 [package]
-name = "pdfer"
+name = "chitallo"
 version = "0.1.0"
 description = "Minimalist PDF reader with local AI translation and Claude Code Q&A"
-authors = ["stas"]
+authors = ["Stanislav Medvedev"]
+license = "MIT"
+repository = "https://github.com/Meddelin/Chitallo"
 edition = "2021"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
@@ -11,7 +13,7 @@ edition = "2021"
 # The `_lib` suffix may seem redundant but it is necessary
 # to make the lib name unique and wouldn't conflict with the bin name.
 # This seems to be only an issue on Windows, see https://github.com/rust-lang/cargo/issues/8519
-name = "pdfer_lib"
+name = "chitallo_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
 
 [build-dependencies]
@@ -29,6 +31,10 @@ ureq = "2"
 # integrity check of downloaded weights against the HF-published sha256
 sha2 = "0.10"
 
+[target.'cfg(unix)'.dependencies]
+# statvfs for the free-disk-space check before a multi-GB download
+libc = "0.2"
+
 [target.'cfg(windows)'.dependencies]
 # free-disk-space check before a multi-GB download
 windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_Storage_FileSystem"] }
@@ -38,3 +44,10 @@ windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_Storage
 webview2-com = "0.38.2"
 windows-core = "0.61"
 
+[target.'cfg(target_os = "macos")'.dependencies]
+# silent PDF export: NSPrintOperation over the window's WKWebView. Versions
+# match what wry already pulls in, so no duplicate majors appear.
+objc2 = "0.6"
+objc2-app-kit = "0.3"
+objc2-foundation = "0.3"
+objc2-web-kit = "0.3"

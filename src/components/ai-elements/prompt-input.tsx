@@ -1,5 +1,6 @@
 import { Button } from "@/components/ui/button";
 import { Textarea } from "@/components/ui/textarea";
+import { t } from "@/i18n";
 import { cn } from "@/lib/utils";
 import { ArrowUpIcon, Loader2Icon, SquareIcon, XIcon } from "lucide-react";
 import type {
@@ -11,7 +12,7 @@ import type {
 } from "react";
 import { useState } from "react";
 
-// AI Elements `prompt-input` (shadcn.io/ai pattern), trimmed for pdfer:
+// AI Elements `prompt-input` (shadcn.io/ai pattern), trimmed for Chitallo:
 // PromptInput (the form shell), PromptInputTextarea (Enter submits,
 // Shift+Enter breaks, IME-safe), PromptInputToolbar / PromptInputTools and
 // PromptInputSubmit with the status icon cycle (ready → submitted → streaming
@@ -34,7 +35,7 @@ export const PromptInput = ({ className, onSubmit, ...props }: PromptInputProps)
   return (
     <form
       className={cn(
-        // pdfer restyle: one quiet pill instead of the stock bordered card —
+        // Chitallo restyle: one quiet pill instead of the stock bordered card —
         // the same neutral fill the old sidebar textarea had
         "w-full overflow-hidden rounded-xl bg-neutral-200/60 dark:bg-neutral-700/50",
         className,
@@ -50,7 +51,7 @@ export type PromptInputTextareaProps = ComponentProps<typeof Textarea>;
 export const PromptInputTextarea = ({
   onChange,
   className,
-  placeholder = "Вопрос по книге…",
+  placeholder,
   ...props
 }: PromptInputTextareaProps) => {
   const [isComposing, setIsComposing] = useState(false);
@@ -118,7 +119,7 @@ export const PromptInputSubmit = ({
 
   return (
     <Button
-      aria-label="Отправить"
+      aria-label={t("ask.send")}
       className={cn("rounded-full", className)}
       size={size}
       type="submit"

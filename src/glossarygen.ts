@@ -13,6 +13,7 @@
 import type { PDFDocumentProxy } from "pdfjs-dist";
 import { clusterParagraphs } from "./paragraphs";
 import { auxComplete, completeRaw, translate, type ChatMessage } from "./translate";
+import { t } from "./i18n";
 
 export type ExtractedTerm = { term: string; freq: number; sample: string };
 export type TermPair = { term: string; tr: string };
@@ -505,19 +506,16 @@ function lastQuoted(raw: string): string {
 // domains; the only domain signal it needs is the book's own top mined terms.
 // No embedded dictionaries anywhere — works for any book.
 
-const AUX_SYSTEM =
-  "Ты — терминолог. Тебе дают английский термин из книги, тематику книги и предложение-контекст. " +
-  "Ответь ТОЛЬКО устоявшимся русским эквивалентом этого термина — без пояснений, без кавычек, без точки в конце. " +
-  "Если термин по общепринятой конвенции не переводится (аббревиатура, имя собственное, название продукта или компании) — верни его без изменений.";
-
 const auxMessages = (term: string, sample: string | undefined, domain: string): ChatMessage[] => [
-  { role: "system", content: AUX_SYSTEM },
+  // The terminologist is instructed in the interface language, because that is
+  // the language its answer has to come back in.
+  { role: "system", content: t("term.system") },
   {
     role: "user",
     content:
-      (domain ? `Тематика книги (ключевые термины): ${domain}\n` : "") +
-      (sample ? `Контекст: ${sample}\n` : "") +
-      `Термин: ${term}`,
+      (domain ? `${t("term.domain", { domain })}\n` : "") +
+      (sample ? `${t("term.context", { sample })}\n` : "") +
+      t("term.term", { term }),
   },
 ];
 

@@ -1,0 +1,57 @@
+name: CI
+
+# Every push and PR is type-checked on both target platforms. `cargo check`
+# on macOS is not a formality: the PDF-export path there is AppKit FFI that
+# never compiles on a Windows machine, so this workflow is the only thing that
+# catches a break in it before a release build does.
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  frontend:
+    name: Frontend (typecheck + build)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm run typecheck
+      - run: npm run build
+
+  rust:
+    name: Rust (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+      # tauri-build embeds the frontend dist, so it has to exist before cargo runs
+      - run: npm ci
+      - run: npm run build
+      # No `cargo fmt --check`: this codebase is hand-laid-out on purpose and
+      # rustfmt would rewrite most of it. Clippy is the gate that matters.
+      - name: cargo clippy
+        run: cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings

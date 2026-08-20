@@ -1,0 +1,92 @@
+name: Release
+
+# Push a tag like v0.1.0 and this builds the installers on every supported
+# platform, then collects them into one draft GitHub release. The release stays
+# a DRAFT: nothing is published until a human opens it, reads the notes and
+# presses the button.
+#
+# What it produces:
+#   Windows  — Chitallo_<version>_x64-setup.exe        (NSIS)
+#   macOS    — Chitallo_<version>_aarch64.dmg          (Apple silicon)
+#              Chitallo_<version>_x64.dmg              (Intel)
+#
+# Nothing is code-signed yet. On first launch users will see SmartScreen on
+# Windows and Gatekeeper on macOS; RELEASING.md says what to tell them and what
+# signing would take.
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to build (must already exist)"
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: ${{ matrix.label }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - label: Windows x64
+            os: windows-latest
+            target: x86_64-pc-windows-msvc
+          - label: macOS (Apple silicon)
+            os: macos-latest
+            target: aarch64-apple-darwin
+          - label: macOS (Intel)
+            os: macos-latest
+            target: x86_64-apple-darwin
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+          key: ${{ matrix.target }}
+
+      - run: npm ci
+
+      - name: Build the bundle
+        uses: tauri-apps/tauri-action@v0
+        with:
+          args: --target ${{ matrix.target }}
+          # one draft release for all three bundles; tauri-action creates it on
+          # the first job and appends to it on the rest
+          tagName: ${{ inputs.tag || github.ref_name }}
+          releaseName: Chitallo ${{ inputs.tag || github.ref_name }}
+          releaseDraft: true
+          prerelease: false
+          releaseBody: |
+            See CHANGELOG.md for what changed.
+
+            **Install what Chitallo does not ship.** The app bundles no model and
+            no inference engine; the first-run setup shows the one command for
+            your platform:
+
+            - translation engine — `winget install llama.cpp` (Windows) or
+              `brew install llama.cpp` (macOS)
+            - the translation model — downloaded from the setup screen, once
+            - «Ask» (optional) — [Claude Code](https://code.claude.com/docs/en/setup)
+
+            These builds are not code-signed: Windows SmartScreen and macOS
+            Gatekeeper will warn on first launch.
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

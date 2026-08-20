@@ -27,9 +27,9 @@ export default defineConfig(async () => ({
         }
       : undefined,
     watch: {
-      // llama-bin holds multi-MB model-server binaries staged for the installer;
-      // watching them crashes chokidar (EBUSY) while they are being copied
-      ignored: ["**/src-tauri/**", "**/llama-bin/**"],
+      // the Rust side has its own watcher (tauri dev), and its target/ holds
+      // multi-GB of build output chokidar has no business walking
+      ignored: ["**/src-tauri/**"],
     },
   },
 }));

@@ -1,0 +1,21 @@
+# Normalise line endings in the repository to LF.
+#
+# Development happens on Windows (core.autocrlf=true), CI runs on Linux and
+# macOS, and the release builds on all three. Without this, a file committed
+# from a Windows checkout can land in the repository with CRLF and then fail
+# somewhere that reads it literally.
+* text=auto eol=lf
+
+# Binary assets: never touched.
+*.png binary
+*.jpg binary
+*.ico binary
+*.icns binary
+*.svg text eol=lf
+*.pdf binary
+*.gguf binary
+
+# Lockfiles are generated: collapse them in GitHub's diff view, but keep them
+# diffable locally — a dependency change is exactly the thing worth reading.
+package-lock.json linguist-generated=true
+src-tauri/Cargo.lock linguist-generated=true

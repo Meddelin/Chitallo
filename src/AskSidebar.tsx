@@ -38,6 +38,9 @@ import {
 } from "@/components/ai-elements/prompt-input";
 import { Suggestion, Suggestions } from "@/components/ai-elements/suggestion";
 import { ASK_W_DEFAULT, ASK_W_MIN, askWMax } from "./askwidth";
+import { copyToClipboard } from "./clipboard";
+import { CLAUDE, installCommand } from "./host";
+import { getLang, t } from "./i18n";
 import { IconClose } from "./icons";
 
 // ---- «Спросить»: chat sidebar over headless Claude Code ---------------------
@@ -48,7 +51,7 @@ import { IconClose } from "./icons";
 // inside MessageResponse; raw HTML is never executed — the hardened renderer
 // drops it).
 //
-// Transport: the Rust `ask_claude` command spawns claude.exe (-p stream-json)
+// Transport: the Rust `ask_claude` command spawns the Claude CLI (-p stream-json)
 // and forwards every stdout NDJSON line RAW over a tauri Channel. This
 // component owns the whole NDJSON contract:
 //   stream_event/content_block_delta/text_delta  → token stream
@@ -104,37 +107,35 @@ type NdLine = {
 type MockLines = string[] | ((prompt: string) => string[]);
 
 const HIST_LIMIT = 50;
-const DEFAULT_Q = "Объясни этот фрагмент";
+const defaultQ = () => t("ask.defaultQ");
 // static follow-up chips after a completed answer — no extra model calls.
 // Three, wrapping, dismissible: the market rule for chips in a narrow panel
 // (cap the visible set, never a hidden scroller, never push the composer down).
 // label = what the chip reads (short enough to fit one row at 400 px);
 // msg = what is actually sent, since the chip becomes the user's own turn
-const SUGGESTIONS: { label: string; msg: string }[] = [
-  { label: "Объясни проще", msg: "Объясни проще" },
-  { label: "Приведи пример", msg: "Приведи пример" },
-  { label: "Связь с темой", msg: "Как это связано с темой книги?" },
+const suggestions = (): { label: string; msg: string }[] => [
+  { label: t("ask.simpler"), msg: t("ask.simpler") },
+  { label: t("ask.example"), msg: t("ask.example") },
+  { label: t("ask.linkTopic"), msg: t("ask.linkTopicMsg") },
 ];
 const isTauri = "__TAURI_INTERNALS__" in window;
 
 // ---- quick commands ---------------------------------------------------------
 // «/» in an empty composer opens the menu — the settled convention (ChatGPT,
 // Cursor, assistant-ui). Only at position 0: a naked «/» mid-sentence is normal
-// Russian («и/или»), and a menu there would be hostile. Picking a command sends
-// straight away — this is a reader, not an agent, so no directive chip lingers.
-// Menu labels are infinitives (UI voice); the payload is 2nd-person imperative
-// because it becomes the user's own turn.
+// prose in both interface languages, and a menu there would be hostile. Picking
+// a command sends straight away — this is a reader, not an agent, so no
+// directive chip lingers. Menu labels are infinitives (UI voice); the payload
+// is 2nd-person imperative, because it becomes the user's own turn.
 type CmdNeed = "seed" | "answer" | "seedOrAnswer";
 type Cmd = { id: string; label: string; icon: LucideIcon; msg: (page: number) => string; need?: CmdNeed };
-const COMMANDS: Cmd[] = [
-  { id: "explain", label: "Объяснить выделенное", icon: TextQuoteIcon, msg: () => "Объясни этот фрагмент", need: "seed" },
-  { id: "term", label: "Определить термин", icon: BookOpenIcon, msg: () => "Что означает этот термин в контексте книги?", need: "seed" },
-  { id: "page", label: "Пересказать страницу", icon: FileTextIcon, msg: (p) => `Перескажи страницу ${p} своими словами` },
-  { id: "link", label: "Связать с темой книги", icon: Link2Icon, msg: () => "Как это связано с темой книги?", need: "seedOrAnswer" },
-  { id: "simpler", label: "Объяснить проще", icon: LightbulbIcon, msg: () => "Объясни проще", need: "answer" },
+const commands = (): Cmd[] => [
+  { id: "explain", label: t("ask.cmdExplain"), icon: TextQuoteIcon, msg: () => t("ask.defaultQ"), need: "seed" },
+  { id: "term", label: t("ask.cmdTerm"), icon: BookOpenIcon, msg: () => t("ask.cmdTermMsg"), need: "seed" },
+  { id: "page", label: t("ask.cmdPage"), icon: FileTextIcon, msg: (p) => t("ask.cmdPageMsg", { n: p }) },
+  { id: "link", label: t("ask.cmdLink"), icon: Link2Icon, msg: () => t("ask.linkTopicMsg"), need: "seedOrAnswer" },
+  { id: "simpler", label: t("ask.cmdSimpler"), icon: LightbulbIcon, msg: () => t("ask.simpler"), need: "answer" },
 ];
-const NEED_SEED = "Сначала выделите фрагмент в книге";
-const NEED_ANSWER = "Сначала задайте вопрос";
 
 // header icon button, and the destructive-confirm pair (Settings pattern #11:
 // consequence + a red button that names the action + «Отмена»)
@@ -163,7 +164,6 @@ const threadsKey = (p: string) => `pdfer:claude:threads:${p}`;
 const threadKey = (p: string, id: string) => `pdfer:claude:th:${p}:${id}`;
 
 const THREAD_LIMIT = 30;
-const UNTITLED = "Новая беседа";
 
 type ThreadMeta = { id: string; title: string; ts: number; n: number };
 type ThreadIndex = { v: 2; active: string; items: ThreadMeta[] };
@@ -171,19 +171,13 @@ type ThreadData = { sid?: string; msgs: Msg[] };
 
 const newThreadId = () => `t${Date.now().toString(36)}${Math.random().toString(36).slice(2, 6)}`;
 
-// «1 сообщение / 2 сообщения / 5 сообщений»
-const msgCount = (n: number) => {
-  if (!n) return "пусто";
-  const t = n % 10;
-  const h = n % 100;
-  const w = t === 1 && h !== 11 ? "сообщение" : t >= 2 && t <= 4 && (h < 10 || h >= 20) ? "сообщения" : "сообщений";
-  return `${n} ${w}`;
-};
+// «1 сообщение / 2 сообщения / 5 сообщений», «1 message / 2 messages»
+const msgCount = (n: number) => (n ? t("ask.msgs", { n }) : t("ask.emptyThread"));
 
 // title = first user message, per the market convention (ChatGPT/Cloudscape)
 function titleOf(msgs: Msg[]): string {
   const first = msgs.find((m) => m.role === "user")?.text.replace(/\s+/g, " ").trim();
-  if (!first) return UNTITLED;
+  if (!first) return t("ask.newThread");
   return first.length > 60 ? `${first.slice(0, 59)}…` : first;
 }
 
@@ -241,7 +235,7 @@ function bumpMeta(p: string, id: string, msgs: Msg[]): ThreadIndex {
   const meta: ThreadMeta = {
     id,
     // a title, once earned from the first user message, never drifts
-    title: prev && prev.title !== UNTITLED ? prev.title : titleOf(msgs),
+    title: prev && prev.title !== t("ask.newThread") ? prev.title : titleOf(msgs),
     ts: Date.now(),
     n: msgs.length,
   };
@@ -276,11 +270,9 @@ async function replayMock(lines: string[], onLine: (l: string) => void, isCancel
   }
 }
 
-// RU reading-assistant persona; goes to claude.exe --append-system-prompt
-const sysPrompt = (title: string) =>
-  `Ты — помощник в PDF-читалке. Пользователь читает книгу «${title}» (обычно на английском) и задаёт вопросы о ней по-русски. ` +
-  `Отвечай на русском, кратко и по существу. Если вопрос про выделенный фрагмент — объясняй именно его в контексте книги. ` +
-  `Ссылайся на номера страниц, когда это уместно. Уместна умеренная markdown-разметка (списки, выделение); без заголовков без необходимости.`;
+// Reading-assistant persona, in the interface language so the answers come
+// back in it; goes to the CLI as --append-system-prompt
+const sysPrompt = (title: string) => t("ask.system", { title });
 
 // VS Code / Cursor grammar: an invisible 8 px strip on the panel edge, a 2 px
 // tint on hover or drag, col-resize cursor. No grip dots — they would be the
@@ -336,7 +328,7 @@ function ResizeHandle({ width, onWidth }: { width: number; onWidth: (w: number) 
 
   return (
     <div
-      aria-label="Ширина панели"
+      aria-label={t("ask.panelWidth")}
       aria-orientation="vertical"
       aria-valuemax={askWMax()}
       aria-valuemin={ASK_W_MIN}
@@ -351,7 +343,7 @@ function ResizeHandle({ width, onWidth }: { width: number; onWidth: (w: number) 
       onPointerUp={endDrag}
       role="separator"
       tabIndex={0}
-      title="Ширина панели · двойной клик вернёт исходную"
+      title={t("ask.panelWidthTitle")}
     >
       <div className="pointer-events-none mx-auto h-full w-0.5 bg-transparent transition-colors group-hover/rz:bg-neutral-400/70 group-focus-visible/rz:bg-neutral-400/70 dark:group-hover/rz:bg-neutral-500/70 dark:group-focus-visible/rz:bg-neutral-500/70" />
     </div>
@@ -384,7 +376,7 @@ export function AskSidebar({
   const [pending, setPending] = useState<AskSeed | null>(null);
   const [busy, setBusy] = useState(false);
   const [stream, setStream] = useState(""); // streamed text of the in-flight answer
-  const [copied, setCopied] = useState(-1); // msg index with the «Скопировано» state
+  const [copied, setCopied] = useState(-1); // msg index showing the «Copied» state
   const [threadsOpen, setThreadsOpen] = useState(false);
   const [confirmDel, setConfirmDel] = useState<string | null>(null); // thread id armed for delete
   const [cmdOpen, setCmdOpen] = useState(false);
@@ -538,7 +530,7 @@ export function AskSidebar({
     const id = newThreadId();
     saveThread(bookPath, id, { msgs: [] });
     const ix = loadIndex(bookPath);
-    openThread(id, { ...ix, items: [{ id, title: UNTITLED, ts: Date.now(), n: 0 }, ...ix.items] });
+    openThread(id, { ...ix, items: [{ id, title: t("ask.newThread"), ts: Date.now(), n: 0 }, ...ix.items] });
     setThreadsOpen(false);
     setConfirmDel(null);
     taRef.current?.focus();
@@ -571,7 +563,7 @@ export function AskSidebar({
     if (!items.length) {
       const fresh = newThreadId();
       saveThread(bookPath, fresh, { msgs: [] });
-      items.push({ id: fresh, title: UNTITLED, ts: Date.now(), n: 0 });
+      items.push({ id: fresh, title: t("ask.newThread"), ts: Date.now(), n: 0 });
     }
     const next = items.reduce((a, b) => (b.ts > a.ts ? b : a)); // most recent survivor
     openThread(next.id, { ...ix, items });
@@ -592,12 +584,16 @@ export function AskSidebar({
 
     let prompt: string;
     if (pend) {
+      const where = t("ask.quoteFrom", {
+        title: bookTitle,
+        page: pend.page ? t("ask.quotePage", { n: pend.page }) : "",
+      });
       prompt =
-        `Фрагмент из книги «${bookTitle}»${pend.page ? ` (страница ${pend.page})` : ""}:\n<<<\n${pend.quote}\n>>>\n\n` +
-        (pend.pageText ? `Окружающий текст страницы:\n<<<\n${pend.pageText}\n>>>\n\n` : "") +
-        `Вопрос: ${q}`;
+        `${where}\n<<<\n${pend.quote}\n>>>\n\n` +
+        (pend.pageText ? `${t("ask.surrounding")}\n<<<\n${pend.pageText}\n>>>\n\n` : "") +
+        t("ask.question", { q });
     } else if (!sid) {
-      prompt = `Читаю книгу «${bookTitle}», сейчас открыта страница ${page}.\n\n${q}`;
+      prompt = `${t("ask.readingCtx", { title: bookTitle, page })}\n\n${q}`;
     } else {
       prompt = q; // follow-up: the resumed session already has the context
     }
@@ -641,31 +637,39 @@ export function AskSidebar({
           onEvent: ch,
         });
       } else {
-        push(path, tid, { role: "assistant", text: "Вопросы к Claude доступны только в приложении pdfer", error: true });
+        push(path, tid, { role: "assistant", text: t("ask.appOnly"), error: true });
         return;
       }
       // assertion: TS narrows the ref to its pre-await null, blind to onLine's writes
       const r = resultRef.current as NdLine | null;
       if (r && !r.is_error) {
-        push(path, tid, { role: "assistant", text: r.result || streamRef.current || "(пустой ответ)", md: true });
+        push(path, tid, { role: "assistant", text: r.result || streamRef.current || t("ask.emptyAnswer"), md: true });
         if (r.session_id) saveSid(path, tid, r.session_id); // --resume is per THREAD now
       } else if ((cancelledRef.current || r?.subtype === "cancelled") && streamRef.current) {
         push(path, tid, { role: "assistant", text: streamRef.current, cancelled: true, md: true });
       } else if (r) {
-        push(path, tid, { role: "assistant", text: r.result || `Ошибка: ${r.subtype ?? "неизвестная"}`, error: true });
+        // the backend puts only the raw process detail in `result` (it never
+        // words anything the reader sees) — the sentence is composed here
+        const detail = (r.result ?? "").trim();
+        const text =
+          r.subtype === "cancelled"
+            ? t("ask.cancelled")
+            : r.subtype === "error_process"
+              ? t("ask.exited", { detail: detail || (r.subtype ?? t("ask.errUnknownWhat")) })
+              : detail || t("ask.errUnknown", { what: r.subtype ?? t("ask.errUnknownWhat") });
+        push(path, tid, { role: "assistant", text, error: true });
       } else if (cancelledRef.current) {
-        push(path, tid, { role: "assistant", text: "Запрос отменён", error: true });
+        push(path, tid, { role: "assistant", text: t("ask.cancelled"), error: true });
       } else {
-        push(path, tid, { role: "assistant", text: "Ответ не получен", error: true });
+        push(path, tid, { role: "assistant", text: t("ask.noAnswer"), error: true });
       }
     } catch (e) {
       const s = String(e);
       const text = s.startsWith("claude_not_found")
-        ? `Claude Code не найден (${s.slice("claude_not_found:".length).trim()}). ` +
-          `Установите его с https://claude.com/claude-code и войдите в аккаунт командой claude.`
+        ? `${t("ask.notFound", { path: s.slice("claude_not_found:".length).trim() })}\n\n${installCommand(CLAUDE) ?? CLAUDE.docs}`
         : s.startsWith("busy")
-          ? "Уже выполняется другой запрос — дождитесь ответа или остановите его"
-          : `Не удалось запустить Claude: ${s}`;
+          ? t("ask.busy")
+          : t("ask.launchFail", { detail: s });
       push(path, tid, { role: "assistant", text, error: true });
     } finally {
       busyRef.current = false;
@@ -678,7 +682,7 @@ export function AskSidebar({
   const send = () => {
     if (busyRef.current) return;
     const pend = pending;
-    const q = input.trim() || (pend ? DEFAULT_Q : "");
+    const q = input.trim() || (pend ? defaultQ() : "");
     if (!q) return;
     setPending(null);
     setInput("");
@@ -686,7 +690,7 @@ export function AskSidebar({
   };
 
   const copyMsg = (i: number, text: string) => {
-    navigator.clipboard?.writeText(text).catch(() => {});
+    void copyToClipboard(text);
     setCopied(i);
     window.setTimeout(() => setCopied((c) => (c === i ? -1 : c)), 1500);
   };
@@ -711,15 +715,15 @@ export function AskSidebar({
   // ---- quick commands ----
   const hasAnswer = msgs.some((m) => m.role === "assistant" && !m.error);
   const cmdBlocker = (c: Cmd): string | null => {
-    if (c.need === "seed" && !pending) return NEED_SEED;
-    if (c.need === "answer" && !hasAnswer) return NEED_ANSWER;
-    if (c.need === "seedOrAnswer" && !pending && !hasAnswer) return NEED_SEED;
+    if (c.need === "seed" && !pending) return t("ask.needSeed");
+    if (c.need === "answer" && !hasAnswer) return t("ask.needAnswer");
+    if (c.need === "seedOrAnswer" && !pending && !hasAnswer) return t("ask.needSeed");
     return null;
   };
   const cmdQuery = cmdOpen && input.startsWith("/") ? input.slice(1).trim().toLowerCase() : "";
   // every command stays listed even when unavailable — the user asked to be able
   // to FIND these; a dimmed row with its reason beats a row that isn't there
-  const cmdList = COMMANDS.filter((c) => !cmdQuery || c.label.toLowerCase().includes(cmdQuery));
+  const cmdList = commands().filter((c) => !cmdQuery || c.label.toLowerCase().includes(cmdQuery));
   const cmdEnabled = cmdList.filter((c) => !cmdBlocker(c));
 
   const closeCmd = () => setCmdOpen(false);
@@ -778,17 +782,17 @@ export function AskSidebar({
   };
   const today = dayOf(Date.now());
   const groups: { key: string; items: ThreadMeta[] }[] = [];
-  for (const t of [...index.items].sort((a, b) => b.ts - a.ts)) {
-    const day = dayOf(t.ts);
-    const key = day === today ? "Сегодня" : day === today - 864e5 ? "Вчера" : "Раньше";
+  for (const th of [...index.items].sort((a, b) => b.ts - a.ts)) {
+    const day = dayOf(th.ts);
+    const key = day === today ? t("ask.today") : day === today - 864e5 ? t("ask.yesterday") : t("ask.earlier");
     const g = groups[groups.length - 1];
-    if (g?.key === key) g.items.push(t);
-    else groups.push({ key, items: [t] });
+    if (g?.key === key) g.items.push(th);
+    else groups.push({ key, items: [th] });
   }
   const stamp = (ts: number) =>
     dayOf(ts) >= today - 864e5
-      ? new Date(ts).toLocaleTimeString("ru-RU", { hour: "2-digit", minute: "2-digit" })
-      : new Date(ts).toLocaleDateString("ru-RU", { day: "numeric", month: "short" });
+      ? new Date(ts).toLocaleTimeString(getLang(), { hour: "2-digit", minute: "2-digit" })
+      : new Date(ts).toLocaleDateString(getLang(), { day: "numeric", month: "short" });
 
   return (
     <aside
@@ -804,7 +808,7 @@ export function AskSidebar({
       }</style>
       <ResizeHandle onWidth={onWidth} width={width} />
       <div className="flex items-center gap-1 h-10 pl-3.5 pr-2 border-b border-neutral-200 dark:border-neutral-700 select-none shrink-0">
-        <span className="truncate font-medium">Вопросы по книге</span>
+        <span className="truncate font-medium">{t("ask.title")}</span>
         <span className="flex-1" />
         <button
           aria-expanded={threadsOpen}
@@ -815,22 +819,22 @@ export function AskSidebar({
             setConfirmDel(null);
             setCmdOpen(false);
           }}
-          title={index.items.length > 1 ? `Беседы по книге · ${index.items.length}` : "Беседы по книге"}
+          title={index.items.length > 1 ? t("ask.threadsN", { n: index.items.length }) : t("ask.threads")}
         >
           <MessagesSquareIcon className="size-3.5" />
-          <span className="sr-only">Беседы по книге</span>
+          <span className="sr-only">{t("ask.threads")}</span>
         </button>
         <button
           aria-disabled={busy || msgs.length === 0}
           className={`${HDR_BTN} ${HDR_BTN_OFF}`}
           disabled={busy || msgs.length === 0}
           onClick={newThread}
-          title={msgs.length === 0 ? "Новая беседа — эта беседа уже пустая" : "Новая беседа"}
+          title={msgs.length === 0 ? t("ask.newThreadEmpty") : t("ask.newThreadTitle")}
         >
           <SquarePenIcon className="size-3.5" />
-          <span className="sr-only">Новая беседа</span>
+          <span className="sr-only">{t("ask.newThreadTitle")}</span>
         </button>
-        <button className={HDR_BTN} onClick={onClose} title="Закрыть (Ctrl+J)">
+        <button className={HDR_BTN} onClick={onClose} title={t("ask.closeKey")}>
           <IconClose />
         </button>
       </div>
@@ -841,11 +845,11 @@ export function AskSidebar({
           data-askthreads
         >
           <div className="px-3 pb-1 pt-1.5 text-xs font-medium text-neutral-500 dark:text-neutral-400 select-none">
-            Беседы
+            {t("ask.threadsHeading")}
           </div>
           {index.items.length === 0 && (
             <div className="px-3 py-2 text-xs text-neutral-500 dark:text-neutral-400">
-              Здесь появятся беседы по этой книге
+              {t("ask.threadsEmpty")}
             </div>
           )}
           {groups.map((g) => (
@@ -853,45 +857,45 @@ export function AskSidebar({
               <div className="px-3 pb-0.5 pt-2 text-[11px] uppercase tracking-wide text-neutral-400 dark:text-neutral-500 select-none">
                 {g.key}
               </div>
-              {g.items.map((t) => (
+              {g.items.map((th) => (
                 <div
                   className={`group/th relative px-3 py-1.5 transition-colors hover:bg-neutral-100 dark:hover:bg-neutral-700/60 ${
-                    t.id === index.active ? "bg-neutral-100/70 dark:bg-neutral-700/40" : ""
+                    th.id === index.active ? "bg-neutral-100/70 dark:bg-neutral-700/40" : ""
                   }`}
-                  key={t.id}
+                  key={th.id}
                 >
-                  {t.id === index.active && (
+                  {th.id === index.active && (
                     <span aria-hidden className="absolute inset-y-1 left-0 w-0.5 rounded-r bg-neutral-500 dark:bg-neutral-300" />
                   )}
                   <div className="flex items-center gap-2">
-                    <button className="min-w-0 flex-1 text-left" onClick={() => switchThread(t.id)} title={t.title}>
-                      <div className="truncate text-[13px]">{t.title}</div>
+                    <button className="min-w-0 flex-1 text-left" onClick={() => switchThread(th.id)} title={th.title}>
+                      <div className="truncate text-[13px]">{th.title}</div>
                       <div className="text-[11px] text-neutral-500 dark:text-neutral-400">
-                        {msgCount(t.n)} · {stamp(t.ts)}
+                        {msgCount(th.n)} · {stamp(th.ts)}
                       </div>
                     </button>
-                    {confirmDel !== t.id && (
+                    {confirmDel !== th.id && (
                       <button
                         className="shrink-0 rounded-md p-1 text-neutral-400 opacity-0 transition-colors hover:text-red-600 group-hover/th:opacity-100 focus-visible:opacity-100 dark:hover:text-red-400"
-                        onClick={() => setConfirmDel(t.id)}
-                        title="Удалить беседу"
+                        onClick={() => setConfirmDel(th.id)}
+                        title={t("ask.deleteThread")}
                       >
                         <Trash2Icon className="size-3.5" />
-                        <span className="sr-only">Удалить беседу</span>
+                        <span className="sr-only">{t("ask.deleteThread")}</span>
                       </button>
                     )}
                   </div>
-                  {confirmDel === t.id && (
+                  {confirmDel === th.id && (
                     <div className="mt-1 text-xs">
                       <div className="text-neutral-600 dark:text-neutral-300">
-                        Беседа и её память будут удалены
+                        {t("ask.deleteThreadWarn")}
                       </div>
                       <div className="mt-1 flex items-center gap-3">
-                        <button className={RED_BTN} onClick={() => deleteThread(t.id)}>
-                          Удалить
+                        <button className={RED_BTN} onClick={() => deleteThread(th.id)}>
+                          {t("ui.delete")}
                         </button>
                         <button className={PLAIN_BTN} onClick={() => setConfirmDel(null)}>
-                          Отмена
+                          {t("ui.cancel")}
                         </button>
                       </div>
                     </div>
@@ -907,13 +911,13 @@ export function AskSidebar({
         <ConversationContent className="min-h-full gap-3 px-3.5 py-3">
           {!canAsk && (
             <div className="rounded-lg bg-amber-500/10 text-amber-700 dark:text-amber-400 px-2.5 py-1.5 text-xs">
-              Доступно только в приложении
+              {t("ask.appOnlyBadge")}
             </div>
           )}
           {msgs.length === 0 && !busy && (
             <ConversationEmptyState className="flex-1 select-none">
               <div className="px-2 text-xs leading-relaxed text-neutral-500 dark:text-neutral-400 whitespace-pre-line">
-                {"Выделите фрагмент и нажмите «Спросить» —\nили задайте вопрос о книге здесь"}
+                {t("ask.empty")}
               </div>
             </ConversationEmptyState>
           )}
@@ -923,7 +927,7 @@ export function AskSidebar({
                 <MessageContent>
                   {m.quote && (
                     <div className="mb-1 border-l-2 border-neutral-400/60 dark:border-neutral-500/60 pl-2 text-xs text-neutral-600 dark:text-neutral-300 line-clamp-3">
-                      {m.page ? `стр. ${m.page} — ` : ""}
+                      {m.page ? t("ask.quotePagePrefix", { n: m.page }) : ""}
                       {m.quote}
                     </div>
                   )}
@@ -950,7 +954,7 @@ export function AskSidebar({
                     </span>
                   )}
                   {m.cancelled && (
-                    <span className="text-xs text-neutral-500 dark:text-neutral-400">(остановлено)</span>
+                    <span className="text-xs text-neutral-500 dark:text-neutral-400">{t("ask.stopped")}</span>
                   )}
                 </MessageContent>
                 {!m.error && (
@@ -962,7 +966,7 @@ export function AskSidebar({
                     <MessageAction
                       className="text-neutral-500 dark:text-neutral-400"
                       onClick={() => copyMsg(i, m.text)}
-                      tooltip={copied === i ? "Скопировано" : "Копировать"}
+                      tooltip={copied === i ? t("ui.copied") : t("ui.copy")}
                     >
                       {copied === i ? <CheckIcon /> : <CopyIcon />}
                     </MessageAction>
@@ -970,7 +974,7 @@ export function AskSidebar({
                       className="text-neutral-500 dark:text-neutral-400"
                       disabled={busy}
                       onClick={() => repeat(i)}
-                      tooltip="Повторить"
+                      tooltip={t("ui.retry")}
                     >
                       <RefreshCcwIcon />
                     </MessageAction>
@@ -1000,7 +1004,7 @@ export function AskSidebar({
           // it becomes two rows instead of hiding a chip behind a scrollbar that
           // Radix renders as nothing
           <Suggestions className="mb-1.5" wrap>
-            {SUGGESTIONS.map((s) => (
+            {suggestions().map((s) => (
               <Suggestion
                 className="h-6 px-2.5 text-xs text-neutral-600 dark:text-neutral-300"
                 key={s.label}
@@ -1011,10 +1015,10 @@ export function AskSidebar({
             <button
               className="rounded-md p-1 text-neutral-400 transition-colors hover:text-neutral-700 dark:hover:text-neutral-200"
               onClick={() => setSugHideAt(turn.current)}
-              title="Скрыть подсказки"
+              title={t("ask.hideSuggestions")}
             >
               <IconClose size={12} />
-              <span className="sr-only">Скрыть подсказки</span>
+              <span className="sr-only">{t("ask.hideSuggestions")}</span>
             </button>
           </Suggestions>
         )}
@@ -1023,12 +1027,12 @@ export function AskSidebar({
             {/* break-words: line-clamp hides the overflow, so a long unbroken
                 token would be silently cut with no ellipsis on that line */}
             <div className="min-w-0 flex-1 line-clamp-3 break-words text-neutral-600 dark:text-neutral-300">
-              {pending.page ? `стр. ${pending.page}: ` : ""}«{pending.quote}»
+              {pending.page ? t("ask.pageShort", { n: pending.page }) : ""}«{pending.quote}»
             </div>
             <button
               className="text-neutral-500 dark:text-neutral-400 transition-colors hover:text-neutral-800 dark:hover:text-neutral-100"
               onClick={() => setPending(null)}
-              title="Убрать фрагмент"
+              title={t("ask.removeFragment")}
             >
               <IconClose />
             </button>
@@ -1041,7 +1045,7 @@ export function AskSidebar({
             data-askcmd
           >
             {cmdList.length === 0 && (
-              <div className="px-3 py-2 text-xs text-neutral-500 dark:text-neutral-400">Команда не найдена</div>
+              <div className="px-3 py-2 text-xs text-neutral-500 dark:text-neutral-400">{t("ask.cmdNotFound")}</div>
             )}
             {cmdList.map((c) => {
               const why = cmdBlocker(c);
@@ -1078,7 +1082,7 @@ export function AskSidebar({
         <PromptInput data-askcomposer onSubmit={send}>
           <PromptInputTextarea
             onChange={(e) => onInput(e.target.value)}
-            placeholder={pending ? DEFAULT_Q : "Вопрос по книге… «/» — команды"}
+            placeholder={pending ? defaultQ() : t("ask.placeholder")}
             ref={taRef}
             rows={1}
             value={input}
@@ -1094,11 +1098,11 @@ export function AskSidebar({
                 data-askcmdbtn
                 disabled={busy || !canAsk}
                 onClick={() => (cmdOpen ? closeCmd() : openCmd())}
-                title="Быстрые команды (/)"
+                title={t("ask.quickCommands")}
                 type="button"
               >
                 <SparklesIcon className="size-3.5" />
-                <span className="sr-only">Быстрые команды</span>
+                <span className="sr-only">{t("ask.quickCommandsShort")}</span>
               </button>
             </PromptInputTools>
             <PromptInputSubmit
@@ -1106,7 +1110,7 @@ export function AskSidebar({
               disabled={!busy && !sendable}
               onClick={busy ? cancel : undefined}
               status={busy ? (stream ? "streaming" : "submitted") : undefined}
-              title={busy ? "Остановить" : "Отправить (Enter)"}
+              title={busy ? t("ask.stop") : t("ask.send")}
               type={busy ? "button" : "submit"}
             />
           </PromptInputToolbar>

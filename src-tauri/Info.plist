@@ -1,0 +1,42 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Merged into the generated macOS bundle Info.plist (name, version, identifier
+  and minimum system version all come from tauri.conf.json — nothing here
+  overrides them).
+
+  The one thing this file adds is an App Transport Security exception for the
+  loopback address. Translation happens over plain HTTP to a llama-server on
+  127.0.0.1:11544 that this app started itself; ATS is designed to stop apps
+  shipping cleartext traffic across the network, and a request that never
+  leaves the machine is exactly the case its loopback exception exists for.
+
+  The exception is deliberately narrow: 127.0.0.1 only, and local networking.
+  NSAllowsArbitraryLoads is NOT set — nothing else in Chitallo talks cleartext.
+-->
+<plist version="1.0">
+  <dict>
+    <key>NSAppTransportSecurity</key>
+    <dict>
+      <key>NSAllowsLocalNetworking</key>
+      <true/>
+      <key>NSExceptionDomains</key>
+      <dict>
+        <key>127.0.0.1</key>
+        <dict>
+          <key>NSExceptionAllowsInsecureHTTPLoads</key>
+          <true/>
+          <key>NSIncludesSubdomains</key>
+          <false/>
+        </dict>
+        <key>localhost</key>
+        <dict>
+          <key>NSExceptionAllowsInsecureHTTPLoads</key>
+          <true/>
+          <key>NSIncludesSubdomains</key>
+          <false/>
+        </dict>
+      </dict>
+    </dict>
+  </dict>
+</plist>

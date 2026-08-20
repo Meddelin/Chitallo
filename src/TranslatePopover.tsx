@@ -4,7 +4,6 @@ import { invoke } from "@tauri-apps/api/core";
 import { extractTerms, mergeGlossary, translateTerms } from "./glossarygen";
 import { isAuxUp, loadGlossaryText, parseGlossary, saveGlossaryText, translateStream } from "./translate";
 import {
-  MODEL_META,
   Spinner,
   cancelDownload,
   dlBusy,
@@ -14,10 +13,14 @@ import {
   fetchModelStatus,
   modelFileReady,
   restartModel,
+  sizeLabel,
   startDownload,
   statusUp,
   useDownload,
 } from "./ModelSetup";
+import { copyToClipboard } from "./clipboard";
+import { baseName } from "./host";
+import { t } from "./i18n";
 import { IconClose } from "./icons";
 
 export type Anchor = { x: number; y: number };
@@ -205,17 +208,17 @@ export function SelectionBar({
       onPointerDown={(e) => e.stopPropagation()}
     >
       {onOriginal ? (
-        <button className={`${PILL_BTN} px-1.5`} onClick={onOriginal} title="Оригинал выделенного (O)">
-          Оригинал <span className="text-xs text-neutral-500 dark:text-neutral-400">O</span>
+        <button className={`${PILL_BTN} px-1.5`} onClick={onOriginal} title={t("sel.originalTitle")}>
+          {t("tb.original")} <span className="text-xs text-neutral-500 dark:text-neutral-400">O</span>
         </button>
       ) : onTranslate ? (
-        <button className={`${PILL_BTN} px-1.5`} onClick={onTranslate} title="Перевести выделенное (Enter)">
-          Перевести <span className="text-xs text-neutral-500 dark:text-neutral-400">⏎</span>
+        <button className={`${PILL_BTN} px-1.5`} onClick={onTranslate} title={t("sel.translateTitle")}>
+          {t("sel.translate")} <span className="text-xs text-neutral-500 dark:text-neutral-400">⏎</span>
         </button>
       ) : null}
       <span className="text-neutral-300 dark:text-neutral-600">·</span>
-      <button className={`${PILL_BTN} px-1.5`} onClick={onAsk} title="Спросить Claude об этом фрагменте">
-        Спросить
+      <button className={`${PILL_BTN} px-1.5`} onClick={onAsk} title={t("sel.askTitle")}>
+        {t("tb.ask")}
       </button>
     </div>
   );
@@ -238,9 +241,9 @@ export function TranslatePopover({
   context?: string;
   bookPath: string;
   onClose: () => void;
-  // opens the model setup flow (license + download) — the «Скачать модель» CTA
+  // opens the model setup flow (licence + download) — the «Download» CTA
   onSetup?: () => void;
-  // header caption, default «Перевод»
+  // header caption, default «Translation»
   label?: string;
   // show text as-is, no model call — e.g. the stored original of an
   // already-translated paragraph on a reflowed page (label «Оригинал»)
@@ -281,11 +284,11 @@ export function TranslatePopover({
     (async () => {
       try {
         // Model gate — the shared status source, not a bare /health probe:
-        // 503 while the weights load must read «запускается», never «не
-        // запущена». The popover stays put (the captured text IS the
+        // 503 while the weights load must read «starting», never «not
+        // running». The popover stays put (the captured text IS the
         // selection) and auto-retries: "starting" resolves by itself, "none"
-        // resolves once the download + spawn finish. Only "dead" waits for
-        // an explicit «Перезапустить».
+        // resolves once the download + spawn finish. Only "dead" waits for an
+        // explicit «Restart».
         for (;;) {
           const status = await fetchModelStatus();
           if (ctrl.signal.aborted) return;
@@ -324,7 +327,8 @@ export function TranslatePopover({
   }, [onClose]);
 
   const copy = useCallback(() => {
-    navigator.clipboard.writeText(out).then(() => {
+    void copyToClipboard(out).then((ok) => {
+      if (!ok) return; // nothing was copied — do not claim otherwise
       setCopied(true);
       setTimeout(() => setCopied(false), 1200);
     });
@@ -338,40 +342,40 @@ export function TranslatePopover({
       onMouseDown={(e) => e.stopPropagation()}
     >
       <div className="flex shrink-0 items-center gap-2 px-3 pt-2 text-xs text-neutral-500 dark:text-neutral-400 select-none">
-        <span>{label ?? "Перевод"}</span>
+        <span>{label ?? t("tb.translation")}</span>
         <span className="flex-1" />
         {(phase === "done" || out) && (
           <button className={LINK_HOVER} onClick={copy}>
-            {copied ? "Скопировано" : "Копировать"}
+            {copied ? t("ui.copied") : t("ui.copy")}
           </button>
         )}
-        <button className={`${LINK_HOVER} px-0.5`} onClick={onClose} title="Закрыть (Esc)">
+        <button className={`${LINK_HOVER} px-0.5`} onClick={onClose} title={t("ui.close")}>
           <IconClose />
         </button>
       </div>
       <div className="min-h-0 px-3 pb-2.5 pt-1 max-h-[45vh] overflow-y-auto leading-relaxed whitespace-pre-wrap">
         {phase === "starting" ? (
           <span className="flex items-center gap-2 text-neutral-500 dark:text-neutral-400">
-            <Spinner /> Модель запускается… ≈20 с
+            <Spinner /> {t("model.startingShort")}
           </span>
         ) : phase === "nomodel" ? (
           dlBusy(dl) ? (
             <span className="text-neutral-500 dark:text-neutral-400 tabular-nums">
-              Модель скачивается · {dlProgressLine(dl)}
+              {t("model.downloadingDetail", { detail: dlProgressLine(dl) })}
             </span>
           ) : (
             <div className="text-neutral-600 dark:text-neutral-300">
-              <div>Для перевода нужна модель — 4,6 ГБ, скачивается один раз, работает офлайн</div>
+              <div>{t("model.needed", { size: sizeLabel("main") })}</div>
               {onSetup && (
                 <button className={`mt-1.5 underline underline-offset-2 ${LINK_HOVER}`} onClick={onSetup}>
-                  Скачать модель
+                  {t("model.downloadShort")}
                 </button>
               )}
             </div>
           )
         ) : phase === "dead" ? (
           <div className="text-neutral-600 dark:text-neutral-300">
-            <div>Модель не отвечает</div>
+            <div>{t("model.dead")}</div>
             <button
               className={`mt-1.5 underline underline-offset-2 ${LINK_HOVER}`}
               onClick={() => {
@@ -379,17 +383,17 @@ export function TranslatePopover({
                 setAttempt((a) => a + 1);
               }}
             >
-              Перезапустить
+              {t("ui.restart")}
             </button>
           </div>
         ) : phase === "error" ? (
           <div className="text-neutral-600 dark:text-neutral-300">
-            <div>Не удалось перевести. Попробуйте ещё раз</div>
+            <div>{t("pop.failed")}</div>
             <button
               className={`mt-1.5 underline underline-offset-2 ${LINK_HOVER}`}
               onClick={() => setAttempt((a) => a + 1)}
             >
-              Повторить
+              {t("ui.retry")}
             </button>
           </div>
         ) : (
@@ -401,7 +405,7 @@ export function TranslatePopover({
       </div>
       {showAltHint && (
         <div className="shrink-0 border-t border-neutral-200/70 dark:border-neutral-700/70 px-3 py-1.5 text-xs text-neutral-500 dark:text-neutral-400 select-none">
-          Alt+клик по абзацу — перевод целиком
+          {t("pop.altHint")}
         </div>
       )}
     </div>
@@ -548,8 +552,8 @@ export function GlossaryModal({
       if (statusUp(ms)) return true;
       setGen(
         ms === "dead"
-          ? { phase: "error", msg: "Модель не отвечает", action: "restart" }
-          : { phase: "error", msg: "Для перевода нужна модель — 4,6 ГБ, скачивается один раз", action: "setup" },
+          ? { phase: "error", msg: t("model.dead"), action: "restart" }
+          : { phase: "error", msg: t("model.neededShort", { size: sizeLabel("main") }), action: "setup" },
       );
       return false;
     };
@@ -561,7 +565,7 @@ export function GlossaryModal({
         signal: ctrl.signal,
         onProgress: (done, total) => setGen({ phase: "extract", done, total }),
       });
-      if (!terms.length) return setGen({ phase: "error", msg: "В книге не нашлось характерных терминов" });
+      if (!terms.length) return setGen({ phase: "error", msg: t("gl.noTerms") });
       if (!(await modelGate())) return;
       // terminologist model: started on demand for this run, stopped in finally
       setGen({ phase: "auxstart" });
@@ -582,7 +586,7 @@ export function GlossaryModal({
         setGen({ phase: "done", added, skipped, auxUsed: useAux });
       }
     } catch {
-      if (!ctrl.signal.aborted) setGen({ phase: "error", msg: "Не удалось собрать глоссарий. Попробуйте ещё раз" });
+      if (!ctrl.signal.aborted) setGen({ phase: "error", msg: t("gl.failed") });
       else if (!closedRef.current) setGen(null); // cancelled before the translate phase
     } finally {
       genCtrl.current = null;
@@ -602,14 +606,14 @@ export function GlossaryModal({
       <div className="modal-panel rounded-xl bg-white dark:bg-neutral-800 shadow-2xl p-4 w-[min(30rem,90vw)] text-sm text-neutral-800 dark:text-neutral-100">
         {/* 14px medium title: the modal has a name; the filename is context */}
         <div className="flex items-center gap-2 mb-2.5 select-none">
-          <span className="font-medium">Глоссарий</span>
+          <span className="font-medium">{t("gl.title")}</span>
           <span className="min-w-0 flex-1 truncate text-xs text-neutral-400 dark:text-neutral-500">
-            {bookPath.split(/[\\/]/).pop()}
+            {baseName(bookPath)}
           </span>
           <button
             className="px-0.5 text-neutral-500 dark:text-neutral-400 transition-colors hover:text-neutral-800 dark:hover:text-neutral-100"
             onClick={onClose}
-            title="Закрыть (Esc)"
+            title={t("ui.close")}
           >
             <IconClose />
           </button>
@@ -617,7 +621,7 @@ export function GlossaryModal({
         <textarea
           autoFocus
           className="w-full h-64 resize-y rounded-lg bg-neutral-100 dark:bg-neutral-900 p-2.5 font-mono text-[13px] leading-relaxed outline-none focus:ring-2 focus:ring-accent/60 dark:focus:ring-accent/50"
-          placeholder={"attention = внимание\nпо одной паре на строку"}
+          placeholder={t("gl.placeholder")}
           value={text}
           onChange={(e) => setText(e.target.value)}
         />
@@ -629,7 +633,7 @@ export function GlossaryModal({
                   // rebuild replaces the whole list — inline confirm (#12):
                   // consequence + a button naming the action, never «да/нет»
                   <>
-                    <span>Список будет заменён, ручные правки пропадут</span>
+                    <span>{t("gl.replaceWarn")}</span>
                     <button
                       className={RED_BTN}
                       onClick={() => {
@@ -637,42 +641,36 @@ export function GlossaryModal({
                         runGen(true); // fresh run — the result replaces the list
                       }}
                     >
-                      Заменить
+                      {t("gl.replace")}
                     </button>
                     <button className={PLAIN_BTN} onClick={() => setConfirmRebuild(false)}>
-                      Отмена
+                      {t("ui.cancel")}
                     </button>
                   </>
                 ) : (
                   <>
                     <button
                       className={`${GEN_BTN} transition-colors hover:bg-neutral-700 dark:hover:bg-white`}
-                      title={
-                        text.trim()
-                          ? "Пересобрать глоссарий с нуля — текущий список будет заменён (с подтверждением)"
-                          : "Найти термины во всей книге и перевести их локальной моделью"
-                      }
+                      title={text.trim() ? t("gl.rebuildTitle") : t("gl.buildTitle")}
                       onClick={() => (text.trim() ? setConfirmRebuild(true) : runGen())}
                     >
                       {/* non-empty list ⇒ true rebuild (confirm + replace); empty ⇒ first run */}
-                      {text.trim() ? "Собрать заново" : "Собрать глоссарий"}
+                      {text.trim() ? t("gl.rebuild") : t("gl.build")}
                     </button>
                     <span
                       title={
-                        gen?.phase === "done" && !gen.auxUsed
-                          ? "Термины переведены основной моделью — качество может быть ниже"
-                          : undefined
+                        gen?.phase === "done" && !gen.auxUsed ? t("gl.mainModelNote") : undefined
                       }
                     >
                       {gen === null
-                        ? "~2–3 мин, поиск терминов по всей книге"
+                        ? t("gl.estimate")
                         : gen.phase === "done"
-                          ? `Добавлено: ${gen.added}` + (gen.skipped ? ` · не переведено: ${gen.skipped}` : "")
+                          ? t("gl.added", { n: gen.added }) + (gen.skipped ? t("gl.skipped", { n: gen.skipped }) : "")
                           : gen.msg}
                     </span>
                     {gen?.phase === "error" && gen.action === "setup" && onSetup && (
                       <button className={QUIET_LINK} onClick={onSetup}>
-                        Скачать модель
+                        {t("model.downloadShort")}
                       </button>
                     )}
                     {gen?.phase === "error" && gen.action === "restart" && (
@@ -683,7 +681,7 @@ export function GlossaryModal({
                           setGen(null);
                         }}
                       >
-                        Перезапустить
+                        {t("ui.restart")}
                       </button>
                     )}
                   </>
@@ -697,20 +695,20 @@ export function GlossaryModal({
                     <Spinner />
                     <span className="tabular-nums">
                       {gen.phase === "extract"
-                        ? `Поиск терминов… ${gen.done}/${gen.total}`
+                        ? t("gl.mining", { done: gen.done, total: gen.total })
                         : gen.phase === "modelwait"
-                          ? "Модель запускается… ≈20 с"
+                          ? t("model.startingShort")
                           : gen.phase === "auxstart"
-                            ? "Загрузка модели… (до 30 с)"
-                            : `Перевод терминов… ${gen.done}/${gen.total}`}
+                            ? t("gl.loading")
+                            : t("gl.translating", { done: gen.done, total: gen.total })}
                     </span>
                   </span>
                   <button
                     className={QUIET_LINK}
                     onClick={() => genCtrl.current?.abort()}
-                    title="Остановить — уже переведённые термины будут добавлены"
+                    title={t("gl.stopTitle")}
                   >
-                    Отменить
+                    {t("gl.stop")}
                   </button>
                 </>
               ))}
@@ -718,7 +716,7 @@ export function GlossaryModal({
             {onRetranslate && (
               <button
                 className="rounded-lg px-2.5 py-1.5 text-[13px] text-neutral-500 transition-colors hover:bg-neutral-100 hover:text-neutral-700 dark:text-neutral-400 dark:hover:bg-neutral-700/60 dark:hover:text-neutral-200"
-                title="Удалить сохранённый перевод книги и перевести заново с текущим глоссарием"
+                title={t("gl.retranslateTitle")}
                 onClick={() => {
                   // the pipeline snapshots the glossary at start — save the
                   // edits now, before the modal's unmount autosave would
@@ -726,20 +724,20 @@ export function GlossaryModal({
                   onRetranslate();
                 }}
               >
-                Перевести заново
+                {t("gl.retranslate")}
               </button>
             )}
           </div>
         )}
-        {/* optional Qwen terminologist (Р-3: user-initiated, license named);
-            without it term translation falls back to the main model */}
+        {/* optional Qwen terminologist (user-initiated, licence named); without
+            it, term translation falls back to the main model */}
         {showAuxOffer && (
           <div className="mt-1.5 flex items-center gap-2 text-xs text-neutral-500 dark:text-neutral-400 select-none">
             {dlBusy(auxDl) ? (
               <>
-                <span className="tabular-nums">Дополнительная модель: {dlProgressLine(auxDl)}</span>
+                <span className="tabular-nums">{t("gl.auxProgress", { detail: dlProgressLine(auxDl) })}</span>
                 <button className={QUIET_LINK} onClick={() => cancelDownload("aux")}>
-                  Отменить
+                  {t("ui.cancel")}
                 </button>
               </>
             ) : (
@@ -747,12 +745,12 @@ export function GlossaryModal({
                 <span>
                   {auxDl.status === "error"
                     ? dlErrorLine(auxDl.error)
-                    : `Перевод терминов точнее с дополнительной моделью — ${MODEL_META.aux.sizeLabel}, лицензия Apache-2.0`}
+                    : t("gl.auxPitch", { size: sizeLabel("aux") })}
                 </span>
                 <button className={QUIET_LINK} onClick={() => startDownload("aux")}>
                   {auxDl.received > 0 && (auxDl.status === "cancelled" || auxDl.status === "error")
-                    ? `Продолжить · ${dlPct(auxDl)}%`
-                    : "Скачать"}
+                    ? t("gl.auxResume", { pct: dlPct(auxDl) })
+                    : t("ui.download")}
                 </button>
               </>
             )}

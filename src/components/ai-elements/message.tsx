@@ -10,7 +10,7 @@ import type { ComponentProps, HTMLAttributes } from "react";
 import { memo } from "react";
 import { Streamdown } from "streamdown";
 
-// AI Elements `message` (shadcn.io/ai pattern), trimmed for pdfer:
+// AI Elements `message` (shadcn.io/ai pattern), trimmed for Chitallo:
 // Message / MessageContent (bubbles), MessageActions / MessageAction (the
 // «Actions» pattern), MessageResponse (the «Response» pattern — streaming
 // markdown via Streamdown, which never renders raw HTML: markdown HTML nodes
@@ -39,7 +39,7 @@ export const MessageContent = ({ children, className, ...props }: MessageContent
   <div
     className={cn(
       "flex w-fit max-w-full min-w-0 flex-col gap-2 overflow-hidden text-sm",
-      // pdfer restyle: the user bubble mirrors the old sidebar pill (xl radius,
+      // Chitallo restyle: the user bubble mirrors the old sidebar pill (xl radius,
       // clipped corner, neutral fill); assistant text runs full-width, no chrome
       "group-[.is-user]:ml-auto group-[.is-user]:rounded-xl group-[.is-user]:rounded-br-sm group-[.is-user]:bg-secondary group-[.is-user]:px-3 group-[.is-user]:py-1.5 group-[.is-user]:text-foreground group-[.is-user]:whitespace-pre-wrap",
       "group-[.is-assistant]:w-full group-[.is-assistant]:leading-relaxed group-[.is-assistant]:text-foreground",
@@ -101,7 +101,7 @@ export const MessageResponse = memo(
   ({ className, ...props }: MessageResponseProps) => (
     <Streamdown
       className={cn("size-full [&>*:first-child]:mt-0 [&>*:last-child]:mb-0", className)}
-      // pdfer: strip Streamdown's hover chrome (English «Copy code» / «Download
+      // Chitallo: strip Streamdown's hover chrome (English «Copy code» / «Download
       // file» / table buttons) — clashes with the pill aesthetic and RU voice
       controls={false}
       {...props}

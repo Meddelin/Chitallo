@@ -1,11 +1,11 @@
 import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
 import type { Anchor } from "./TranslatePopover";
 
-// ---- pdfer's right-click menu ----------------------------------------------
+// ---- Chitallo's right-click menu ----------------------------------------------
 //
 // Custom surface, deliberately NOT Tauri's Menu.popup():
 //  - `accelerator` on a native item REGISTERS the shortcut, it does not merely
-//    draw it. pdfer's bare letters (T, O, D, ?) and Enter-confirms-selection
+//    draw it. Chitallo's bare letters (T, O, D, ?) and Enter-confirms-selection
 //    would gain a second owner; here the key is a grey hint column and nothing
 //    more;
 //  - a native menu cannot render that hint column, the accent primary or the

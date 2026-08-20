@@ -31,19 +31,26 @@ import * as booktranslate from "./booktranslate";
 import type { TrParagraph } from "./booktranslate";
 import { hydrateGlossary, loadGlossaryText, saveGlossaryText } from "./translate";
 import * as glossarygen from "./glossarygen";
-import { ModelSetupModal, Spinner, dlBusy, dlPct, fetchModelStatus, restartModel, statusUp, useDownload } from "./ModelSetup";
+import { ModelSetupModal, Spinner, dlBusy, dlPct, fetchModelStatus, restartModel, sizeLabel, statusUp, useDownload } from "./ModelSetup";
 import { AboutModal } from "./About";
 import { SettingsModal, TR_FONT_DEFAULT, TR_FONT_MAX, TR_FONT_MIN } from "./Settings";
 import { exportTranslationPdf, exportTranslationToDownloads, exportTranslationTxt } from "./export";
 import * as exportmod from "./export";
 import { IconChevronDown, IconColumns, IconMoon, IconSliders, IconSun } from "./icons";
 import "./App.css";
+import { baseName, host, isMac, joinPath, macKeys } from "./host";
+import { copyToClipboard } from "./clipboard";
+import { fmtNum, t, useLang } from "./i18n";
+import { Onboarding, needsOnboarding, resetOnboarding } from "./Onboarding";
 
 pdfjs.GlobalWorkerOptions.workerSrc = workerUrl;
 
+/// Shortcut hints are written the Windows/Linux way and rewritten to the
+/// macOS glyphs here — the same rule i18n's `t()` applies to catalogue strings.
+const K = (s: string) => (isMac() ? macKeys(s) : s);
+
 const DEFAULT_SCALE = 1.25;
-// Н4: every open path (обложка, Ctrl+O, палитра, pdfer:last) fails into the same toast
-const OPEN_FAIL_MSG = "Не удалось открыть файл — он перемещён или повреждён";
+// every open path (cover, Ctrl+O, palette, pdfer:last) fails into one toast
 const PAGE_GAP = 16;
 // «Спросить» sidebar width: the reading area shrinks by it (flex row, no
 // overlay), the fixed toolbar shifts left by half to stay centered over it.
@@ -92,15 +99,15 @@ function normalizeSelText(raw: string): string {
   return raw.replace(/[-­]\s*\n\s*/g, "").replace(/\s+/g, " ").trim();
 }
 
-// « · осталось ~40 мин» from the engine's etaMs (moving average over recent
-// pages); копирайт #18 — префикс «осталось», десятичная запятая
+// « · ~40 min left» from the engine's etaMs (a moving average over the recent
+// pages)
 function fmtEta(ms?: number): string {
   if (ms === undefined) return "";
   const min = Math.round(ms / 60000);
-  if (min < 1) return " · осталось <1 мин";
-  if (min < 60) return ` · осталось ~${min} мин`;
+  if (min < 1) return t("tr.etaMinSub");
+  if (min < 60) return t("tr.etaMin", { n: min });
   const h = ms / 3600000;
-  return ` · осталось ~${h < 10 ? h.toFixed(1).replace(".", ",") : Math.round(h)} ч`;
+  return t("tr.etaHour", { n: h < 10 ? fmtNum(h) : Math.round(h) });
 }
 
 // for 1-2 word selections: pull the containing sentence out of the surrounding
@@ -840,6 +847,12 @@ function Page({
 }
 
 export default function App() {
+  // Subscribing to the language here re-renders the whole tree on a switch:
+  // nothing below is memoised, so one subscription covers every surface.
+  useLang();
+  // First run: the setup wizard owns the screen until it is finished or
+  // skipped. `setup` is also how Settings re-opens it later.
+  const [setup, setSetup] = useState(needsOnboarding);
   const [doc, setDoc] = useState<PDFDocumentProxy | null>(null);
   const [path, setPath] = useState<string | null>(null);
   const [baseSize, setBaseSize] = useState<Size | null>(null);
@@ -862,7 +875,7 @@ export default function App() {
   // selection happened to be when it was made.
   const selAnchorRef = useRef<Anchor>({ x: 0, y: 0 });
   const [pop, setPop] = useState<TrRequest | null>(null);
-  // pdfer's right-click menu (см. ContextMenu.tsx): items are built per event
+  // Chitallo's right-click menu (см. ContextMenu.tsx): items are built per event
   const [ctxMenu, setCtxMenu] = useState<{ at: Anchor; items: CtxItem[]; keyboard?: boolean } | null>(null);
   const [glossOpen, setGlossOpen] = useState(false);
   // ---- «Спросить» sidebar ----
@@ -887,7 +900,7 @@ export default function App() {
   // selBar — the «Оригинал выделенного» command runs off this snapshot
   const [paletteSel, setPaletteSel] = useState<SelBarState | null>(null);
   const [shortcutsOpen, setShortcutsOpen] = useState(false);
-  // ---- «О pdfer» (WP-F): версия, приватность, лицензии ----
+  // ---- «О Chitallo» (WP-F): версия, приватность, лицензии ----
   const [aboutOpen, setAboutOpen] = useState(false);
   // ---- Настройки (WP-L): Ctrl+, / меню / глиф в тулбаре библиотеки ----
   const [settingsOpen, setSettingsOpen] = useState(false);
@@ -1008,7 +1021,7 @@ export default function App() {
       exportPdf: (bp?: string) => {
         const p = bp ?? path;
         if (!p) return Promise.reject(new Error("no book"));
-        return exportmod.exportTranslationPdf(p, (p.split(/[\\/]/).pop() ?? "перевод").replace(/\.pdf$/i, ""));
+        return exportmod.exportTranslationPdf(p, baseName(p).replace(/\.pdf$/i, ""));
       },
     };
   }, [doc, path]);
@@ -1024,14 +1037,14 @@ export default function App() {
         try {
           const { writeFile } = await import("@tauri-apps/plugin-fs");
           const dir = await appDataDir();
-          await writeFile(`${dir}\\autotranslate.log`, new TextEncoder().encode(`${new Date().toISOString()} ${msg}`));
+          await writeFile(joinPath(dir, "autotranslate.log"), new TextEncoder().encode(`${new Date().toISOString()} ${msg}`));
         } catch {
           /* ignore */
         }
       };
       try {
         const dir = await appDataDir();
-        const bytes = await readFile(`${dir}\\autotranslate.json`);
+        const bytes = await readFile(joinPath(dir, "autotranslate.json"));
         const marker = JSON.parse(new TextDecoder().decode(bytes)) as { bookPath?: string };
         if (stale) return void (await dbg("stale after read"));
         if (marker.bookPath !== path) return void (await dbg(`path mismatch: marker=${marker.bookPath} path=${path}`));
@@ -1226,7 +1239,7 @@ export default function App() {
         if (!orig) return false;
         const r = block.getBoundingClientRect();
         setSelBar(null);
-        setPop({ anchor: { x: r.left, y: r.bottom + 6 }, text: orig, label: "Оригинал", noTranslate: true });
+        setPop({ anchor: { x: r.left, y: r.bottom + 6 }, text: orig, label: t("tb.original"), noTranslate: true });
         return true;
       }
       const span = target.closest?.(".textLayer span") as HTMLElement | null;
@@ -1280,7 +1293,7 @@ export default function App() {
     // the LIVE bar has travelled with the page since the selection was made —
     // answer where the bar is now; the palette's dead snapshot keeps its own
     setSelBar(null);
-    setPop({ anchor: bar ? b.anchor : selAnchorRef.current, text: b.orig, label: "Оригинал", noTranslate: true });
+    setPop({ anchor: bar ? b.anchor : selAnchorRef.current, text: b.orig, label: t("tb.original"), noTranslate: true });
   }, []);
 
   // «Перевести» off the live selection bar — its button, ⏎ and the context menu
@@ -1406,7 +1419,7 @@ export default function App() {
     if (!docRef.current) return;
     if (!trAvailRef.current) {
       // T with nothing to toggle: point at the entry instead of silence (Н5)
-      showNotice("Сначала переведите книгу — Перевод ▾");
+      showNotice(t("tr.needTranslated"));
       return;
     }
     setView(viewModeRef.current === "tr" ? "orig" : "tr");
@@ -1421,13 +1434,13 @@ export default function App() {
   // out (auto-start on ready), "none"/"dead" surface the reason instead of
   // fake-succeeding (WP-B routes these into the model-setup flow), and a book
   // with no text layer never starts a run at all.
-  // update === true routes into «Обновить перевод» (incremental re-clustering,
+  // update === true routes into «Update the translation» (incremental re-clustering,
   // booktranslate.updateBookTranslation) instead of a translation run; the
   // model gate is shared — an update may need the wire for changed paragraphs
   const startTr = useCallback(async (update?: boolean) => {
     if (!doc || !path || booktranslate.getRun(path) || trWaitRef.current) return;
     if ((await hasTextProbeRef.current) === false) {
-      if (pathRef.current === path) showNotice("В книге нет текстового слоя — нужен OCR");
+      if (pathRef.current === path) showNotice(t("tr.noTextLayer"));
       return;
     }
     if (pathRef.current !== path || booktranslate.getRun(path)) return; // book changed during the probe
@@ -1456,7 +1469,7 @@ export default function App() {
     }
     // rejects only when the book file cannot be re-opened for the run's doc
     (update === true ? booktranslate.updateBookTranslation(path) : booktranslate.startRun(path)).catch(() => {
-      if (pathRef.current === path) showNotice(OPEN_FAIL_MSG);
+      if (pathRef.current === path) showNotice(t("app.openFail"));
     });
   }, [doc, path, showNotice]);
 
@@ -1607,7 +1620,7 @@ export default function App() {
 
   const loadFile = useCallback(async (p: string) => {
     const bytes = await readFile(p);
-    await loadBytes(bytes, p, p.split(/[\\/]/).pop() ?? "pdfer");
+    await loadBytes(bytes, p, p.split(/[\\/]/).pop() ?? "Chitallo");
     localStorage.setItem("pdfer:last", p);
     // recency stamp for the library's «Читаю» row — merged into the existing
     // pos record so a book opened but never scrolled still counts as opened
@@ -1628,7 +1641,7 @@ export default function App() {
     (p: string) =>
       loadFile(p).catch((e) => {
         console.error("open failed", e);
-        showNotice(OPEN_FAIL_MSG);
+        showNotice(t("app.openFail"));
       }),
     [loadFile, showNotice],
   );
@@ -1651,7 +1664,7 @@ export default function App() {
     if (last)
       loadFile(last).catch(() => {
         localStorage.removeItem("pdfer:last");
-        showNotice(OPEN_FAIL_MSG); // the book moved/vanished since last session
+        showNotice(t("app.openFail")); // the book moved/vanished since last session
       });
   }, [loadFile, loadBytes, showNotice]);
 
@@ -1786,9 +1799,9 @@ export default function App() {
     histRef.current = { back: [], fwd: [] };
     setAskSeed(null); // askOpen itself survives — it's a session preference
     try {
-      getCurrentWindow().setTitle("pdfer").catch(() => {});
+      getCurrentWindow().setTitle("Chitallo").catch(() => {});
     } catch {
-      document.title = "pdfer";
+      document.title = "Chitallo";
     }
   }, [savePos]);
 
@@ -1837,12 +1850,12 @@ export default function App() {
   const [pdfBusy, setPdfBusy] = useState(false);
   const exportTitle = useCallback(() => {
     const p = pathRef.current!;
-    const file = p.split(/[\\/]/).pop()?.replace(/\.pdf$/i, "") ?? "перевод";
+    const file = baseName(p).replace(/\.pdf$/i, "") || t("tr.untitled");
     try {
       const idx = JSON.parse(localStorage.getItem("pdfer:books") ?? "{}") as Record<string, { title?: string }>;
       return (idx[p]?.title ?? "").trim() || file;
     } catch {
-      return file; // индекса нет — остаётся имя файла
+      return file; // no index — the file name stands
     }
   }, []);
   const exportTr = useCallback(async () => {
@@ -1851,16 +1864,17 @@ export default function App() {
     exportBusyRef.current = true;
     try {
       const res = await exportTranslationToDownloads(p, exportTitle(), (done, total) => {
-        if (done === total || done % 5 === 0) showNotice(`Экспорт… ${Math.floor((100 * done) / total)}%`);
+        if (done === total || done % 5 === 0)
+          showNotice(t("tr.exporting", { pct: Math.floor((100 * done) / total) }));
       });
-      if (res === "none") return; // пункт меню без готовых страниц и так скрыт
-      showNotice("Сохранено в Загрузки", {
-        label: "Открыть",
-        run: () => void revealItemInDir(res.path).catch(() => showNotice("Не удалось открыть папку")),
+      if (res === "none") return; // the menu item is hidden without finished pages anyway
+      showNotice(t("tr.savedToDownloads"), {
+        label: t("ui.open"),
+        run: () => void revealItemInDir(res.path).catch(() => showNotice(t("ui.openFolderFailed"))),
       });
     } catch (e) {
       console.error("export failed", e);
-      showNotice("Не удалось экспортировать перевод");
+      showNotice(t("tr.exportFailed"));
     } finally {
       exportBusyRef.current = false;
     }
@@ -1871,18 +1885,20 @@ export default function App() {
     exportBusyRef.current = true;
     setPdfBusy(true);
     try {
-      showNotice("Подготовка PDF…");
+      showNotice(t("tr.pdfPreparing"));
       const res = await exportTranslationPdf(p, exportTitle(), (done, total) => {
-        if (done === total || done % 5 === 0) showNotice(`Подготовка PDF… ${Math.floor((100 * done) / total)}%`);
+        if (done === total || done % 5 === 0)
+          showNotice(t("tr.pdfPreparingPct", { pct: Math.floor((100 * done) / total) }));
       });
-      if (res === "none") return; // пункт меню без готовых страниц и так скрыт
-      showNotice("Сохранено в Загрузки", {
-        label: "Открыть",
-        run: () => void revealItemInDir(res.path).catch(() => showNotice("Не удалось открыть папку")),
+      if (res === "none") return; // the menu item is hidden without finished pages anyway
+      showNotice(t("tr.savedToDownloads"), {
+        label: t("ui.open"),
+        run: () => void revealItemInDir(res.path).catch(() => showNotice(t("ui.openFolderFailed"))),
       });
     } catch (e) {
       console.error("pdf export failed", e);
-      showNotice("Не удалось сохранить PDF");
+      // the platform with no silent print pipeline says so, instead of failing mutely
+      showNotice(String(e).includes("pdf_unsupported") ? t("tr.pdfUnsupported") : t("tr.pdfFailed"));
     } finally {
       exportBusyRef.current = false;
       setPdfBusy(false);
@@ -1894,10 +1910,10 @@ export default function App() {
     exportBusyRef.current = true;
     try {
       const res = await exportTranslationTxt(p, exportTitle());
-      if (res === "saved") showNotice("Перевод сохранён");
+      if (res === "saved") showNotice(t("tr.saved"));
     } catch (e) {
       console.error("export failed", e);
-      showNotice("Не удалось экспортировать перевод");
+      showNotice(t("tr.exportFailed"));
     } finally {
       exportBusyRef.current = false;
     }
@@ -1951,43 +1967,41 @@ export default function App() {
 
   const copyText = useCallback(
     (text: string) => {
-      navigator.clipboard?.writeText(text).then(
-        () => showNotice("Скопировано"),
-        () => showNotice("Не удалось скопировать"),
-      );
+      void copyToClipboard(text).then((ok) => showNotice(t(ok ? "ui.copied" : "ui.copyFailed")));
     },
     [showNotice],
   );
 
-  // ---- правый клик: собственное меню вместо системного WebView2 -------------
+  // ---- right click: our own menu instead of the platform webview's ---------
   //
-  // One document-level listener, three outcomes (см. таблицу в ContextMenu.tsx):
-  //  - в поле ввода — НЕ вмешиваемся: вырезать/вставить, отмена, проверка
-  //    орфографии и подсказки IME честно живут только в системном меню;
-  //  - в книге, на карточке библиотеки или на любом выделении — своё меню;
-  //  - в остальном хроме — preventDefault и НИЧЕГО: «Обновить», «Сохранить
-  //    как…» и «Проверить код» в читалке смысла не имеют.
+  // One document-level listener, three outcomes (see the table in
+  // ContextMenu.tsx):
+  //  - inside a text field we do NOT interfere: cut/paste, undo, spellcheck and
+  //    IME candidates honestly live only in the system menu;
+  //  - in the book, on a library card, or over any selection — our own menu;
+  //  - anywhere else in the chrome — preventDefault and NOTHING: «Reload»,
+  //    «Save as…» and «Inspect» make no sense in a reader.
   useEffect(() => {
     const onCtx = (e: MouseEvent) => {
-      const t = e.target as HTMLElement | null;
-      if (isTextField(t)) return; // системное меню — не подменяем
-      // правый клик ПО открытому меню: гасим системное и уходим — иначе меню
-      // пересобралось бы под курсором и потеряло пункты (цель вне scrollRef,
-      // т.е. inReader === false)
-      if (t?.closest("[data-ctxmenu]")) {
+      const el = e.target as HTMLElement | null;
+      if (isTextField(el)) return; // the system menu stands
+      // right click ON the open menu: suppress the system one and leave —
+      // otherwise the menu would rebuild under the cursor and lose items (the
+      // target is outside scrollRef, i.e. inReader === false)
+      if (el?.closest("[data-ctxmenu]")) {
         e.preventDefault();
         return;
       }
       e.preventDefault();
 
-      // Клавиатурный вызов (Shift+F10 / клавиша «Меню») приходит тем же
-      // событием, но с button 0 и без осмысленных координат — целимся в конец
-      // выделения, иначе в сфокусированный элемент.
+      // A keyboard invocation (Shift+F10 / the Menu key) arrives as the same
+      // event but with button 0 and no meaningful coordinates — aim at the end
+      // of the selection, else at the focused element.
       const byKey = e.button !== 2;
-      // «в книге» — единственная область, где уместны пункты страницы и поиск
-      // по выделению: цитата из ответа «Спросить» — пересказ, искать её в книге
-      // значит обещать заведомо пустой результат
-      const inReader = !!(t && scrollRef.current?.contains(t));
+      // «in the book» is the only area where the page items and find-selection
+      // belong: a quote from an «Ask» answer is a paraphrase, and searching the
+      // book for it would promise a result that cannot exist
+      const inReader = !!(el && scrollRef.current?.contains(el));
       const s = document.getSelection();
       const selText = s && !s.isCollapsed ? normalizeSelText(s.toString()) : "";
       const rects = s && !s.isCollapsed && s.rangeCount ? s.getRangeAt(0).getClientRects() : null;
@@ -2004,94 +2018,97 @@ export default function App() {
 
       const items: CtxItem[] = [];
 
-      // ---- карточка библиотеки ----
-      const card = t?.closest<HTMLElement>("[data-book][data-path]");
+      // ---- library card ----
+      const card = el?.closest<HTMLElement>("[data-book][data-path]");
       if (card) {
         const p = card.dataset.path!;
         items.push(
-          { id: "open", label: "Открыть", run: () => void openPath(p) },
+          { id: "open", label: t("ui.open"), run: () => void openPath(p) },
           {
             id: "reveal",
-            label: "Показать в папке",
-            run: () => void revealItemInDir(p).catch(() => showNotice("Не удалось открыть папку")),
+            label: t("ctx.revealInFolder"),
+            run: () => void revealItemInDir(p).catch(() => showNotice(t("ui.openFolderFailed"))),
           },
         );
-        // Экспорта здесь нет намеренно: готов ли перевод у ЭТОЙ книги, видно
-        // только после асинхронного чтения хранилища — пункт либо лгал бы,
-        // либо всплывал под курсором уже после открытия меню.
+        // Export is deliberately absent here: whether THIS book has a finished
+        // translation is only known after an async read of the store — the item
+        // would either lie, or appear under the cursor after the menu opened.
         setCtxMenu({ at, items, keyboard: byKey });
         return;
       }
 
-      // ---- выделение ----
-      // Правый клик мимо выделения схлопывает его ещё до этого события, так
-      // что живое выделение здесь — уже правильный ответ; панель выделения
-      // (её payload с оригиналами) годится, только пока текст на месте.
+      // ---- selection ----
+      // A right click outside the selection collapses it before this event
+      // fires, so a live selection here is already the right answer; the
+      // selection bar (whose payload carries the originals) is only good while
+      // that text is still in place.
       const bar = selText ? selBarRef.current : null;
       if (bar) {
-        if (bar.orig) items.push({ id: "orig", label: "Оригинал", hint: "O", run: () => peekOriginal() });
-        // «Перевести» и «Добавить в глоссарий» отсутствуют в переводе не по
-        // недосмотру: выделен русский текст, а глоссарий — EN=RU (тот же
-        // честный выбор, что и у панели выделения)
-        else items.push({ id: "tr", label: "Перевести", hint: "⏎", run: translateSelection });
-        items.push({ id: "ask", label: "Спросить", run: askFromSelection });
+        if (bar.orig) items.push({ id: "orig", label: t("tb.original"), hint: "O", run: () => peekOriginal() });
+        // «Translate» and «Add to the glossary» are missing over a translation
+        // on purpose: the selected text is already in the reader's language,
+        // and a glossary entry is source=target (the same honest choice the
+        // selection bar makes)
+        else items.push({ id: "tr", label: t("sel.translate"), hint: "⏎", run: translateSelection });
+        items.push({ id: "ask", label: t("tb.ask"), run: askFromSelection });
       }
       if (selText) {
-        items.push({ id: "copy", label: "Копировать", hint: "Ctrl+C", run: () => copyText(selText) });
+        items.push({ id: "copy", label: t("ui.copy"), hint: "Ctrl+C", run: () => copyText(selText) });
         if (inReader && path)
-          items.push({ id: "find", label: "Найти в книге", hint: "Ctrl+F", run: () => findSeeded(selText) });
-        // термин, а не абзац: глоссарий — это пары слов, строка на пол-страницы
-        // в нём бессмысленна
+          items.push({ id: "find", label: t("cmd.find"), hint: "Ctrl+F", run: () => findSeeded(selText) });
+        // a term, not a paragraph: the glossary is word pairs, and half a page
+        // of prose is meaningless in it
         if (bar && !bar.orig && selText.length <= 60 && selText.split(" ").length <= 6)
-          items.push({ id: "gloss", label: "Добавить в глоссарий", run: () => addToGlossary(selText) });
+          items.push({ id: "gloss", label: t("ctx.addToGlossary"), run: () => addToGlossary(selText) });
       }
 
-      // ---- ссылка под курсором ----
-      const link = t?.closest<HTMLAnchorElement>("a[href]");
+      // ---- link under the cursor ----
+      const link = el?.closest<HTMLAnchorElement>("a[href]");
       const href = link?.href ?? "";
       if (!selText && /^https?:/i.test(href)) {
         items.push(
-          { id: "openurl", label: "Открыть в браузере", run: () => void openUrl(href).catch(() => {}) },
-          { id: "copyurl", label: "Копировать ссылку", run: () => copyText(href) },
+          { id: "openurl", label: t("ctx.openInBrowser"), run: () => void openUrl(href).catch(() => {}) },
+          { id: "copyurl", label: t("ctx.copyLink"), run: () => copyText(href) },
         );
       }
 
-      // ---- абзац под курсором (без выделения) ----
-      if (!selText && !byKey && t) {
-        const block = t.closest(".trPage [data-tridx]");
-        const span = !block && t.closest(".textLayer span");
+      // ---- paragraph under the cursor (no selection) ----
+      if (!selText && !byKey && el) {
+        const block = el.closest(".trPage [data-tridx]");
+        const span = !block && el.closest(".textLayer span");
         if (block || span)
           items.push({
             id: "para",
-            label: block ? "Оригинал абзаца" : "Перевести абзац",
-            hint: "Alt+клик",
-            run: () => paragraphPopover(t),
+            label: block ? t("ctx.originalPara") : t("ctx.translatePara"),
+            hint: `Alt+${t("keys.click")}`,
+            run: () => paragraphPopover(el),
           });
       }
 
-      // ---- страница: отдельной группой, но только в области чтения ----
-      // Клик по хрому (тулбар, сайдбар, пустое поле вокруг) не получает НИЧЕГО:
-      // системное меню подавлено, своего нет — «Обновить» и «Проверить код» в
-      // читалке не нужны, а пункты страницы там не к месту. Выделение в ответе
-      // «Спросить» — это тоже не книга: там остаётся одно «Копировать».
+      // ---- the page: its own group, but only inside the reading area ----
+      // A click on the chrome (toolbar, sidebar, the empty field around) gets
+      // NOTHING: the system menu is suppressed and there is no menu of ours —
+      // «Reload» and «Inspect» have no place in a reader, and the page items
+      // have no place there. A selection inside an «Ask» answer is not the book
+      // either: only «Copy» survives there.
       if (doc && inReader) {
         const page: CtxItem[] = [];
         if (trInfo !== null)
           page.push({
             id: "view",
-            label: viewMode === "tr" ? "Показать оригинал" : "Показать перевод",
+            label: viewMode === "tr" ? t("cmd.showOriginal") : t("cmd.showTranslation"),
             hint: "T",
             run: toggleView,
           });
-        page.push({ id: "toc", label: "Оглавление", run: () => setNavOpen(true) });
-        if (!selText) page.push({ id: "findplain", label: "Найти в книге", hint: "Ctrl+F", run: openFind });
+        page.push({ id: "toc", label: t("cmd.toc"), run: () => setNavOpen(true) });
+        if (!selText) page.push({ id: "findplain", label: t("cmd.find"), hint: "Ctrl+F", run: openFind });
         if (page.length) {
           if (items.length) items.push({ sep: true });
           items.push(...page);
         }
       }
 
-      // одно всплывающее над книгой за раз — как делает Ctrl+K
+      // one popup over the book at a time — the same rule Ctrl+K follows
       if (!items.length) return void setCtxMenu(null);
       setMenuOpen(false);
       setNavOpen(false);
@@ -2147,16 +2164,16 @@ export default function App() {
         setPaletteSel(selBarRef.current); // before the input focus kills the bar
         setPaletteOpen((o) => !o);
       }
-      // «?» / Ctrl+/ — все клавиши одним экраном
+      // «?» / Ctrl+/ — every key on one screen
       else if (ctrl && e.code === "Slash") { e.preventDefault(); setPaletteOpen(false); setShortcutsOpen((o) => !o); }
-      // Ctrl+, — настройки (WP-L)
+      // Ctrl+, — settings
       else if (ctrl && e.code === "Comma") { e.preventDefault(); setSettingsOpen((o) => !o); }
       else if (!ctrl && !e.altKey && !typing && e.key === "?") { e.preventDefault(); setPaletteOpen(false); setShortcutsOpen((o) => !o); }
-      // bare-letter hotkeys stay live while the «Перевод» menu is open — it has
-      // no text inputs, and T visibly flips the pill's Ориг|Перевод segment
+      // bare-letter hotkeys stay live while the translation menu is open — it
+      // has no text inputs, and T visibly flips the pill's Orig|Translation segment
       else if (!ctrl && !e.altKey && !typing && e.code === "KeyD") toggleDark();
       else if (!ctrl && !e.altKey && !typing && e.code === "KeyT") toggleView();
-      // O — «Оригинал» peek for an active tr-selection (bare letter, like D/T;
+      // O — the «Original» peek for an active tr-selection (bare letter, like D/T;
       // does nothing without a selection bar carrying originals)
       else if (!ctrl && !e.altKey && !typing && e.code === "KeyO" && selBarRef.current?.orig && !popRef.current) {
         e.preventDefault();
@@ -2207,7 +2224,7 @@ export default function App() {
       }
       else if (e.key === "Escape") {
         // Esc peels UI layers before closing the book:
-        // контекстное меню → палитра → шорткаты → «О pdfer» → настройки → оглавление → масштаб → меню → модель → глоссарий → перевод → поиск → сайдбар (только при фокусе в нём) → выделение
+        // контекстное меню → палитра → шорткаты → «О Chitallo» → настройки → оглавление → масштаб → меню → модель → глоссарий → перевод → поиск → сайдбар (только при фокусе в нём) → выделение
         // (Esc typed INSIDE the find/page/palette inputs is handled there and never reaches this chain)
         // Контекстное меню снимает себя само (capture на document в
         // ContextMenu.tsx) — иначе Esc из поля поиска до сюда не дошёл бы;
@@ -2241,12 +2258,14 @@ export default function App() {
     return () => window.removeEventListener("keydown", onKey);
   }, [openDialog, openFind, zoomTo, applyFit, toggleDark, closeBook, setColsMode, toggleView, toggleAsk, setAsk, histNav, peekOriginal]);
 
-  // Ctrl+wheel zoom, anchored at the cursor (non-passive, to suppress webview page zoom)
+  // Ctrl+wheel zoom, anchored at the cursor (non-passive, to suppress webview
+  // page zoom). metaKey too, for Cmd+wheel on macOS — trackpad pinch already
+  // arrives as ctrlKey there, so both idioms land on the same handler.
   useEffect(() => {
     const el = scrollRef.current;
     if (!el) return;
     const onWheel = (e: WheelEvent) => {
-      if (e.ctrlKey) {
+      if (e.ctrlKey || e.metaKey) {
         e.preventDefault();
         zoomTo(scaleRef.current * (e.deltaY < 0 ? 1.1 : 1 / 1.1), { at: { x: e.clientX, y: e.clientY } });
       }
@@ -2302,24 +2321,26 @@ export default function App() {
   if (paletteOpen) {
     if (doc) {
       paletteCommands.push(
-        { id: "toc", label: "Оглавление", keywords: "toc contents содержание страница", run: () => setNavOpen(true) },
-        { id: "find", label: "Найти в книге", hint: "Ctrl+F", keywords: "поиск search find", run: openFind },
+        // keywords stay bilingual on purpose: the palette should answer to
+        // whichever word comes to mind, not only to the current interface language
+        { id: "toc", label: t("cmd.toc"), keywords: "toc contents содержание оглавление страница", run: () => setNavOpen(true) },
+        { id: "find", label: t("cmd.find"), hint: K("Ctrl+F"), keywords: "поиск найти search find", run: openFind },
       );
       if (trInfo !== null)
         paletteCommands.push({
           id: "view",
-          label: viewMode === "tr" ? "Показать оригинал" : "Показать перевод",
+          label: viewMode === "tr" ? t("cmd.showOriginal") : t("cmd.showTranslation"),
           hint: "T",
           keywords: "перевод оригинал translation original",
           run: toggleView,
         });
-      // tr-selection at palette-open time: the «Оригинал» peek is reachable
-      // from the palette too (WP-E: the palette doubles as the cheat-sheet);
-      // runs off the snapshot — the live bar died with the input's autofocus
+      // tr-selection at palette-open time: the «Original» peek is reachable
+      // from the palette too (the palette doubles as the cheat-sheet); it runs
+      // off the snapshot — the live bar died with the input's autofocus
       if (paletteSel?.orig)
         paletteCommands.push({
           id: "selorig",
-          label: "Оригинал выделенного",
+          label: t("cmd.originalSel"),
           hint: "O",
           keywords: "оригинал выделение original selection",
           run: () => peekOriginal(paletteSel),
@@ -2327,8 +2348,8 @@ export default function App() {
       if (trRun)
         paletteCommands.push({
           id: "trpause",
-          label: "Приостановить перевод",
-          keywords: "пауза pause стоп",
+          label: t("cmd.pauseTr"),
+          keywords: "пауза pause стоп stop",
           run: () => {
             if (path) void booktranslate.stopRun(path);
           },
@@ -2336,46 +2357,50 @@ export default function App() {
       else if (trInfo === null ? hasText !== false : trInfo.done < trInfo.total)
         paletteCommands.push({
           id: "trstart",
-          label: trInfo === null ? "Перевести книгу" : `Продолжить перевод · ${trPct}%`,
-          keywords: "translate перевод книга",
+          label: trInfo === null ? t("cmd.translateBook") : t("cmd.resumeTr", { pct: trPct }),
+          keywords: "translate перевод книга book",
           run: startTr,
         });
       if (trInfo !== null && trInfo.done > 0)
         paletteCommands.push(
-          {
-            id: "exportpdf",
-            label: "Экспорт в PDF",
-            keywords: "экспорт сохранить export pdf печать print загрузки downloads",
-            run: exportPdf,
-          },
+          ...(host().pdfExport
+            ? [
+                {
+                  id: "exportpdf",
+                  label: t("tr.exportPdf"),
+                  keywords: "экспорт сохранить export pdf печать print загрузки downloads",
+                  run: exportPdf,
+                },
+              ]
+            : []),
           {
             id: "export",
-            label: "Экспорт в HTML",
+            label: t("tr.exportHtml"),
             keywords: "экспорт сохранить export html загрузки downloads",
             run: exportTr,
           },
         );
       paletteCommands.push(
-        { id: "gloss", label: "Глоссарий…", keywords: "термины glossary", run: () => setGlossOpen(true) },
-        { id: "ask", label: "Спросить", hint: "Ctrl+J", keywords: "вопрос чат claude ask", run: toggleAsk },
-        { id: "zin", label: "Крупнее", hint: "Ctrl +", keywords: "масштаб zoom", run: () => zoomTo(scaleRef.current + 0.125) },
-        { id: "zout", label: "Мельче", hint: "Ctrl −", keywords: "масштаб zoom", run: () => zoomTo(scaleRef.current - 0.125) },
-        { id: "zwidth", label: "По ширине", hint: "Ctrl+0", keywords: "масштаб zoom ширина fit width", run: () => applyFit("width") },
-        { id: "zpage", label: "Страница целиком", keywords: "масштаб zoom страница fit page", run: () => applyFit("page") },
-        { id: "c1", label: "Одна страница в ряд", hint: "Ctrl+1", keywords: "колонки columns", run: () => setColsMode(1) },
-        { id: "c2", label: "Две страницы в ряд", hint: "Ctrl+2", keywords: "колонки columns", run: () => setColsMode(2) },
-        { id: "cauto", label: "Автоподбор по ширине", hint: "Ctrl+3", keywords: "колонки columns авто", run: () => setColsMode("auto") },
-        { id: "back", label: "Назад по переходам", hint: "Alt+←", keywords: "история back", run: () => histNav(-1) },
-        { id: "fwd", label: "Вперёд по переходам", hint: "Alt+→", keywords: "история forward", run: () => histNav(1) },
-        { id: "lib", label: "Библиотека", hint: "Esc", keywords: "закрыть library close", run: closeBook },
+        { id: "gloss", label: t("tr.glossary"), keywords: "термины glossary terms", run: () => setGlossOpen(true) },
+        { id: "ask", label: t("tb.ask"), hint: K("Ctrl+J"), keywords: "вопрос чат claude ask chat", run: toggleAsk },
+        { id: "zin", label: t("cmd.zoomIn"), hint: K("Ctrl +"), keywords: "масштаб zoom", run: () => zoomTo(scaleRef.current + 0.125) },
+        { id: "zout", label: t("cmd.zoomOut"), hint: K("Ctrl −"), keywords: "масштаб zoom", run: () => zoomTo(scaleRef.current - 0.125) },
+        { id: "zwidth", label: t("tb.fitWidth"), hint: K("Ctrl+0"), keywords: "масштаб zoom ширина fit width", run: () => applyFit("width") },
+        { id: "zpage", label: t("tb.fitPage"), keywords: "масштаб zoom страница fit page", run: () => applyFit("page") },
+        { id: "c1", label: t("cmd.col1"), hint: K("Ctrl+1"), keywords: "колонки columns", run: () => setColsMode(1) },
+        { id: "c2", label: t("cmd.col2"), hint: K("Ctrl+2"), keywords: "колонки columns", run: () => setColsMode(2) },
+        { id: "cauto", label: t("cmd.colAuto"), hint: K("Ctrl+3"), keywords: "колонки columns авто auto", run: () => setColsMode("auto") },
+        { id: "back", label: t("cmd.histBack"), hint: K("Alt+←"), keywords: "история back", run: () => histNav(-1) },
+        { id: "fwd", label: t("cmd.histFwd"), hint: K("Alt+→"), keywords: "история forward", run: () => histNav(1) },
+        { id: "lib", label: t("lib.title"), hint: "Esc", keywords: "закрыть library close", run: closeBook },
       );
     }
     paletteCommands.push(
-      { id: "open", label: "Открыть файл…", hint: "Ctrl+O", keywords: "open file pdf", run: openDialog },
-      { id: "dark", label: dark ? "Светлая тема" : "Тёмная тема", hint: "D", keywords: "тема theme dark light", run: toggleDark },
-      { id: "keys", label: "Клавиши", hint: "?", keywords: "шорткаты клавиатура shortcuts помощь help", run: () => setShortcutsOpen(true) },
-      { id: "settings", label: "Настройки…", hint: "Ctrl+,", keywords: "настройки settings тема размер модели хранилище", run: () => setSettingsOpen(true) },
-      { id: "about", label: "О pdfer", keywords: "версия лицензии приватность about version license", run: () => setAboutOpen(true) },
+      { id: "open", label: t("cmd.openFile"), hint: K("Ctrl+O"), keywords: "open file pdf открыть", run: openDialog },
+      { id: "dark", label: dark ? t("cmd.lightTheme") : t("cmd.darkTheme"), hint: "D", keywords: "тема theme dark light", run: toggleDark },
+      { id: "keys", label: t("cmd.keys"), hint: "?", keywords: "шорткаты клавиатура shortcuts keyboard помощь help", run: () => setShortcutsOpen(true) },
+      { id: "settings", label: t("cmd.settings"), hint: K("Ctrl+,"), keywords: "настройки settings тема размер модели хранилище", run: () => setSettingsOpen(true) },
+      { id: "about", label: t("app.about"), keywords: "версия лицензии приватность about version license", run: () => setAboutOpen(true) },
     );
   }
 
@@ -2383,9 +2408,9 @@ export default function App() {
   // recovery. anyStall covers BACKGROUND runs too — a model outage while the
   // library (or another book) is on screen must not fail silently.
   const toast = anyStall
-    ? { msg: "Модель недоступна — перевод приостановлен, готовые страницы сохранены" }
+    ? { msg: t("tr.modelStalled") }
     : trWait
-      ? { msg: "Модель запускается… Перевод начнётся автоматически" }
+      ? { msg: t("tr.modelWarming") }
       : notice;
 
   return (
@@ -2393,7 +2418,7 @@ export default function App() {
        same instant — a lone animated surface reads as a glitch (WP-K) */
     <div
       className={`${dark ? "dark" : ""} h-screen w-screen overflow-hidden bg-neutral-200 dark:bg-neutral-900`}
-      // кегль перевода (WP-L): каждая .trPage читает переменную, зум умножает
+      // translated type size: every .trPage reads this variable, zoom multiplies it
       style={{ "--tr-font-size": `${trFont}px` } as React.CSSProperties}
     >
       <div
@@ -2409,26 +2434,30 @@ export default function App() {
             <span
               className="absolute bottom-0 left-0 h-0.5 bg-accent transition-[width] duration-300"
               // 2% floor: a run at 0 swept pages must still show a living
-              // sliver — a 0-width band is «клик ничего не сделал»
+              // sliver — a zero-width band reads as «the click did nothing»
               style={{ width: `${Math.max(2, bandPct)}%` }}
             />
           </span>
         )}
         {/* left: library */}
-        <button className={`${TB_BTN} px-1`} onClick={doc ? closeBook : openDialog} title={doc ? "Библиотека (Esc)" : "Открыть файл (Ctrl+O)"}>
-          {doc ? "Библиотека" : "Открыть файл"}
+        <button
+          className={`${TB_BTN} px-1`}
+          onClick={doc ? closeBook : openDialog}
+          title={doc ? t("tb.libraryEsc") : t("tb.openFileKey")}
+        >
+          {doc ? t("tb.library") : t("tb.openFile")}
         </button>
         {doc && (
           <>
-            {/* group «навигация»: Библиотека + страница; the indicator opens
-                the go-to-page + оглавление flyout. Width is reserved for the
-                widest page number so the pill never shifts while scrolling */}
+            {/* the «navigation» group: library + page; the indicator opens the
+                go-to-page + contents flyout. Width is reserved for the widest
+                page number so the pill never shifts while scrolling */}
             <span className="relative" data-pagenav>
               <button
                 className={`${TB_BTN} tabular-nums text-neutral-600 dark:text-neutral-300 hover:text-neutral-800 dark:hover:text-neutral-100 px-1 whitespace-nowrap text-center`}
                 style={{ minWidth: `calc(${2 * String(doc.numPages).length + 3}ch + 0.5rem)` }}
                 onClick={() => setNavOpen((o) => !o)}
-                title="Страница и оглавление"
+                title={t("tb.pageAndToc")}
               >
                 {curPage} / {doc.numPages}
               </button>
@@ -2445,13 +2474,15 @@ export default function App() {
               )}
             </span>
             <span className="mx-2 h-4 w-px bg-neutral-900/15 dark:bg-neutral-100/20" />
-            {/* group «вид»: масштаб · колонки · тема */}
-            <button className={`${TB_BTN} px-1.5`} onClick={() => zoomTo(scale - 0.125)} title="Мельче (Ctrl −, Ctrl+0 — по ширине)">−</button>
+            {/* the «view» group: zoom · columns · theme */}
+            <button className={`${TB_BTN} px-1.5`} onClick={() => zoomTo(scale - 0.125)} title={t("tb.zoomOut")}>
+              −
+            </button>
             <span className="relative" data-zoommenu>
               <button
                 className={`${TB_BTN} tabular-nums text-neutral-600 dark:text-neutral-300 hover:text-neutral-800 dark:hover:text-neutral-100 w-11 text-center`}
                 onClick={() => setZoomOpen((o) => !o)}
-                title="Масштаб: пресеты (Ctrl+0 — по ширине)"
+                title={t("tb.zoomPresets")}
               >
                 {Math.round(scale * 100)}%
               </button>
@@ -2459,8 +2490,8 @@ export default function App() {
                 <div className="overlay-pop absolute left-1/2 -translate-x-1/2 top-full mt-2.5 z-20 rounded-xl bg-white/95 dark:bg-neutral-800/95 backdrop-blur shadow-xl p-1.5 text-left">
                   {(
                     [
-                      ["width", "По ширине", "Ctrl+0"],
-                      ["page", "Страница целиком", null],
+                      ["width", t("tb.fitWidth"), K("Ctrl+0")],
+                      ["page", t("tb.fitPage"), null],
                     ] as const
                   ).map(([m, label, hint]) => (
                     <button
@@ -2485,7 +2516,9 @@ export default function App() {
                 </div>
               )}
             </span>
-            <button className={`${TB_BTN} px-1.5`} onClick={() => zoomTo(scale + 0.125)} title="Крупнее (Ctrl +, Ctrl+0 — по ширине)">+</button>
+            <button className={`${TB_BTN} px-1.5`} onClick={() => zoomTo(scale + 0.125)} title={t("tb.zoomIn")}>
+              +
+            </button>
             <span className="ml-1 flex items-center gap-1">
               {/* active column mode carries the accent — the app's one active color */}
               {([1, 2, "auto"] as const).map((c) => (
@@ -2493,18 +2526,22 @@ export default function App() {
                   key={String(c)}
                   className={`${TB_BTN} px-1.5 py-0.5 ${cols === c ? "text-accent" : "text-neutral-500 dark:text-neutral-400"}`}
                   onClick={() => setColsMode(c)}
-                  title={c === 1 ? "Одна страница в ряд (Ctrl+1)" : c === 2 ? "Две страницы в ряд (Ctrl+2)" : "Автоподбор по ширине (Ctrl+3)"}
+                  title={c === 1 ? t("tb.col1") : c === 2 ? t("tb.col2") : t("tb.colAuto")}
                 >
                   <IconColumns n={c === "auto" ? 3 : c} />
                 </button>
               ))}
             </span>
-            <button className={`${TB_BTN} ml-1 px-1 py-0.5`} onClick={toggleDark} title={dark ? "Светлая тема (D)" : "Тёмная тема (D)"}>
+            <button
+              className={`${TB_BTN} ml-1 px-1 py-0.5`}
+              onClick={toggleDark}
+              title={dark ? t("tb.light") : t("tb.dark")}
+            >
               {dark ? <IconSun /> : <IconMoon />}
             </button>
             <span className="mx-2 h-4 w-px bg-neutral-900/15 dark:bg-neutral-100/20" />
-            {/* group «перевод+инструменты»: Ориг|Перевод сегмент (зеркалит T),
-                меню рана, «Спросить» */}
+            {/* the «translation + tools» group: the Orig|Translation segment
+                (mirrors T), the run menu, «Ask» */}
             {trInfo !== null && (
               <div className="flex gap-0.5 p-0.5 mr-1 rounded-full bg-neutral-100 dark:bg-neutral-900/50">
                 {(["orig", "tr"] as const).map((m) => (
@@ -2516,9 +2553,9 @@ export default function App() {
                         : "text-neutral-500 dark:text-neutral-400 hover:bg-neutral-900/5 dark:hover:bg-neutral-100/10"
                     }`}
                     onClick={() => setView(m)}
-                    title={m === "orig" ? "Оригинал (T)" : "Перевод (T)"}
+                    title={m === "orig" ? t("tb.originalKey") : t("tb.translationKey")}
                   >
-                    {m === "orig" ? "Оригинал" : "Перевод"}
+                    {m === "orig" ? t("tb.original") : t("tb.translation")}
                   </button>
                 ))}
               </div>
@@ -2527,32 +2564,32 @@ export default function App() {
               <button
                 className={`${TB_BTN} px-1 whitespace-nowrap`}
                 onClick={() => setMenuOpen((o) => !o)}
-                title="Перевод книги"
+                title={t("tb.trMenu")}
               >
                 {modelStatus !== null && !statusUp(modelStatus) && (
-                  // model not ready — the single «загляни сюда» signal
+                  // model not ready — the single «look here» signal
                   <span
                     className={`mr-1.5 inline-block h-1.5 w-1.5 rounded-full bg-amber-500 align-middle ${
                       modelStatus === "starting" || dlBusy(dlMain) ? "animate-pulse" : ""
                     }`}
                   />
                 )}
-                Перевод <IconChevronDown className="ml-0.5" />
+                {t("tb.translation")} <IconChevronDown className="ml-0.5" />
               </button>
               {menuOpen && (
                 <div className="overlay-pop absolute right-0 top-full mt-2.5 z-20 w-64 rounded-xl bg-white/95 dark:bg-neutral-800/95 backdrop-blur shadow-xl p-1.5 text-left">
                   <div>
                     {trRun ? (
-                      // копирайт #14: статус некликабелен, пауза — своя кнопка,
-                      // подпись постоянна (движок пишет каждую страницу сразу)
+                      // the status is not clickable, pause is its own button, and
+                      // the caption is constant (the engine writes every page at once)
                       <div className="px-2.5 py-1.5 select-none">
                         <div className="tabular-nums">
                           {/* update sweeps a 100%-done store — its progress is
                               the run's swept-pages counter, not donePages */}
                           {run?.update
-                            ? `Обновление · ${Math.floor((100 * run.done) / Math.max(1, run.total))}%`
+                            ? t("tr.updating", { pct: Math.floor((100 * run.done) / Math.max(1, run.total)) })
                             : `${trPct}%`}
-                          {run?.stalled ? " · модель недоступна" : fmtEta(run?.etaMs)}
+                          {run?.stalled ? t("tr.modelGone") : fmtEta(run?.etaMs)}
                         </div>
                         <button
                           className="mt-1 -mx-1 px-1 rounded transition-colors hover:bg-neutral-100 dark:hover:bg-neutral-700/70"
@@ -2560,16 +2597,16 @@ export default function App() {
                             if (path) void booktranslate.stopRun(path);
                           }}
                         >
-                          Приостановить
+                          {t("tr.pause")}
                         </button>
-                        <div className="mt-1 text-xs text-neutral-500 dark:text-neutral-400">Готовые страницы сохраняются</div>
+                        <div className="mt-1 text-xs text-neutral-500 dark:text-neutral-400">{t("tr.pagesKept")}</div>
                       </div>
                     ) : trInfo === null ? (
                       hasText === false ? (
                         // scan: nothing to feed the model — honest refusal
                         // instead of an instantly-«done» empty translation
                         <div className="px-2.5 py-1.5 text-neutral-500 dark:text-neutral-400 cursor-default">
-                          В книге нет текстового слоя — нужен OCR
+                          {t("tr.noTextLayer")}
                         </div>
                       ) : (
                         <button
@@ -2578,9 +2615,9 @@ export default function App() {
                             setMenuOpen(false);
                             startTr();
                           }}
-                          title="Вся книга переводится офлайн, на вашем компьютере. Можно прервать в любой момент"
+                          title={t("tr.startTitle")}
                         >
-                          Перевести книгу
+                          {t("tr.start")}
                         </button>
                       )
                     ) : trInfo.done < trInfo.total ? (
@@ -2590,18 +2627,18 @@ export default function App() {
                           setMenuOpen(false);
                           startTr();
                         }}
-                        title={`Продолжить перевод (готово ${trInfo.done} из ${trInfo.total} страниц)`}
+                        title={t("tr.resumeTitle", { done: trInfo.done, total: trInfo.total })}
                       >
-                        Продолжить перевод · {trPct}%
+                        {t("tr.resume", { pct: trPct })}
                       </button>
                     ) : (
-                      <div className="px-2.5 py-1.5 text-neutral-500 dark:text-neutral-400">Книга переведена</div>
+                      <div className="px-2.5 py-1.5 text-neutral-500 dark:text-neutral-400">{t("tr.complete")}</div>
                     )}
                     {/* «Обновить перевод»: инкрементальная пересборка готового
-                        перевода текущим движком — недеструктивная пара к
-                        «Перевести заново», скрыта пока идёт любой ран.
-                        Прерванное обновление (watermark updatedThrough) видно
-                        прямо в подписи — клик продолжит с этого места */}
+                        with the current engine — the non-destructive twin of
+                        «Translate again», hidden while any run is going. An
+                        interrupted update (the updatedThrough watermark) shows
+                        in the caption — a click resumes from there */}
                     {trInfo !== null && !trRun && (
                       <button
                         className={`${MENU_ROW}${updPct > 0 ? " tabular-nums" : ""}`}
@@ -2609,17 +2646,17 @@ export default function App() {
                           setMenuOpen(false);
                           startTr(true);
                         }}
-                        title="Пересобрать структуру страниц и доперевести только изменившееся"
+                        title={t("tr.updateTitle")}
                       >
-                        {updPct > 0 ? `Продолжить обновление · ${updPct}%` : "Обновить перевод"}
+                        {updPct > 0 ? t("tr.updateResume", { pct: updPct }) : t("tr.update")}
                       </button>
                     )}
                     {/* деструктивное подтверждение (#11): следствие + кнопка,
-                        называющая действие; «Перевести заново» (#13) */}
+                        naming the action; «Translate again» */}
                     {trInfo !== null &&
                       (confirmRestart ? (
                         <div className="px-2.5 py-1.5">
-                          <div className="text-neutral-600 dark:text-neutral-300">Готовый перевод будет удалён</div>
+                          <div className="text-neutral-600 dark:text-neutral-300">{t("tr.redoWarn")}</div>
                           <div className="mt-1 flex flex-col items-start gap-1">
                             <button
                               className="-mx-1 px-1 rounded text-red-600 dark:text-red-400 transition-colors hover:bg-red-500/10"
@@ -2629,13 +2666,13 @@ export default function App() {
                                 retranslate();
                               }}
                             >
-                              Удалить и перевести заново
+                              {t("tr.redoConfirm")}
                             </button>
                             <button
                               className="-mx-1 px-1 rounded transition-colors hover:bg-neutral-100 dark:hover:bg-neutral-700/70"
                               onClick={() => setConfirmRestart(false)}
                             >
-                              Отмена
+                              {t("ui.cancel")}
                             </button>
                           </div>
                         </div>
@@ -2643,33 +2680,37 @@ export default function App() {
                         <button
                           className={MENU_ROW}
                           onClick={() => setConfirmRestart(true)}
-                          title="Удалить готовый перевод и перевести книгу заново"
+                          title={t("tr.redoTitle")}
                         >
-                          Перевести заново
+                          {t("tr.redo")}
                         </button>
                       ))}
-                    {/* экспорт (WP-L, Р-9 + PDF): один клик — файл сразу в
-                        «Загрузки». PDF — главный путь (иллюстрации оригинала
-                        встроены); пока скрытое окно печатает, строка — спиннер,
-                        меню при клике не закрывается: эффект виден на месте.
-                        При частичном переводе — честная подпись, сколько
-                        страниц попадёт в файл */}
+                    {/* export: one click and the file is in Downloads.
+                        PDF is the main path (the original's
+                        illustrations are embedded); while the hidden window
+                        prints, the row is a spinner and the menu stays open, so
+                        the effect of the click is visible where it happened.
+                        On a partial translation the caption says honestly how
+                        many pages will land in the file */}
                     {trInfo !== null && trInfo.done > 0 && (
                       <>
-                        {pdfBusy ? (
+                        {/* PDF export leans on the platform's own silent print
+                            pipeline; where there is none, the row is absent
+                            rather than a button that always fails */}
+                        {!host().pdfExport ? null : pdfBusy ? (
                           <div className="px-2.5 py-1.5 flex items-center gap-1.5 text-neutral-500 dark:text-neutral-400">
-                            <Spinner /> Подготовка PDF…
+                            <Spinner /> {t("tr.pdfPreparing")}
                           </div>
                         ) : (
                           <button
                             className={MENU_ROW}
                             onClick={exportPdf}
-                            title="Сохранить перевод в PDF с иллюстрациями оригинала — файл появится в папке «Загрузки»"
+                            title={t("tr.exportPdfTitle")}
                           >
-                            Экспорт в PDF
+                            {t("tr.exportPdf")}
                             {trInfo.done < trInfo.total && (
                               <div className="text-xs text-neutral-500 dark:text-neutral-400 tabular-nums">
-                                Готово {trInfo.done} из {trInfo.total} страниц
+                                {t("tr.exportPartial", { done: trInfo.done, total: trInfo.total })}
                               </div>
                             )}
                           </button>
@@ -2680,9 +2721,9 @@ export default function App() {
                             setMenuOpen(false);
                             exportTr();
                           }}
-                          title="Сохранить перевод в HTML — файл появится в папке «Загрузки»"
+                          title={t("tr.exportHtmlTitle")}
                         >
-                          Экспорт в HTML
+                          {t("tr.exportHtml")}
                         </button>
                       </>
                     )}
@@ -2692,12 +2733,12 @@ export default function App() {
                         setMenuOpen(false);
                         setGlossOpen(true);
                       }}
-                      title="Термины книги и их переводы — используются при переводе"
+                      title={t("tr.glossaryTitle")}
                     >
-                      Глоссарий…
+                      {t("tr.glossary")}
                     </button>
                   </div>
-                  {/* model status row — единый словарь статусов (копирайт #1–4) */}
+                  {/* model status row — one status vocabulary, app-wide */}
                   {modelStatus && (
                     <div className="mt-1 border-t border-neutral-200 dark:border-neutral-700 px-2.5 pt-1.5 pb-1 text-xs">
                       {dlBusy(dlMain) ? (
@@ -2707,22 +2748,22 @@ export default function App() {
                             setMenuOpen(false);
                             setSetupOpen(true);
                           }}
-                          title="Скачивается в фоне — подробности и отмена"
+                          title={t("model.bgDownload")}
                         >
-                          Модель скачивается · {dlPct(dlMain)}%
+                          {t("model.downloading", { pct: dlPct(dlMain) })}
                         </button>
                       ) : modelStatus === "starting" || (dlMain.status === "done" && !statusUp(modelStatus)) ? (
                         <span className="flex items-center gap-1.5 text-neutral-500 dark:text-neutral-400">
-                          <Spinner /> Модель перевода: запускается…
+                          <Spinner /> {t("model.starting")}
                         </span>
                       ) : statusUp(modelStatus) ? (
-                        <span className="text-neutral-500 dark:text-neutral-400">Модель перевода: готова</span>
+                        <span className="text-neutral-500 dark:text-neutral-400">{t("model.ready")}</span>
                       ) : modelStatus === "dead" ? (
                         <button
                           className={MENU_QUIET}
                           onClick={() => restartModel().then((s) => setModelStatus(s))}
                         >
-                          Модель не отвечает · Перезапустить
+                          {t("model.deadRestart")}
                         </button>
                       ) : (
                         <button
@@ -2732,12 +2773,14 @@ export default function App() {
                             setSetupOpen(true);
                           }}
                         >
-                          Модель не установлена · Скачать (4,6 ГБ)
+                          {modelStatus === "noengine"
+                            ? t("model.noEngine")
+                            : t("model.notInstalled", { size: sizeLabel("main") })}
                         </button>
                       )}
                     </div>
                   )}
-                  {/* «Настройки» (WP-L) + «О pdfer» (WP-F) */}
+                  {/* «Settings» + «About Chitallo» */}
                   <div className="mt-1 flex flex-col gap-1 border-t border-neutral-200 dark:border-neutral-700 px-2.5 pt-1.5 pb-1 text-xs">
                     <button
                       className={MENU_QUIET}
@@ -2746,7 +2789,7 @@ export default function App() {
                         setSettingsOpen(true);
                       }}
                     >
-                      Настройки…
+                      {t("cmd.settings")}
                     </button>
                     <button
                       className={MENU_QUIET}
@@ -2755,25 +2798,34 @@ export default function App() {
                         setAboutOpen(true);
                       }}
                     >
-                      О pdfer
+                      {t("app.about")}
                     </button>
                   </div>
                 </div>
               )}
             </span>
             {/* «Спросить»: chat sidebar over Claude, empty thread from here */}
-            <button className={`${TB_BTN} px-1`} onClick={toggleAsk} title="Вопросы по книге (Ctrl+J)">
-              Спросить
+            <button className={`${TB_BTN} px-1`} onClick={toggleAsk} title={t("tb.askTitle")}>
+              {t("tb.ask")}
             </button>
           </>
         )}
         {!doc && (
           <>
-            <button className={`${TB_BTN} px-1 py-0.5`} onClick={toggleDark} title={dark ? "Светлая тема (D)" : "Тёмная тема (D)"}>
+            <button
+              className={`${TB_BTN} px-1 py-0.5`}
+              onClick={toggleDark}
+              title={dark ? t("tb.light") : t("tb.dark")}
+            >
               {dark ? <IconSun /> : <IconMoon />}
             </button>
-            {/* в читалке настройки живут в меню «Перевод»; здесь — свой глиф */}
-            <button className={`${TB_BTN} px-1 py-0.5`} onClick={() => setSettingsOpen(true)} title="Настройки (Ctrl+,)">
+            {/* in the reader, Settings lives in the «Translation» menu; here it
+                gets its own glyph */}
+            <button
+              className={`${TB_BTN} px-1 py-0.5`}
+              onClick={() => setSettingsOpen(true)}
+              title={t("tb.settingsKey")}
+            >
               <IconSliders />
             </button>
           </>
@@ -2832,7 +2884,7 @@ export default function App() {
           <AskSidebar
             open={askOpen}
             bookPath={path}
-            bookTitle={path.split(/[\\/]/).pop()?.replace(/\.pdf$/i, "") ?? "книга"}
+            bookTitle={baseName(path).replace(/\.pdf$/i, "")}
             page={curPage}
             seed={askSeed}
             width={askW}
@@ -2893,6 +2945,7 @@ export default function App() {
           onRetranslate={trInfo !== null ? retranslate : undefined}
         />
       )}
+      {setup && <Onboarding onDone={() => setSetup(false)} />}
       {setupOpen && <ModelSetupModal onClose={() => setSetupOpen(false)} />}
       {aboutOpen && <AboutModal onClose={() => setAboutOpen(false)} />}
       {settingsOpen && (
@@ -2903,6 +2956,11 @@ export default function App() {
           onTrFont={setTrFontPersist}
           onTranslationsCleared={onTranslationsCleared}
           onExportTxt={doc && trInfo !== null && trInfo.done > 0 ? exportTxt : undefined}
+          onRerunSetup={() => {
+            resetOnboarding();
+            setSettingsOpen(false);
+            setSetup(true);
+          }}
           onClose={() => setSettingsOpen(false)}
         />
       )}
@@ -2927,9 +2985,9 @@ export default function App() {
         />
       )}
       {toast && (
-        /* z-40 + последний в DOM: тост читается и поверх дым-слоя модалок
-           (TXT-экспорт из Настроек); палитра (z-50) всё равно выше. Сам тост
-           клики пропускает, живая только кнопка действия */
+        /* z-40 and last in the DOM: the toast reads even over a modal's scrim
+           (TXT export from Settings); the palette (z-50) still wins. The toast
+           itself passes clicks through — only its action button is live */
         <div
           className="overlay-pop fixed bottom-6 -translate-x-1/2 z-40 rounded-2xl bg-white/95 dark:bg-neutral-800/95 backdrop-blur px-4 py-2 shadow-xl text-sm text-neutral-700 dark:text-neutral-200 select-none pointer-events-none text-center"
           // centered over the READING area, like the toolbar: a nowrap pill at

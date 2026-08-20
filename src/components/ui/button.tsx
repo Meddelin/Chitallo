@@ -4,7 +4,7 @@ import { Slot } from "radix-ui"
 
 import { cn } from "@/lib/utils"
 
-/* pdfer restyle: the stock focus-visible ring classes are stripped — the app
+/* Chitallo restyle: the stock focus-visible ring classes are stripped — the app
    has ONE global 2px accent :focus-visible outline (App.css, WP-K); ghost and
    outline hovers use the app tint language (900/5 light, 100/10 dark). */
 const buttonVariants = cva(

@@ -13,6 +13,7 @@ import type { FigureRegion } from "./paragraphs";
 import type { TrParagraph } from "./booktranslate";
 import { Spinner } from "./ModelSetup";
 import { IconClose } from "./icons";
+import { t } from "./i18n";
 
 // one hit. orig mode: start/end are offsets in the page's index text (item
 // strs + "\n" per hasEOL — exactly what walkLayer reads back from the DOM,
@@ -356,13 +357,13 @@ export default function FindBar({
         value={query}
         onChange={(e) => setQuery(e.target.value)}
         onKeyDown={onKeyDown}
-        placeholder="Найти в книге"
+        placeholder={t("find.placeholder")}
         spellCheck={false}
         className="w-52 bg-transparent outline-none px-1 placeholder:text-neutral-400 dark:placeholder:text-neutral-500"
       />
       {hasQuery && (
         <span className="tabular-nums whitespace-nowrap px-1 text-neutral-500 dark:text-neutral-400 flex items-center gap-1.5">
-          {matches.length ? `${(idx < 0 ? 0 : idx) + 1}/${matches.length}` : busy ? null : "Не найдено"}
+          {matches.length ? `${(idx < 0 ? 0 : idx) + 1}/${matches.length}` : busy ? null : t("find.nothing")}
           {busy && <Spinner />}
         </span>
       )}
@@ -373,7 +374,7 @@ export default function FindBar({
         disabled={!matches.length}
         onMouseDown={(e) => e.preventDefault()}
         onClick={() => step(-1)}
-        title="Предыдущее совпадение (Shift+Enter)"
+        title={t("find.prev")}
       >
         ↑
       </button>
@@ -382,12 +383,12 @@ export default function FindBar({
         disabled={!matches.length}
         onMouseDown={(e) => e.preventDefault()}
         onClick={() => step(1)}
-        title="Следующее совпадение (Enter)"
+        title={t("find.next")}
       >
         ↓
       </button>
       <span className="mx-1 h-4 w-px bg-neutral-900/15 dark:bg-neutral-100/20" />
-      <button className={`${BAR_BTN} py-0.5`} onClick={onClose} title="Закрыть (Esc)">
+      <button className={`${BAR_BTN} py-0.5`} onClick={onClose} title={t("ui.close")}>
         <IconClose />
       </button>
     </div>

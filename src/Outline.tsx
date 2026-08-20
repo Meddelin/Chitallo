@@ -8,6 +8,7 @@
 import { useEffect, useRef, useState } from "react";
 import type { PDFDocumentProxy } from "pdfjs-dist";
 import { openUrl } from "@tauri-apps/plugin-opener";
+import { t } from "./i18n";
 
 export type DestTarget = { page: number; frac: number };
 
@@ -161,15 +162,15 @@ export default function Outline({
           }
         }}
         inputMode="numeric"
-        placeholder={`Страница 1–${doc.numPages}`}
-        aria-label="Номер страницы"
+        placeholder={t("out.pagePlaceholder", { last: doc.numPages })}
+        aria-label={t("out.pageLabel")}
         spellCheck={false}
         className="w-full bg-transparent outline-none px-2.5 py-1 tabular-nums placeholder:text-neutral-400 dark:placeholder:text-neutral-500"
       />
       {rows !== null && (
         <div className="mt-1 border-t border-neutral-200 dark:border-neutral-700 pt-1 max-h-[55vh] overflow-y-auto overscroll-contain">
           {rows.length === 0 ? (
-            <div className="px-2.5 py-1.5 text-neutral-500 dark:text-neutral-400 cursor-default">В книге нет оглавления</div>
+            <div className="px-2.5 py-1.5 text-neutral-500 dark:text-neutral-400 cursor-default">{t("out.noToc")}</div>
           ) : (
             rows.map((r) => (
               // the row prints the translated heading when there is one; the

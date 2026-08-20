@@ -1,11 +1,11 @@
-// Настройки (WP-L): одна тихая модалка — тема, кегль перевода, папка
-// библиотеки, модели на диске, хранилище. Ничего больше (план §2).
-// Грамматика поверхности — solid-модалка как About/ShortcutsOverlay; сегмент
-// темы повторяет пилюлю Ориг|Перевод из тулбара; деструктивные действия — по
-// паттерну #11: следствие + красная кнопка, называющая действие, + «Отмена».
-// Скачивание/удаление моделей — та же машинерия, что в ModelSetup (общий
-// download-store, resumable .part, delete_model в Rust глушит только НАШ
-// спавн llama-server и никогда не трогает внешний).
+// Settings (WP-L): one quiet modal — theme, language, translation type size,
+// library folder, models on disk, external dependencies, storage. Nothing more.
+// Surface grammar: a solid modal like About/ShortcutsOverlay; the theme segment
+// echoes the Orig|Translation pill from the toolbar; destructive actions follow
+// the house pattern — consequence, then a red button naming the action, then
+// «Cancel». Model download/delete reuses ModelSetup's machinery (shared
+// download store, resumable .part; delete_model in Rust only ever kills the
+// llama-server WE spawned and never touches an external one).
 
 import { useCallback, useEffect, useState } from "react";
 import { open } from "@tauri-apps/plugin-dialog";
@@ -13,44 +13,33 @@ import { readDir, readFile, remove, stat } from "@tauri-apps/plugin-fs";
 import { appDataDir } from "@tauri-apps/api/path";
 import { IconClose } from "./icons";
 import {
-  MODEL_META,
+  MODEL_SIZE,
   Progress,
   cancelDownload,
   deleteModel,
   dlBusy,
   fetchDlSnapshot,
+  sizeLabel,
   startDownload,
   useDownload,
 } from "./ModelSetup";
 import type { ModelKey } from "./ModelSetup";
 import { listRuns, onRunsChange } from "./booktranslate";
+import { useDependencies } from "./Depends";
+import { CLAUDE, LLAMA, baseName, joinPath } from "./host";
+import { fmtNum, fmtSize, getLang, setLang, t, type Lang } from "./i18n";
 
 export const TR_FONT_DEFAULT = 15.5;
 export const TR_FONT_MIN = 13;
 export const TR_FONT_MAX = 19;
 const TR_FONT_STEP = 0.5;
 
-// «15,5» / «16» — десятичная запятая, без хвоста ,0
-const fmtPx = (v: number) => v.toFixed(1).replace(".", ",").replace(/,0$/, "");
+// «15,5» / «16» — no trailing ,0
+const fmtPx = (v: number) => fmtNum(v).replace(/[.,]0$/, "");
 
-const fmtSize = (b: number) =>
-  b >= 1e9
-    ? `${(b / 1e9).toFixed(1).replace(".", ",")} ГБ`
-    : b >= 1e6
-      ? `${Math.round(b / 1e6)} МБ`
-      : `${Math.max(1, Math.round(b / 1e3))} КБ`;
-
-const ruPlural = (n: number, one: string, few: string, many: string) => {
-  const d10 = n % 10;
-  const d100 = n % 100;
-  if (d10 === 1 && d100 !== 11) return one;
-  if (d10 >= 2 && d10 <= 4 && (d100 < 12 || d100 > 14)) return few;
-  return many;
-};
-
-// тихая инлайн-ссылка (грамматика MENU_QUIET) и шаг кегля; красный вариант —
-// ОТДЕЛЬНЫЙ класс: два hover:text-* в одном списке разрешает порядок CSS,
-// а не порядок в className
+// A quiet inline link (MENU_QUIET's grammar) and the type-size stepper; the red
+// variant is a SEPARATE class: two hover:text-* in one list is resolved by CSS
+// order, not by the order in className
 const QUIET_BTN =
   "text-neutral-500 dark:text-neutral-400 transition-colors hover:text-neutral-700 dark:hover:text-neutral-200";
 const QUIET_RED_BTN = "text-neutral-500 dark:text-neutral-400 transition-colors hover:text-red-600 dark:hover:text-red-400";
@@ -98,7 +87,7 @@ function ModelRow({ model, label, desc, confirmNote }: { model: ModelKey; label:
     if (!busy) refresh();
   }, [busy, refresh]);
 
-  const size = MODEL_META[model].size;
+  const size = MODEL_SIZE[model];
   const ready = snap?.ready === true;
   const received = Math.max(snap?.received ?? 0, dl.status === "cancelled" || dl.status === "error" ? dl.received : 0);
   const partial = !ready && received > 0;
@@ -109,7 +98,7 @@ function ModelRow({ model, label, desc, confirmNote }: { model: ModelKey; label:
       await deleteModel(model);
       setErr(null);
     } catch (e) {
-      setErr(String(e).includes("busy") ? "Идёт скачивание — сначала отмените его" : "Не удалось удалить — файл занят другим процессом");
+      setErr(String(e).includes("busy") ? t("set.deleteBusy") : t("set.deleteFail"));
     }
     refresh();
   };
@@ -123,24 +112,26 @@ function ModelRow({ model, label, desc, confirmNote }: { model: ModelKey; label:
         <span className="flex-1" />
         {busy ? null : ready ? (
           <span className="flex items-center gap-3 text-xs">
-            <span className="text-neutral-500 dark:text-neutral-400">{MODEL_META[model].sizeLabel} на диске</span>
+            <span className="text-neutral-500 dark:text-neutral-400">
+              {t("set.onDisk", { size: sizeLabel(model) })}
+            </span>
             {!confirmDel && (
               <button className={QUIET_RED_BTN} onClick={() => setConfirmDel(true)}>
-                Удалить
+                {t("ui.delete")}
               </button>
             )}
           </span>
         ) : partial ? (
           <span className="flex items-center gap-3 text-xs">
             <span className="tabular-nums text-neutral-500 dark:text-neutral-400">
-              скачано {Math.floor((100 * received) / size)}%
+              {t("set.downloaded", { pct: Math.floor((100 * received) / size) })}
             </span>
             <button className={QUIET_BTN} onClick={() => startDownload(model)}>
-              Продолжить
+              {t("set.resume")}
             </button>
             {!confirmDel && (
               <button className={QUIET_RED_BTN} onClick={() => setConfirmDel(true)}>
-                Удалить
+                {t("ui.delete")}
               </button>
             )}
           </span>
@@ -148,9 +139,9 @@ function ModelRow({ model, label, desc, confirmNote }: { model: ModelKey; label:
           <span className="text-xs text-neutral-500 dark:text-neutral-400">—</span>
         ) : (
           <span className="flex items-center gap-3 text-xs">
-            <span className="text-neutral-500 dark:text-neutral-400">не установлена</span>
+            <span className="text-neutral-500 dark:text-neutral-400">{t("set.notInstalled")}</span>
             <button className={QUIET_BTN} onClick={() => startDownload(model)}>
-              Скачать ({MODEL_META[model].sizeLabel})
+              {t("ui.download")} ({sizeLabel(model)})
             </button>
           </span>
         )}
@@ -165,10 +156,10 @@ function ModelRow({ model, label, desc, confirmNote }: { model: ModelKey; label:
           <div className="text-neutral-600 dark:text-neutral-300">{confirmNote}</div>
           <div className="mt-1 flex items-center gap-3">
             <button className={RED_BTN} onClick={() => void doDelete()}>
-              Удалить
+              {t("ui.delete")}
             </button>
             <button className={PLAIN_BTN} onClick={() => setConfirmDel(false)}>
-              Отмена
+              {t("ui.cancel")}
             </button>
           </div>
         </div>
@@ -187,32 +178,32 @@ async function dirStat(path: string): Promise<DirStat> {
   let bytes = 0;
   try {
     for (const e of await readDir(path)) {
-      if (e.isDirectory || e.name.endsWith(".tmp")) continue; // .tmp — незавершённая атомарная запись, не книга
-      const st = await stat(`${path}\\${e.name}`).catch(() => null);
+      if (e.isDirectory || e.name.endsWith(".tmp")) continue; // .tmp — a half-finished atomic write, not a book
+      const st = await stat(joinPath(path, e.name)).catch(() => null);
       if (st && st.size > 0) {
         files++;
         bytes += st.size;
       }
     }
   } catch {
-    // папки ещё нет (или plain browser) — нули
+    // the folder does not exist yet (or plain browser) — zeroes
   }
   return { files, bytes };
 }
 
-// Per-book разбивка хранилища (WP-M): каждая строка — один store-файл.
-// bookPath — второе поле в JSON.stringify-выводе движка, так что префикса
-// файла хватает, чтобы узнать книгу без парсинга многомегабайтного JSON.
+// Per-book storage breakdown: one row per store file. bookPath is the second
+// field the engine writes, so the file's prefix is enough to name the book
+// without parsing a multi-megabyte JSON.
 type TrRow = { file: string; path: string; title: string; bytes: number };
 
 async function listTranslations(): Promise<TrRow[]> {
   const idx = JSON.parse(localStorage.getItem("pdfer:books") ?? "{}") as Record<string, { title?: string }>;
   const rows: TrRow[] = [];
   try {
-    const dir = `${await appDataDir()}\\translations`;
+    const dir = joinPath(await appDataDir(), "translations");
     for (const e of await readDir(dir)) {
       if (e.isDirectory || !/\.json$/i.test(e.name)) continue;
-      const full = `${dir}\\${e.name}`;
+      const full = joinPath(dir, e.name);
       const st = await stat(full).catch(() => null);
       if (!st || st.size === 0) continue;
       let path = "";
@@ -221,13 +212,13 @@ async function listTranslations(): Promise<TrRow[]> {
         const m = head.match(/"bookPath":"((?:[^"\\]|\\.)*)"/);
         if (m) path = JSON.parse(`"${m[1]}"`) as string;
       } catch {
-        // заголовок нечитаем — строка останется с именем файла
+        // the header is unreadable — the row keeps the file name
       }
-      const name = path.split(/[\\/]/).pop()?.replace(/\.pdf$/i, "") || e.name.replace(/\.json$/i, "");
+      const name = baseName(path).replace(/\.pdf$/i, "") || e.name.replace(/\.json$/i, "");
       rows.push({ file: full, path, title: idx[path]?.title || name, bytes: st.size });
     }
   } catch {
-    // папки ещё нет (или plain browser)
+    // the folder does not exist yet (or plain browser)
   }
   return rows.sort((a, b) => b.bytes - a.bytes);
 }
@@ -236,12 +227,85 @@ async function clearDir(path: string): Promise<void> {
   try {
     for (const e of await readDir(path)) {
       if (e.isDirectory) continue;
-      await remove(`${path}\\${e.name}`).catch(() => {});
+      await remove(joinPath(path, e.name)).catch(() => {});
     }
   } catch {
     // nothing to clear
   }
 }
+
+// ---- language + dependency rows ---------------------------------------------
+
+/// The interface language, which is also the language books get translated
+/// into. Switching it re-renders every surface through i18n's store.
+function LanguageRow() {
+  const lang = getLang();
+  return (
+    <Row label={t("set.language")}>
+      <div className="flex gap-0.5 rounded-full bg-neutral-100 p-0.5 text-xs dark:bg-neutral-900/50">
+        {(["ru", "en"] as const).map((l: Lang) => (
+          <button
+            key={l}
+            className={`rounded-full px-2 py-0.5 transition-colors ${
+              lang === l
+                ? "bg-white shadow-sm dark:bg-neutral-700"
+                : "text-neutral-500 hover:bg-neutral-900/5 dark:text-neutral-400 dark:hover:bg-neutral-100/10"
+            }`}
+            onClick={() => setLang(l)}
+          >
+            {l === "ru" ? "Русский" : "English"}
+          </button>
+        ))}
+      </div>
+    </Row>
+  );
+}
+
+/// One external program: present or not, with a link to its install docs. The
+/// install command itself lives in the setup wizard — this row is a status
+/// line, not a second place to teach the same thing.
+function DependencyRow({
+  label,
+  status,
+  ready,
+  missing,
+  docs,
+  onRecheck,
+}: {
+  label: string;
+  name: string;
+  status: { installed: boolean; path: string | null; version: string | null } | null;
+  ready: string;
+  missing: string;
+  docs: string;
+  onRecheck: () => void;
+}) {
+  const installed = status?.installed === true;
+  return (
+    <Row label={label} title={status?.path ?? undefined}>
+      <span className="flex items-center gap-3 text-xs">
+        <span className="max-w-[12rem] truncate text-neutral-500 dark:text-neutral-400">
+          {status === null ? "…" : installed ? (status.version ?? ready) : missing}
+        </span>
+        {status !== null && !installed && (
+          <button className={QUIET_BTN} onClick={() => void open_docs(docs)}>
+            {t("set.howToInstall")}
+          </button>
+        )}
+        {status !== null && !installed && (
+          <button className={QUIET_BTN} onClick={onRecheck}>
+            {t("ob.engineRecheck")}
+          </button>
+        )}
+      </span>
+    </Row>
+  );
+}
+
+const open_docs = (url: string) =>
+  import("@tauri-apps/plugin-opener")
+    .then((m) => m.openUrl(url))
+    .catch(() => window.open(url, "_blank", "noopener"));
 
 // ---- modal ------------------------------------------------------------------
 
@@ -252,6 +316,7 @@ export function SettingsModal({
   onTrFont,
   onTranslationsCleared,
   onExportTxt,
+  onRerunSetup,
   onClose,
 }: {
   dark: boolean;
@@ -262,12 +327,15 @@ export function SettingsModal({
   // вторичный экспорт открытой книги (главный — HTML одной кнопкой из меню);
   // undefined = книга не открыта или переведённых страниц нет — строки нет
   onExportTxt?: () => void;
+  // re-open the first-run wizard; undefined only in surfaces that cannot host it
+  onRerunSetup?: () => void;
   onClose: () => void;
 }) {
   const [libDir, setLibDir] = useState<string | null>(() => localStorage.getItem("pdfer:libdir"));
   const [trStat, setTrStat] = useState<DirStat | null>(null);
   const [coverStat, setCoverStat] = useState<DirStat | null>(null);
   const [confirmClear, setConfirmClear] = useState(false);
+  const deps = useDependencies();
   // пути книг с активным раном: блокируют и общую очистку, и строку своей книги
   const [runPaths, setRunPaths] = useState<string[]>(() => listRuns().map((r) => r.bookPath));
   useEffect(() => onRunsChange(() => setRunPaths(listRuns().map((r) => r.bookPath))), []);
@@ -280,8 +348,8 @@ export function SettingsModal({
   const refreshStorage = useCallback(() => {
     appDataDir()
       .then(async (d) => {
-        setTrStat(await dirStat(`${d}\\translations`));
-        setCoverStat(await dirStat(`${d}\\covers`));
+        setTrStat(await dirStat(joinPath(d, "translations")));
+        setCoverStat(await dirStat(joinPath(d, "covers")));
       })
       .catch(() => {
         setTrStat({ files: 0, bytes: 0 });
@@ -304,7 +372,7 @@ export function SettingsModal({
     setConfirmClear(false);
     setConfirmRow(null);
     const d = await appDataDir().catch(() => null);
-    if (d) await clearDir(`${d}\\translations`);
+    if (d) await clearDir(joinPath(d, "translations"));
     onTranslationsCleared();
     setTrRows((rs) => (rs === null ? rs : []));
     refreshStorage();
@@ -333,13 +401,13 @@ export function SettingsModal({
 
   const clearCovers = useCallback(async () => {
     const d = await appDataDir().catch(() => null);
-    if (d) await clearDir(`${d}\\covers`);
+    if (d) await clearDir(joinPath(d, "covers"));
     // индекс указывает на удалённые файлы — сброс, чтобы обложки пересоздались
     localStorage.removeItem("pdfer:books");
     refreshStorage();
   }, [refreshStorage]);
 
-  const dirName = libDir ? (libDir.split(/[\\/]/).filter(Boolean).pop() ?? libDir) : null;
+  const dirName = libDir ? (baseName(libDir.replace(/[\\/]+$/, "")) || libDir) : null;
 
   return (
     <div
@@ -350,18 +418,18 @@ export function SettingsModal({
     >
       <div className="modal-panel w-[min(26rem,90vw)] rounded-xl bg-white p-4 text-sm text-neutral-800 shadow-2xl dark:bg-neutral-800 dark:text-neutral-100 select-none">
         <div className="mb-2 flex items-center text-xs text-neutral-500 dark:text-neutral-400">
-          <span>Настройки</span>
+          <span>{t("set.title")}</span>
           <span className="flex-1" />
           <button
             className="px-0.5 transition-colors hover:text-neutral-800 dark:hover:text-neutral-100"
             onClick={onClose}
-            title="Закрыть (Esc)"
+            title={t("ui.close")}
           >
             <IconClose />
           </button>
         </div>
 
-        <Row label="Тема">
+        <Row label={t("set.theme")}>
           <div className="flex gap-0.5 rounded-full bg-neutral-100 p-0.5 text-xs dark:bg-neutral-900/50">
             {([false, true] as const).map((d) => (
               <button
@@ -373,17 +441,19 @@ export function SettingsModal({
                 }`}
                 onClick={() => onTheme(d)}
               >
-                {d ? "Тёмная" : "Светлая"}
+                {d ? t("set.dark") : t("set.light")}
               </button>
             ))}
           </div>
         </Row>
 
-        <Row label="Размер текста перевода" title="Кегль текста в режиме «Перевод» при масштабе 100%">
+        <LanguageRow />
+
+        <Row label={t("set.trFont")} title={t("set.trFontTitle")}>
           <span className="flex items-center gap-1">
             {trFont !== TR_FONT_DEFAULT && (
               <button className={`mr-2 text-xs ${QUIET_BTN}`} onClick={() => onTrFont(TR_FONT_DEFAULT)}>
-                Сбросить
+                {t("set.reset")}
               </button>
             )}
             <button className={STEP_BTN} disabled={trFont <= TR_FONT_MIN} onClick={() => onTrFont(trFont - TR_FONT_STEP)}>
@@ -396,65 +466,95 @@ export function SettingsModal({
           </span>
         </Row>
 
-        <Row label="Папка библиотеки" title={libDir ?? undefined}>
+        <Row label={t("set.libFolder")} title={libDir ?? undefined}>
           <span className="flex items-center gap-3 text-xs">
             <span className="max-w-[11rem] truncate text-neutral-500 dark:text-neutral-400">
-              {dirName ?? "не выбрана"}
+              {dirName ?? t("set.noFolder")}
             </span>
             <button className={QUIET_BTN} onClick={() => void pickLibDir()}>
-              Сменить
+              {t("set.change")}
             </button>
           </span>
         </Row>
 
-        <SectionLabel>Модели</SectionLabel>
+        <SectionLabel>{t("set.models")}</SectionLabel>
         <ModelRow
           model="main"
-          label="Перевод"
-          desc="HY-MT1.5 · EN→RU"
-          confirmNote="Файл модели будет удалён с диска — перевод перестанет работать до повторного скачивания"
+          label={t("set.modelTr")}
+          desc={t("set.modelTrDesc")}
+          confirmNote={t("set.modelTrConfirm")}
         />
-        <ModelRow model="aux" label="Термины" desc="Qwen3.5 · глоссарий" confirmNote="Файл модели будет удалён с диска" />
+        <ModelRow
+          model="aux"
+          label={t("set.modelTerms")}
+          desc={t("set.modelTermsDesc")}
+          confirmNote={t("set.modelTermsConfirm")}
+        />
+        <DependencyRow
+          label={t("set.engine")}
+          name={LLAMA.name}
+          status={deps.engine}
+          ready={t("set.engineReady")}
+          missing={t("set.engineMissing")}
+          docs={LLAMA.docs}
+          onRecheck={deps.refresh}
+        />
+        <DependencyRow
+          label={t("set.claude")}
+          name={CLAUDE.name}
+          status={deps.claude}
+          ready={`${CLAUDE.name}: ${t("set.claudeReady")}`}
+          missing={`${CLAUDE.name}: ${t("set.claudeMissing")}`}
+          docs={CLAUDE.docs}
+          onRecheck={deps.refresh}
+        />
+        {onRerunSetup && (
+          <Row label={t("set.setup")}>
+            <button className={`text-xs ${QUIET_BTN}`} onClick={onRerunSetup}>
+              {t("ob.rerun")}
+            </button>
+          </Row>
+        )}
 
-        <SectionLabel>Хранилище</SectionLabel>
+        <SectionLabel>{t("set.storage")}</SectionLabel>
         <div className="py-1.5">
           <div className="flex items-center gap-3">
-            <span className="shrink-0">Переводы книг</span>
+            <span className="shrink-0">{t("set.translations")}</span>
             <span className="flex-1" />
             <span className="flex items-center gap-3 text-xs">
               <span className="tabular-nums text-neutral-500 dark:text-neutral-400">
                 {trStat === null
                   ? "…"
                   : trStat.files === 0
-                    ? "нет"
-                    : `${trStat.files} ${ruPlural(trStat.files, "книга", "книги", "книг")} · ${fmtSize(trStat.bytes)}`}
+                    ? t("ui.none")
+                    : `${t("set.books", { n: trStat.files })} · ${fmtSize(trStat.bytes)}`}
               </span>
               {trStat !== null && trStat.files > 0 && (
                 <button className={QUIET_BTN} onClick={toggleBooks}>
-                  {showBooks ? "Свернуть" : "По книгам"}
+                  {showBooks ? t("set.collapse") : t("set.byBook")}
                 </button>
               )}
               {trStat !== null && trStat.files > 0 && !confirmClear && (
                 <button
                   className={`${QUIET_RED_BTN} disabled:pointer-events-none disabled:text-neutral-300 dark:disabled:text-neutral-600`}
                   disabled={runsActive}
-                  title={runsActive ? "Идёт перевод книги — сначала приостановите его" : undefined}
+                  title={runsActive ? t("set.busyTr") : undefined}
                   onClick={() => setConfirmClear(true)}
                 >
-                  Очистить
+                  {t("set.clear")}
                 </button>
               )}
             </span>
           </div>
           {confirmClear && (
             <div className="mt-1 text-xs">
-              <div className="text-neutral-600 dark:text-neutral-300">Все сохранённые переводы будут удалены</div>
+              <div className="text-neutral-600 dark:text-neutral-300">{t("set.clearAllWarn")}</div>
               <div className="mt-1 flex items-center gap-3">
                 <button className={RED_BTN} onClick={() => void clearTranslations()}>
-                  Удалить переводы
+                  {t("set.clearAll")}
                 </button>
                 <button className={PLAIN_BTN} onClick={() => setConfirmClear(false)}>
-                  Отмена
+                  {t("ui.cancel")}
                 </button>
               </div>
             </div>
@@ -480,22 +580,22 @@ export function SettingsModal({
                         <button
                           className={`${QUIET_RED_BTN} disabled:pointer-events-none disabled:text-neutral-300 dark:disabled:text-neutral-600`}
                           disabled={running}
-                          title={running ? "Идёт перевод книги — сначала приостановите его" : undefined}
+                          title={running ? t("set.busyTr") : undefined}
                           onClick={() => setConfirmRow(r.file)}
                         >
-                          Удалить
+                          {t("ui.delete")}
                         </button>
                       )}
                     </div>
                     {confirmRow === r.file && (
                       <div className="mt-1">
-                        <div className="text-neutral-600 dark:text-neutral-300">Перевод книги будет удалён</div>
+                        <div className="text-neutral-600 dark:text-neutral-300">{t("set.clearOneWarn")}</div>
                         <div className="mt-1 flex items-center gap-3">
                           <button className={RED_BTN} onClick={() => void deleteRow(r)}>
-                            Удалить перевод
+                            {t("set.clearOne")}
                           </button>
                           <button className={PLAIN_BTN} onClick={() => setConfirmRow(null)}>
-                            Отмена
+                            {t("ui.cancel")}
                           </button>
                         </div>
                       </div>
@@ -506,23 +606,20 @@ export function SettingsModal({
             ))}
         </div>
         {onExportTxt && (
-          <Row
-            label="Перевод открытой книги"
-            title="Сохранить перевод простым текстом — без картинок и вёрстки; папку и имя спросит диалог"
-          >
+          <Row label={t("set.exportTxtRow")} title={t("set.exportTxtTitle")}>
             <button className={`text-xs ${QUIET_BTN}`} onClick={onExportTxt}>
-              Экспорт в TXT…
+              {t("set.exportTxt")}
             </button>
           </Row>
         )}
-        <Row label="Обложки библиотеки" title="Создаются заново при открытии библиотеки">
+        <Row label={t("set.covers")} title={t("set.coversTitle")}>
           <span className="flex items-center gap-3 text-xs">
             <span className="tabular-nums text-neutral-500 dark:text-neutral-400">
-              {coverStat === null ? "…" : coverStat.files === 0 ? "нет" : fmtSize(coverStat.bytes)}
+              {coverStat === null ? "…" : coverStat.files === 0 ? t("ui.none") : fmtSize(coverStat.bytes)}
             </span>
             {coverStat !== null && coverStat.files > 0 && (
               <button className={QUIET_BTN} onClick={() => void clearCovers()}>
-                Очистить
+                {t("set.clear")}
               </button>
             )}
           </span>
