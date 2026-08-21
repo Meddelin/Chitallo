@@ -30,6 +30,10 @@ const PAD = 8;
 const ROW =
   "w-full text-left px-2.5 py-1.5 rounded-lg flex items-center gap-6 transition-colors whitespace-nowrap";
 
+// The one fill direction B uses for «this row is chosen» — the same on the
+// palette rows and the panel's tabs, so a highlight never means two things.
+const ROW_SEL = "bg-neutral-100 dark:bg-neutral-100/8";
+
 // One-shot placement: the cursor is the menu's top-left, mirrored to the other
 // side of the cursor when that would overflow — the Windows convention — and
 // finally clamped so a menu taller than the gap still fits on screen.
@@ -138,7 +142,7 @@ export function ContextMenu({
       data-ctxmenu
       role="menu"
       style={{ left: at.x, top: at.y }}
-      className="overlay-pop fixed z-[45] min-w-[11rem] rounded-xl bg-white/95 dark:bg-neutral-800/95 backdrop-blur shadow-xl p-1.5 text-sm text-neutral-800 dark:text-neutral-100 select-none"
+      className="overlay-pop fixed z-[45] flex min-w-[11rem] flex-col gap-0.5 rounded-xl bg-white/95 dark:bg-neutral-800/95 backdrop-blur shadow-xl p-1.5 text-sm text-neutral-800 dark:text-neutral-100 select-none"
       // never steal focus: the document selection must survive until the
       // chosen row has run (same guard as SelectionBar)
       onMouseDown={(e) => e.preventDefault()}
@@ -154,7 +158,7 @@ export function ContextMenu({
             role="menuitem"
             data-idx={i}
             data-sel={i === cur || undefined}
-            className={`${ROW} ${i === cur ? "bg-neutral-100 dark:bg-neutral-700/70" : ""}`}
+            className={`${ROW} ${i === cur ? ROW_SEL : ""}`}
             // move only — a scroll under a still cursor must not steal the row
             onMouseMove={() => setCur(i)}
             onClick={() => run(it)}

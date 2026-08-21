@@ -361,9 +361,13 @@ export default function FindBar({
         spellCheck={false}
         className="w-52 bg-transparent outline-none px-1 placeholder:text-neutral-400 dark:placeholder:text-neutral-500"
       />
+      {/* (WP-N) one counter, one shape: «3 из 41», and «0 из 0» when nothing
+          matched — the numbers never leave the bar to make room for a sentence */}
       {hasQuery && (
         <span className="tabular-nums whitespace-nowrap px-1 text-neutral-500 dark:text-neutral-400 flex items-center gap-1.5">
-          {matches.length ? `${(idx < 0 ? 0 : idx) + 1}/${matches.length}` : busy ? null : t("find.nothing")}
+          {matches.length || !busy
+            ? t("find.count", { done: matches.length ? (idx < 0 ? 0 : idx) + 1 : 0, n: matches.length })
+            : null}
           {busy && <Spinner />}
         </span>
       )}

@@ -11,6 +11,62 @@
 
 @custom-variant dark (&:where(.dark, .dark *));
 
+/* ---- Гарнитуры (WP-N) -------------------------------------------------------
+   Две переменные гарнитуры, обе SIL OFL 1.1, обе лежат рядом с приложением:
+   сеть им не нужна — как и всему остальному, кроме «Спросить».
+
+   Golos Text (Paratype) — весь интерфейс. Рисована под русский интерфейс:
+   крупный очковый размер, спокойна на 11–13 px, где живёт панель.
+   Literata (TypeTogether) — переведённая страница и названия на обложках.
+   Рисована для долгого чтения с экрана; ось оптического размера opsz
+   7–72 отзывается на кегль сама (font-optical-sizing: auto по умолчанию),
+   а кегль перевода — это настройка 13…19 px, так что буквы прочнеют на
+   мелком и утончаются на крупном без единой строки кода.
+
+   Раньше здесь стоял Inter «если установлен, иначе Segoe UI Variable»:
+   читалка выглядела по-разному на каждой машине, а на macOS — никак из
+   задуманного. Для приложения про набор книжного текста 196 КБ ассетов
+   дешевле этой лотереи.
+
+   Подмножества только cyrillic и latin: греческий и вьетнамский книге не
+   нужны, а весит каждый как треть кириллицы. Диапазоны — родные гугловские,
+   поэтому браузер грузит вторую пару файлов только если на странице
+   встретится латиница. */
+@font-face {
+  font-family: "Golos Text";
+  font-style: normal;
+  font-weight: 400 700;
+  font-display: swap;
+  src: url("./fonts/golos-cyrillic.woff2") format("woff2");
+  unicode-range: U+0301, U+0400-045F, U+0490-0491, U+04B0-04B1, U+2116;
+}
+@font-face {
+  font-family: "Golos Text";
+  font-style: normal;
+  font-weight: 400 700;
+  font-display: swap;
+  src: url("./fonts/golos-latin.woff2") format("woff2");
+  unicode-range: U+0000-00FF, U+0131, U+0152-0153, U+02BB-02BC, U+02C6, U+02DA, U+02DC, U+0304,
+    U+0308, U+0329, U+2000-206F, U+20AC, U+2122, U+2191, U+2193, U+2212, U+2215, U+FEFF, U+FFFD;
+}
+@font-face {
+  font-family: "Literata";
+  font-style: normal;
+  font-weight: 400 700;
+  font-display: swap;
+  src: url("./fonts/literata-cyrillic.woff2") format("woff2");
+  unicode-range: U+0301, U+0400-045F, U+0490-0491, U+04B0-04B1, U+2116;
+}
+@font-face {
+  font-family: "Literata";
+  font-style: normal;
+  font-weight: 400 700;
+  font-display: swap;
+  src: url("./fonts/literata-latin.woff2") format("woff2");
+  unicode-range: U+0000-00FF, U+0131, U+0152-0153, U+02BB-02BC, U+02C6, U+02DA, U+02DC, U+0304,
+    U+0308, U+0329, U+2000-206F, U+20AC, U+2122, U+2191, U+2193, U+2212, U+2215, U+FEFF, U+FFFD;
+}
+
 /* ---- Design tokens (WP-K) ---------------------------------------------------
    The whole visual system in ~20 lines. The neutral ramp is OVERRIDDEN with
    warm values (Tailwind's stone): a paper-warm light half, an ink-warm dark
@@ -18,10 +74,11 @@
    shifts with it, no redesign. ONE accent — the icon's blue — for selection,
    progress, active states and the focus ring (use `accent` classes, never a
    raw blue-*). Amber stays semantic (find highlight, «модель недоступна»),
-   it is not an accent. UI font: Inter when installed, else the native
-   Segoe UI Variable; numbers opt into tabular-nums per element. */
+   it is not an accent. Гарнитуры — Golos Text в интерфейсе и Literata на
+   переведённой странице, обе лежат рядом с приложением (блок @font-face выше);
+   numbers opt into tabular-nums per element. */
 @theme {
-  --font-sans: "Inter", "Segoe UI Variable Text", "Segoe UI", system-ui, sans-serif;
+  --font-sans: "Golos Text", "Segoe UI Variable Text", "Segoe UI", system-ui, sans-serif;
   --color-accent: #3b82f6; /* the blue of the app icon */
   --color-neutral-50: #fafaf9;
   --color-neutral-100: #f5f5f4;
@@ -360,7 +417,9 @@
   padding: 6% 8.5%; /* of page width; 8.5% mirrors PAGE_PAD_X in App.tsx */
   background: #fff;
   color: #1c1c1c;
-  font-family: Georgia, "Iowan Old Style", "Times New Roman", serif;
+  font-family: "Literata", Georgia, "Iowan Old Style", "Times New Roman", serif;
+  /* opsz 7–72 отзывается на кегль сам: 13 px становятся прочнее, 19 px тоньше */
+  font-optical-sizing: auto;
   font-size: calc(var(--scale-factor, 1) * var(--tr-font-size, 15.5px));
   line-height: 1.5;
   text-align: justify;
@@ -444,7 +503,7 @@
 @theme inline {
   /* Deliberate deviations from the stock shadcn block:
      — no --font-sans override (the app font from @theme above must win;
-       Geist never ships);
+       Geist never ships, Golos Text does);
      — no --color-accent/--color-accent-foreground (the app's `accent` IS the
        blue #3b82f6 above; components use explicit neutral hover tints);
      — no --radius-* scale override (rounded-* everywhere in the app must keep

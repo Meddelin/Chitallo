@@ -41,6 +41,10 @@ function notices(): Notice[] {
     { name: "Claude Code", license: "Anthropic Commercial Terms", url: "https://code.claude.com/docs/en/setup" },
     { name: "React", license: "MIT", url: "https://github.com/facebook/react" },
     { name: "Tailwind CSS", license: "MIT", url: "https://github.com/tailwindlabs/tailwindcss" },
+    { name: "KaTeX", license: "MIT", url: "https://github.com/KaTeX/KaTeX" },
+    // (WP-N) both faces ship inside the app now (src/fonts), so both belong here
+    { name: "Golos Text", license: "SIL OFL 1.1", url: "https://github.com/ParaType/Golos-Text" },
+    { name: "Literata", license: "SIL OFL 1.1", url: "https://github.com/googlefonts/literata" },
     {
       name: t("about.modelHy"),
       license: "Hunyuan Community License",
@@ -82,14 +86,16 @@ export function AboutModal({ onClose }: { onClose: () => void }) {
         <div className="flex items-center gap-3">
           <AppGlyph size={40} />
           <div className="min-w-0">
-            <div className="text-base font-medium leading-tight">
+            <div className="text-lg font-medium leading-tight">
               Chitallo <span className="ml-1 text-xs font-normal tabular-nums text-neutral-500 dark:text-neutral-400">{pkg.version}</span>
             </div>
-            <div className="text-xs text-neutral-500 dark:text-neutral-400">{t("app.tagline")}</div>
+            <div className="mt-1 text-xs text-neutral-500 dark:text-neutral-400">{t("app.tagline")}</div>
           </div>
         </div>
 
-        <p className="mt-3 leading-relaxed">{t("app.privacy")}.</p>
+        {/* (WP-N) one line of privacy, one line of its exception — no full stops:
+            a state line ends where it ends */}
+        <p className="mt-3.5 text-[13px] leading-relaxed">{t("app.privacy")}</p>
         <p className="mt-1 text-xs leading-relaxed text-neutral-500 dark:text-neutral-400">
           {t("app.privacyAsk")}
         </p>
@@ -101,7 +107,7 @@ export function AboutModal({ onClose }: { onClose: () => void }) {
               <div key={n.name} className="py-1">
                 <div className="flex items-baseline gap-3">
                   <button
-                    className="min-w-0 truncate text-left rounded px-1 -mx-1 transition-colors hover:bg-neutral-100 dark:hover:bg-neutral-700/60"
+                    className="min-w-0 truncate rounded-md px-1 -mx-1 text-left text-[13px] transition-colors hover:bg-neutral-900/5 dark:hover:bg-neutral-100/10"
                     onClick={() => void link(n.url)}
                     title={n.url}
                   >

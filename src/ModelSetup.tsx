@@ -238,13 +238,44 @@ export function dlProgressLine(dl: Dl): string {
   return parts.join(" · ");
 }
 
-export function dlErrorLine(err?: string | null): string {
+/// A failed download, split the way direction B writes a refusal: the cause,
+/// and the one verb that gets out of it. `act` says what that verb does —
+/// «Освободить место» opens the folder the weights land in, the other two
+/// start the download over. (WP-N)
+export type DlFix = { cause: string; verb: string; act: "space" | "again" | "resume" };
+
+export function dlErrorFix(err?: string | null): DlFix {
   if (err && err.startsWith("no_space:")) {
     const missing = Number(err.slice("no_space:".length));
-    return t("model.noSpace", { size: fmtGb(Math.max(missing || 0, 1e8)) });
+    return {
+      cause: t("model.noSpace", { size: fmtGb(Math.max(missing || 0, 1e8)) }),
+      verb: t("model.freeSpace"),
+      act: "space",
+    };
   }
-  if (err === "checksum") return t("model.checksum");
-  return t("model.interrupted");
+  if (err === "checksum") return { cause: t("model.checksum"), verb: t("model.redownload"), act: "again" };
+  return { cause: t("model.interrupted"), verb: t("set.resume"), act: "resume" };
+}
+
+/// The same refusal as one line, for surfaces that have no button of their own
+/// to hang the verb on (the onboarding checklist).
+export function dlErrorLine(err?: string | null): string {
+  const f = dlErrorFix(err);
+  return `${f.cause} · ${f.verb}`;
+}
+
+/// «Освободить место» — show the reader where the weights go, so the space is
+/// freed in the right place. Reveal, not open: the folder may not exist yet.
+export function revealModelsDir(): void {
+  void (async () => {
+    try {
+      const { appDataDir } = await import("@tauri-apps/api/path");
+      const { revealItemInDir } = await import("@tauri-apps/plugin-opener");
+      await revealItemInDir(joinPath(await appDataDir(), "models"));
+    } catch {
+      // plain browser, or the folder is not there yet — nothing to show
+    }
+  })();
 }
 
 // ---- shared primitives ------------------------------------------------------
@@ -254,6 +285,9 @@ export function Spinner() {
     <span className="inline-block h-3 w-3 shrink-0 animate-spin rounded-full border-[1.5px] border-current border-t-transparent opacity-70" />
   );
 }
+
+// quiet inline verbs: muted base, the colour firms up on hover
+const QUIET_LINK = "transition-colors hover:text-neutral-700 dark:hover:text-neutral-200";
 
 export function Progress({ dl, onCancel }: { dl: Dl; onCancel: () => void }) {
   return (
@@ -265,7 +299,7 @@ export function Progress({ dl, onCancel }: { dl: Dl; onCancel: () => void }) {
         <span className="tabular-nums">{dlProgressLine(dl)}</span>
         <span className="flex-1" />
         {dl.status === "running" && (
-          <button className="transition-colors hover:text-neutral-700 dark:hover:text-neutral-200" onClick={onCancel}>
+          <button className={QUIET_LINK} onClick={onCancel}>
             {t("ui.cancel")}
           </button>
         )}
@@ -278,12 +312,12 @@ export function Progress({ dl, onCancel }: { dl: Dl; onCancel: () => void }) {
 // every «Download» of the HY-MT weights.
 const LICENSE_URL = "https://huggingface.co/tencent/HY-MT1.5-7B-GGUF/blob/main/License.txt";
 
-function LicenseNote() {
+function LicenseNote({ short }: { short?: boolean }) {
   return (
     <p className="text-xs leading-relaxed text-neutral-500 dark:text-neutral-400">
-      {t("model.license")}{" "}
+      {short ? t("model.licenseShort") : t("model.license")}{" "}
       <button
-        className="underline underline-offset-2 transition-colors hover:text-neutral-700 dark:hover:text-neutral-200"
+        className={`underline underline-offset-2 ${QUIET_LINK}`}
         onClick={() => openUrl(LICENSE_URL).catch(() => window.open(LICENSE_URL, "_blank"))}
       >
         {t("model.licenseTerms")}
@@ -294,6 +328,38 @@ function LicenseNote() {
 
 const PRIMARY_BTN =
   "mt-3 w-full rounded-lg bg-neutral-900 px-3 py-2 text-white transition-colors hover:bg-neutral-700 dark:bg-neutral-100 dark:text-neutral-900 dark:hover:bg-white";
+
+// The card's primary sits in a row next to «Читать без перевода», so it is
+// sized to its own words rather than to the card. (WP-N)
+const CARD_BTN =
+  "rounded-lg bg-neutral-900 px-4 py-1.5 text-[13px] text-white transition-colors hover:bg-neutral-700 dark:bg-neutral-100 dark:text-neutral-900 dark:hover:bg-white";
+
+/// The B status row: what is going on, in numbers where there are any, and the
+/// verb out of it on the right. Every state of the model card wears it. `bad`
+/// is the one difference the mockups draw between «пауза» and «ошибка»: the
+/// cause turns red, the verb never does.
+function StatusRow({
+  cause,
+  verb,
+  onVerb,
+  bad,
+}: {
+  cause: string;
+  verb?: string;
+  onVerb?: () => void;
+  bad?: boolean;
+}) {
+  return (
+    <div className="mt-3 flex items-baseline gap-3 text-xs text-neutral-500 dark:text-neutral-400">
+      <span className={`min-w-0 flex-1 tabular-nums ${bad ? "text-red-600 dark:text-red-400" : ""}`}>{cause}</span>
+      {verb && onVerb && (
+        <button className={`shrink-0 ${QUIET_LINK}`} onClick={onVerb}>
+          {verb}
+        </button>
+      )}
+    </div>
+  );
+}
 
 /// llama.cpp's presence, probed only when the status says it is missing —
 /// the probe costs a PATH walk plus a `--version` spawn, so it is never a poll.
@@ -412,6 +478,7 @@ export function ModelSetupModal({ onClose }: { onClose: () => void }) {
   const busy = dlBusy(dl);
   const resumable = (dl.status === "cancelled" || dl.status === "error") && dl.received > 0;
   const engine = useEngineProbe(status === "noengine");
+  const fix = dl.status === "error" ? dlErrorFix(dl.error) : null;
 
   return (
     <div
@@ -460,13 +527,20 @@ export function ModelSetupModal({ onClose }: { onClose: () => void }) {
             <p className="mt-2 text-xs text-neutral-500 dark:text-neutral-400">
               {t("model.line", { size: sizeLabel("main") })}
             </p>
-            {dl.status === "error" && (
-              <p className="mt-2 text-xs text-red-600 dark:text-red-400">{dlErrorLine(dl.error)}</p>
+            {fix && (
+              <StatusRow
+                bad
+                cause={fix.cause}
+                verb={fix.act === "space" ? fix.verb : undefined}
+                onVerb={revealModelsDir}
+              />
             )}
             <button className={PRIMARY_BTN} onClick={() => startDownload("main")}>
-              {resumable
-                ? t("model.resumeCta", { pct: dlPct(dl) })
-                : t("model.downloadCta", { size: sizeLabel("main") })}
+              {fix?.act === "again"
+                ? t("model.redownload")
+                : resumable
+                  ? t("model.resumeCta", { pct: dlPct(dl) })
+                  : t("model.downloadCta", { size: sizeLabel("main") })}
             </button>
             <div className="mt-3">
               <LicenseNote />
@@ -495,9 +569,18 @@ export function ModelSetupCard() {
   if (later && !busy) return null;
   if (statusUp(status) && !busy) return null;
 
+  // (WP-N) the card names the thing and its price in two lines — «Модель
+  // перевода» / «HY-MT1.5 · 4,6 ГБ · перевод офлайн» — and then does exactly
+  // one thing. The size is already on the second line, so the button is the
+  // bare verb.
+  const fix = dl.status === "error" ? dlErrorFix(dl.error) : null;
+
   return (
     <div className="w-[22rem] max-w-[92vw] rounded-xl border border-neutral-300 bg-white/60 p-4 text-left text-sm text-neutral-700 dark:border-neutral-700 dark:bg-neutral-800/60 dark:text-neutral-300">
-      <div className="leading-relaxed">{t("model.pitchShort")}</div>
+      <div className="text-neutral-800 dark:text-neutral-100">{t("model.title")}</div>
+      <div className="mt-1 text-xs tabular-nums text-neutral-500 dark:text-neutral-400">
+        {t("model.line", { size: sizeLabel("main") })}
+      </div>
       {status === "noengine" ? (
         <div className="mt-3">
           <EngineInstall status={engine.status} onRecheck={engine.probe} busy={engine.busy} />
@@ -511,28 +594,29 @@ export function ModelSetupCard() {
           <Spinner /> {t("model.starting")}
         </div>
       ) : status === "dead" ? (
-        <div className="mt-3 flex items-center gap-2 text-xs text-neutral-500 dark:text-neutral-400">
-          <span>{t("model.dead")}</span>
-          <button
-            className="underline underline-offset-2 transition-colors hover:text-neutral-700 dark:hover:text-neutral-200"
-            onClick={() => void restartModel()}
-          >
-            {t("ui.restart")}
-          </button>
-        </div>
+        <StatusRow cause={t("model.dead")} verb={t("ui.restart")} onVerb={() => void restartModel()} />
       ) : (
         <>
-          {dl.status === "error" && (
-            <p className="mt-2 text-xs text-red-600 dark:text-red-400">{dlErrorLine(dl.error)}</p>
+          {/* the cause carries its own verb only when nothing else can do it:
+              freeing disk space happens in the file manager, not here */}
+          {fix && (
+            <StatusRow
+              bad
+              cause={fix.cause}
+              verb={fix.act === "space" ? fix.verb : undefined}
+              onVerb={revealModelsDir}
+            />
           )}
-          <button className={PRIMARY_BTN} onClick={() => startDownload("main")}>
-            {resumable
-              ? t("model.resumeCta", { pct: dlPct(dl) })
-              : t("model.downloadCta", { size: sizeLabel("main") })}
-          </button>
-          <div className="mt-2 text-center">
+          <div className="mt-3 flex items-center gap-3">
+            <button className={CARD_BTN} onClick={() => startDownload("main")}>
+              {fix?.act === "again"
+                ? t("model.redownload")
+                : resumable
+                  ? t("model.resumeCta", { pct: dlPct(dl) })
+                  : t("ui.download")}
+            </button>
             <button
-              className="text-xs text-neutral-600 dark:text-neutral-300 transition-colors hover:text-neutral-800 dark:hover:text-neutral-100"
+              className={`text-xs text-neutral-500 dark:text-neutral-400 ${QUIET_LINK}`}
               onClick={() => {
                 localStorage.setItem("pdfer:modellater", "1");
                 setLater(true);
@@ -542,7 +626,7 @@ export function ModelSetupCard() {
             </button>
           </div>
           <div className="mt-3">
-            <LicenseNote />
+            <LicenseNote short />
           </div>
         </>
       )}
