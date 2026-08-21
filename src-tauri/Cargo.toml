@@ -1,6 +1,6 @@
 [package]
 name = "chitallo"
-version = "0.1.0"
+version = "0.2.0"
 description = "Minimalist PDF reader with local AI translation and Claude Code Q&A"
 authors = ["Stanislav Medvedev"]
 license = "MIT"
