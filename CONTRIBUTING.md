@@ -45,6 +45,16 @@ English. Keys are typed, so a missing one is a compile error. Shortcut names are
 written the Windows/Linux way (`Ctrl+F`, `Alt+click`) and rewritten to ⌘/⌥ on
 macOS inside `t()` — never spell both.
 
+**A model prompt is not a user-visible string.** What is sent to a model lives
+in a module-local table beside the code that sends it — `graphgen.ts` and
+`glossarygen.ts` both keep one, in Russian and English as the catalogue does —
+and not in `i18n.ts`. Two reasons, and the second was a live bug: a prompt that
+drifts because somebody reworded a UI line is a defect nobody sees until the
+answers come back malformed, and `t()` rewrites `Ctrl`/`Alt` to ⌘/⌥ and splits
+on `|` across everything it interpolates, so a term or a sample sentence passed
+through it reaches the model altered. «Ask»'s own prompts are the exception, and
+the comment beside them in `i18n.ts` says why.
+
 **Paths go through `src/host.ts`.** `joinPath()` and `baseName()`, never a
 hand-built `` `${dir}\\${name}` ``. That was a Windows-only assumption and it is
 gone.
@@ -60,6 +70,9 @@ welcome change on its own.
 | --- | --- |
 | `src/App.tsx` | the reading surface, toolbar, keyboard, context menu |
 | `src/booktranslate.ts` | whole-book translation runs, the per-book store |
+| `src/terms.ts`, `src/glossary.ts`, `src/glossarygen.ts` | the terminology layer: the one term miner, the record and its file grammar, the three passes over it |
+| `src/booklang.ts`, `src/textsim.ts` | the book's language, and the one string-similarity coefficient both the outline and the term folding use |
+| `src/graphgen.ts`, `src/graphstore.ts`, `src/graphrun.ts` | the knowledge layer: per-book shards, the library-wide merge, the build queue |
 | `src/paragraphs.ts`, `src/crops.ts` | page structure and the figure/table crops |
 | `src/export.ts` | PDF / HTML / TXT assembly |
 | `src/i18n.ts` | every user-visible string, both languages |

@@ -25,9 +25,13 @@ English — you pick it on first launch and can change it in Settings.
   finished pages are stored and open offline, paragraph layout is rebuilt, and
   figures, tables and formulas are carried over as high-resolution crops of the
   original
-- **Book glossary** — characteristic terms are mined from the text
-  statistically, translated by the model, and applied while translating; you can
-  edit the list by hand
+- **Book terms** — a term list per book, mined from the text statistically and
+  kept in a plain text file you can edit by hand. Mining works on a book in any
+  language and needs no model at all; the term model then fills in a category, a
+  one-line definition, and a translation only when the book is not already in
+  your own language. The list stopped being a step of translation: translation
+  is prompted with it, the knowledge graph takes its concepts already typed and
+  explained, and «Ask» reads them from there
 - **Search** (Ctrl+F) — over the original and over the finished translation
 - **Command palette** (Ctrl+K) — commands, «page N», book switching, search;
   the shortcut overlay is `?`
@@ -57,8 +61,9 @@ also stands in an open article, or in the book already in front of you.
 
 «Read open articles through Claude Code» asks what the terms of an openly
 published article denote. It sends the title, the authors, the keywords and
-subject from the file's metadata, and the terms already mined from the text by
-statistics — not the pages, and not the file. It is off by default, and a
+subject from the file's metadata, and the terms from that file's own term list —
+what statistics mined, plus anything you typed there yourself. Never a
+definition, never the pages, and never the file. It is off by default, and a
 licensed book, or one the classifier could not place, is read here by the local
 model instead.
 
@@ -109,7 +114,7 @@ never touches it — your own tuned instance stays yours.
 | Model | Role | Size | Licence |
 | --- | --- | --- | --- |
 | [HY-MT1.5-7B](https://huggingface.co/tencent/HY-MT1.5-7B-GGUF) (Tencent) | book translation | 4.6 GB | Hunyuan Community License — free, commercial use included; **not available in the EU, the UK or South Korea** |
-| [Qwen3.5-4B](https://huggingface.co/unsloth/Qwen3.5-4B-GGUF) (Alibaba) | glossary term translation (optional) | 2.7 GB | Apache-2.0 |
+| [Qwen3.5-4B](https://huggingface.co/unsloth/Qwen3.5-4B-GGUF) (Alibaba) | the term model — categories, definitions and checking for a book's terms, and translating them when the book is not in your language (optional) | 2.7 GB | Apache-2.0 |
 
 Downloads only ever happen on an explicit action, with the licence in plain
 sight. An interrupted download resumes from where it stopped and survives an app

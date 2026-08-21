@@ -204,10 +204,15 @@ const S = {
   "tb.palette": ["Палитра команд · Ctrl+K", "Command palette · Ctrl+K"],
   "tb.panel": ["Панель · Ctrl+J", "The panel · Ctrl+J"],
 
-  // -- the panel: three tabs, always in this order (WP-N) --
+  // -- the panel: four tabs, always in this order (WP-N) --
+  // The fourth is the terminology store, which used to be a modal hanging off
+  // the translation tab. It is named for what it holds — «Термины» — and not
+  // for the file it keeps them in: «Глоссарий» stays the title INSIDE the tab
+  // (gl.title), the same way the «Перевод» tab is not called «booktranslate».
   "panel.outline": ["Оглавление", "Contents"],
   "panel.ask": ["Спросить", "Ask"],
   "panel.translate": ["Перевод", "Translation"],
+  "panel.glossary": ["Термины", "Terms"],
   "panel.close": ["Закрыть панель · Esc", "Close the panel · Esc"],
   // A tab badge carries a number when it has one; a paused or broken run shows
   // an amber dot instead, and this is what the dot says when pointed at.
@@ -320,11 +325,28 @@ const S = {
   "pop.failed": ["Не удалось перевести", "Translation failed"],
   "pop.altHint": ["Alt+клик — перевести абзац", "Alt+click — translate the paragraph"],
 
-  // -- glossary modal --
+  // -- the terminology store (the «Термины» tab, GlossaryPanel.tsx). The keys
+  //    down to gl.stopTitle came from the glossary modal that used to hang off
+  //    the translation popover; the modal is gone, its wording was not --
   "gl.title": ["Глоссарий", "Glossary"],
+  // The placeholder is the only documentation the file's grammar has, because
+  // the file is hand-editable and nobody reads a README to type two words into
+  // a textarea. The grammar it now teaches is
+  //     term [= translation] [:: category [:: definition]]
+  // so the three example lines are chosen to show, in order: everything at
+  // once; a term that needs no translation but has a definition; and a bare
+  // term, which is a VALID record now (it is what «Добавить в глоссарий»
+  // writes) and used to look like junk. The old placeholder taught
+  // «attention = внимание», a pair and nothing else, which is precisely the
+  // shape this feature stopped being.
+  //
+  // The left-hand side is in the BOOK's language and the right-hand side in
+  // the reader's, so the two locales cannot share an example: a Russian reader
+  // meets English terms in their books, an English reader does not meet
+  // English ones in theirs.
   "gl.placeholder": [
-    "attention = внимание\nпо одной паре на строку",
-    "attention = attention\none pair per line",
+    "inverted index = инвертированный индекс :: структура данных\nполнота :: метрика :: доля найденных релевантных документов\nBM25\nпо одной записи на строку · перевод после «=», категория и определение после «::»",
+    "Weltanschauung = worldview :: concept\nrecall :: metric :: the share of relevant documents found\nBM25\none entry per line · the translation after «=», the category and the definition after «::»",
   ],
   "gl.replaceWarn": [
     "Заменить список · ручные правки пропадут",
@@ -354,10 +376,10 @@ const S = {
   "gl.mining": ["Ищу термины · {done} из {total}", "Finding terms · {done} of {total}"],
   "gl.loading": ["Загружаю модель · до 30 с", "Loading the model · up to 30 s"],
   "gl.translating": ["Перевожу термины · {done} из {total}", "Translating terms · {done} of {total}"],
-  "gl.stopTitle": [
-    "Остановить · уже переведённые термины останутся",
-    "Stop · the terms already translated stay",
-  ],
+  // Was «уже переведённые термины останутся» when translating was the only
+  // thing a run did. Three passes can be stopped now and all three keep their
+  // partial work, so the promise is stated once, for whichever is running.
+  "gl.stopTitle": ["Остановить · сделанное останется", "Stop · what is already done stays"],
   "gl.stop": ["Остановить", "Stop"],
   "gl.noTerms": ["Терминов не нашлось", "No terms found"],
   "gl.failed": ["Глоссарий не собрался · Повторить", "The glossary did not build · Try again"],
@@ -372,6 +394,132 @@ const S = {
     "Terms are sharper with the term model · {size} · Apache-2.0",
   ],
   "gl.auxResume": ["Продолжить · {pct}%", "Resume · {pct}%"],
+
+  // ---- the tab's own vocabulary ----------------------------------------------
+  //
+  // Everything below arrived with the tab. The glossary stopped being a step of
+  // translation and became a store with three passes over it, and the reader is
+  // now shown three things the modal never had a word for: which language the
+  // book is in, which pass is running, and what the model actually did.
+
+  // How many terms are in the file. Used twice — the tab's tooltip and the
+  // header — because a tab badge is a number and a number needs its noun
+  // somewhere (WP-N).
+  "gl.terms": ["{n} термин|{n} термина|{n} терминов", "{n} term|{n} terms"],
+  "gl.empty": ["Терминов пока нет", "No terms yet"],
+  "gl.emptyHint": ["Найдите их по книге или впишите свои", "Find them in the book, or type your own"],
+
+  // The book's own language, which is a FIELD of the record and not the
+  // interface language: it decides which words the miner may treat as terms,
+  // and whether a translation column applies at all. Detection can honestly
+  // refuse (booklang's «und»), so «не определён» is a value the row can show
+  // and the picker can offer, not an error — and the reader can always correct
+  // it, which is the only reason a detector is allowed to guess in the first
+  // place.
+  "gl.bookLang": ["Язык книги", "Book language"],
+  "gl.bookLangTitle": [
+    "Язык оригинала · от него зависит, какие слова считаются терминами",
+    "The language of the original · it decides which words count as terms",
+  ],
+  "gl.langUnknown": ["не определён", "undetermined"],
+  // Appended to the language name when detection was close to a coin toss. The
+  // reader is not told a margin — they are told to look at it.
+  "gl.langWeak": [" · уверенности мало", " · a weak guess"],
+  "gl.langChange": ["Изменить", "Change"],
+  "gl.langPick": ["Выбрать язык книги", "Choose the book's language"],
+  // The two honest reasons the translation column stays empty. Neither is a
+  // failure and neither may be silent: a reader who asked for translations and
+  // got none is owed the sentence saying why.
+  "gl.sameLang": [
+    "Книга уже на вашем языке · переводы терминов не нужны",
+    "The book is already in your language · term translations are not needed",
+  ],
+  "gl.noTrTarget": [
+    "Термины переводятся только на язык интерфейса",
+    "Terms are translated into the interface language only",
+  ],
+
+  // -- pass 1: mining. Model-free, always available, and the answer to «no
+  //    model»: the terms and their pages land on disk either way.
+  "gl.mine": ["Найти термины", "Find the terms"],
+  "gl.mineTitle": [
+    "Прочитать книгу целиком и выписать её термины · модель не нужна",
+    "Read the whole book and write out its terms · no model needed",
+  ],
+  "gl.mineNote": ["Читает книгу целиком · без модели", "Reads the whole book · no model needed"],
+  // gl.mining above is this pass's progress and counts PAGES READ, which is
+  // what it counted in the modal too — the bar is the book, not the term list.
+  "gl.mined": [
+    "Найден {n} термин|Найдено {n} термина|Найдено {n} терминов",
+    "{n} term found|{n} terms found",
+  ],
+  // Appended after gl.added, the way gl.skipped is: a merge that filled empty
+  // fields on lines that were already there did work the added-count cannot see.
+  "gl.updated": [" · дополнено {n}", " · {n} filled in"],
+
+  // -- pass 2: enrichment. The aux model fills kind, category and definition,
+  //    twelve terms a call, and translates only when a translation applies.
+  "gl.enrich": ["Определить термины", "Define the terms"],
+  "gl.enrichTitle": [
+    "Модель терминов заполнит категорию и определение, а если книга не на вашем языке — и перевод",
+    "The term model fills in the category and the definition — and the translation, unless the book is already in your language",
+  ],
+  "gl.enriching": ["Определяю термины · {done} из {total}", "Defining terms · {done} of {total}"],
+  "gl.enriched": [
+    "Определён {n} термин|Определено {n} термина|Определено {n} терминов",
+    "{n} term defined|{n} terms defined",
+  ],
+  "gl.enrichSkipped": [" · без определения {n}", " · {n} left blank"],
+  "gl.translated": [" · переведено {n}", " · {n} translated"],
+  // Not installed is a STATE, not a refusal: pass 1 has already written the
+  // file, so the line says what is on disk and what is merely late. Same shape
+  // as gr.noModel / gr.noModelHint — a state with a quiet line under it (WP-N).
+  "gl.noAux": ["Модель терминов не установлена", "No term model installed"],
+  "gl.noAuxHint": [
+    "Термины и страницы уже сохранены · определения появятся, когда будет модель",
+    "The terms and their pages are already saved · the definitions follow once the model is there",
+  ],
+
+  // -- pass 3: validation. Definitions checked against their terms, and the
+  //    spellings of one concept folded together.
+  "gl.validate": ["Проверить термины", "Check the terms"],
+  "gl.validateTitle": [
+    "Модель сверит определения с терминами и сведёт разные написания одного понятия",
+    "The model checks each definition against its term and folds the spellings of one concept together",
+  ],
+  // Counted in MODEL CALLS — one per duplicate cluster plus one per batch of
+  // definitions — so this line must not name a unit it does not count.
+  "gl.validating": ["Проверяю термины · {done} из {total}", "Checking terms · {done} of {total}"],
+  // The report, assembled the way gl.added + gl.skipped are: one counted noun
+  // per key, appended left to right, so each number keeps its own grammar.
+  "gl.checked": [
+    "Проверено {n} определение|Проверено {n} определения|Проверено {n} определений",
+    "{n} definition checked|{n} definitions checked",
+  ],
+  "gl.cleared": [" · снято неверных {n}", " · {n} wrong ones cleared"],
+  "gl.folded": [" · сведено дублей {n}", " · {n} duplicate folded| · {n} duplicates folded"],
+  "gl.noDupes": ["Дублей не нашлось", "No duplicates found"],
+  // Folded spellings live in the sidecar, never as a line of the .txt, so this
+  // is the only place a reader ever sees them.
+  "gl.aliases": ["синонимы · {list}", "aliases · {list}"],
+  // The other outcome of a confirmed duplicate: the model said two lines say
+  // the same thing, and both are the reader's own, so neither was touched. It
+  // has to be said in those words — otherwise «found and left alone» looks on
+  // screen exactly like «found nothing», which is what the pass used to do.
+  "gl.dupKept": [
+    "Совпадающие написания найдены, но не сведены — эти строки ваши: {list}",
+    "Duplicate spellings found but not folded — those lines are yours: {list}",
+  ],
+
+  // -- how a run ends when it does not end with numbers. A model fault is not
+  //    an exception here (the passes never throw for one), so both of these are
+  //    ordinary outcomes with the work still on disk behind them.
+  "gl.stopped": ["Остановлено · сделанное сохранено", "Stopped · what was done is saved"],
+  "gl.modelSilent": [
+    "Модель не ответила · термины остались как были",
+    "The model did not answer · the terms are unchanged",
+  ],
+  "gl.saveFailed": ["Список не сохранился · Повторить", "The list did not save · Try again"],
 
   // -- find bar --
   "find.placeholder": ["Найти в книге", "Find in this book"],
@@ -840,15 +988,21 @@ const S = {
   "diagram.drawing": ["Строю схему", "Drawing the diagram"],
   "diagram.broken": ["Схема не прочиталась · Показать текстом", "The diagram did not parse · Show as text"],
 
-  // -- glossary terminologist (prompts the aux model sees) --
-  "term.system": [
-    "Ты — терминолог. Тебе дают термин из книги, тематику книги и предложение-контекст. Ответь ТОЛЬКО устоявшимся русским эквивалентом этого термина — без пояснений, без кавычек, без точки в конце. Если термин по общепринятой конвенции не переводится (аббревиатура, имя собственное, название продукта или компании) — верни его без изменений.",
-    "You are a terminologist. You are given a term from a book, the book's subject area, and a sentence of context. Answer with ONLY the established English equivalent of that term — no explanation, no quotes, no full stop. If convention leaves the term untranslated (an acronym, a proper name, a product or company name), return it unchanged.",
-  ],
-  "term.domain": ["Тематика книги (ключевые термины): {domain}", "Subject area (key terms): {domain}"],
-  "term.context": ["Контекст: {sample}", "Context: {sample}"],
-  "term.term": ["Термин: {term}", "Term: {term}"],
-
+  // The glossary terminologist's prompts used to live here — term.system,
+  // term.domain, term.context, term.term — and they are gone from this
+  // catalogue for two reasons, both of which apply to every model prompt except
+  // «Спросить»'s (ask.system / ask.viz / ask.graph, which stay because they are
+  // the only strings the reader can be said to be *addressing*):
+  //
+  //   * A prompt is not a user-visible string. graphgen has always kept its own
+  //     in a module-local table (graphgen.ts:186); the glossary now does the
+  //     same, in glossarygen.ts's TR_PROMPTS, in both languages as ever.
+  //   * t() runs macKeys() over the interpolated values (see the end of this
+  //     file). A term or a context sentence containing "Ctrl+" or "Alt" was
+  //     therefore rewritten to ⌘/⌥ on macOS INSIDE the model's input. Nothing
+  //     downstream could notice, and no amount of care at the call site would
+  //     have helped — the mutation is a property of the lookup.
+  //
   // -- export document (the generated HTML/PDF) --
   "exp.machineTr": ["Машинный перевод · Chitallo{partial}", "Machine translation · Chitallo{partial}"],
   "exp.partial": [" · {done} из {total} страниц", " · {done} of {total} pages"],

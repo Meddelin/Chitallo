@@ -5,7 +5,7 @@
 // (pdfer:books). App owns the actions and passes them down as commands; this
 // file owns matching, keyboard selection and the two surfaces' rendering —
 // both in the app's existing grammar (blurred /95 pill surface for the
-// palette, solid modal like GlossaryModal for the overlay).
+// palette, solid modal like «О Chitallo» for the overlay).
 
 import { useEffect, useMemo, useRef, useState } from "react";
 import { IconClose } from "./icons";
@@ -41,6 +41,10 @@ const GROUP: Record<string, Group> = {
   settings: "book",
   keys: "book",
   about: "book",
+  // (WP-N) Термины переехали с полки «Перевод» на полку «Книга»: глоссарий
+  // перестал быть шагом перевода и стал хранилищем книги, которым перевод
+  // лишь пользуется — наравне с графом, «Спросить» и экспортом.
+  gloss: "book",
   view: "view",
   zin: "view",
   zout: "view",
@@ -53,7 +57,6 @@ const GROUP: Record<string, Group> = {
   trstart: "tr",
   trpause: "tr",
   selorig: "tr",
-  gloss: "tr",
   exportpdf: "tr",
   export: "tr",
   ask: "tr",
