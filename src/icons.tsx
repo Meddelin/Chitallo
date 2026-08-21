@@ -40,15 +40,6 @@ export function IconSun(p: IconProps) {
   );
 }
 
-/* каре меню: 12 px оптический размер (WP-K: вместо 9-px «▾») */
-export function IconChevronDown({ size = 12, className }: IconProps) {
-  return (
-    <Svg size={size} className={className}>
-      <path d="m3.5 6 4.5 4.5L12.5 6" />
-    </Svg>
-  );
-}
-
 export function IconClose(p: IconProps) {
   return (
     <Svg {...p}>

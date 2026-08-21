@@ -7,7 +7,7 @@ import {
   Spinner,
   cancelDownload,
   dlBusy,
-  dlErrorLine,
+  dlErrorFix,
   dlPct,
   dlProgressLine,
   fetchModelStatus,
@@ -20,13 +20,16 @@ import {
 } from "./ModelSetup";
 import { copyToClipboard } from "./clipboard";
 import { baseName } from "./host";
-import { t } from "./i18n";
+import { fmtNum, t } from "./i18n";
 import { IconClose } from "./icons";
 
 export type Anchor = { x: number; y: number };
 
-// pill controls: the app-wide hover grammar (WP-K) — quiet bg tint, no opacity dim
-const PILL_BTN = "rounded-md transition-colors hover:bg-neutral-900/5 dark:hover:bg-neutral-100/10";
+// pill controls: the app-wide hover grammar (WP-K) — quiet bg tint, no opacity
+// dim. Round like the bar around them, so the three verbs read as one control
+// strip and not as words with a background. (WP-N)
+const PILL_BTN =
+  "rounded-full px-2.5 py-0.5 transition-colors hover:bg-neutral-900/5 dark:hover:bg-neutral-100/10";
 // inline text links: muted base, hover strengthens the color (same grammar as QUIET_LINK)
 const LINK_HOVER = "transition-colors hover:text-neutral-800 dark:hover:text-neutral-100";
 
@@ -202,29 +205,44 @@ export function SelectionBar({
       ref={ref}
       data-selbar
       style={{ left: anchor.x, top: anchor.y }}
-      className="overlay-pop fixed z-20 flex items-center gap-1 rounded-full bg-white/90 dark:bg-neutral-800/90 backdrop-blur px-2 py-1 shadow-lg text-sm text-neutral-700 dark:text-neutral-200 select-none"
+      className="overlay-pop fixed z-20 flex items-center gap-0.5 rounded-full bg-white/90 dark:bg-neutral-800/90 backdrop-blur px-2 py-1 shadow-lg text-sm text-neutral-700 dark:text-neutral-200 select-none"
       // preserve the text selection: never let the bar steal focus/collapse it
       onMouseDown={(e) => e.preventDefault()}
       onPointerDown={(e) => e.stopPropagation()}
     >
       {onOriginal ? (
-        <button className={`${PILL_BTN} px-1.5`} onClick={onOriginal} title={t("sel.originalTitle")}>
-          {t("tb.original")} <span className="text-xs text-neutral-500 dark:text-neutral-400">O</span>
+        <button className={PILL_BTN} onClick={onOriginal} title={t("sel.originalTitle")}>
+          {t("sel.original")}
         </button>
       ) : onTranslate ? (
-        <button className={`${PILL_BTN} px-1.5`} onClick={onTranslate} title={t("sel.translateTitle")}>
-          {t("sel.translate")} <span className="text-xs text-neutral-500 dark:text-neutral-400">⏎</span>
+        <button className={PILL_BTN} onClick={onTranslate} title={t("sel.translateTitle")}>
+          {t("sel.translate")}
         </button>
       ) : null}
-      <span className="text-neutral-300 dark:text-neutral-600">·</span>
-      <button className={`${PILL_BTN} px-1.5`} onClick={onAsk} title={t("sel.askTitle")}>
-        {t("tb.ask")}
+      <button className={PILL_BTN} onClick={onAsk} title={t("sel.askTitle")}>
+        {t("sel.ask")}
       </button>
     </div>
   );
 }
 
 // ---- translate popover ------------------------------------------------------
+
+// Every refusal the popover can show has the same shape (WP-N): what happened
+// on the left, the one verb out of it on the right — and the verb is a button,
+// never a word inside the sentence.
+function Refusal({ cause, verb, onVerb }: { cause: string; verb?: string; onVerb?: () => void }) {
+  return (
+    <div className="flex items-baseline gap-3 text-neutral-600 dark:text-neutral-300">
+      <span className="min-w-0 flex-1">{cause}</span>
+      {verb && onVerb && (
+        <button className={`shrink-0 ${LINK_HOVER}`} onClick={onVerb}>
+          {verb}
+        </button>
+      )}
+    </div>
+  );
+}
 
 export function TranslatePopover({
   anchor,
@@ -257,6 +275,10 @@ export function TranslatePopover({
     noTranslate ? "done" : "stream",
   );
   const [copied, setCopied] = useState(false);
+  // seconds the model spent on this fragment — the footer's number once it is
+  // done. Direction B says status out loud in numbers, and this is the only
+  // number a selection translation has. (WP-N)
+  const [took, setTook] = useState<number | null>(null);
   // «Повторить» bumps this to re-run the whole effect
   const [attempt, setAttempt] = useState(0);
   const dl = useDownload("main");
@@ -281,6 +303,7 @@ export function TranslatePopover({
     const ctrl = new AbortController();
     setOut("");
     setPhase("stream");
+    setTook(null);
     (async () => {
       try {
         // Model gate — the shared status source, not a bare /health probe:
@@ -299,10 +322,14 @@ export function TranslatePopover({
         }
         setPhase("stream");
         const glossary = parseGlossary(loadGlossaryText(bookPath));
+        // the clock starts here, past the model gate: a cold start is
+        // «Модель запускается · ~20 с», not slow translation
+        const t0 = performance.now();
         await translateStream(text, glossary, (d) => setOut((o) => o + d), {
           context,
           signal: ctrl.signal,
         });
+        setTook((performance.now() - t0) / 1000);
         setPhase("done");
       } catch {
         if (!ctrl.signal.aborted) setPhase("error");
@@ -325,6 +352,18 @@ export function TranslatePopover({
     document.addEventListener("pointerdown", onDown, true);
     return () => document.removeEventListener("pointerdown", onDown, true);
   }, [onClose]);
+
+  // What the footer says about the run: «Перевожу…» while it streams, the model
+  // and the seconds it took once it is over. Nothing at all on the «Оригинал»
+  // popover — nothing ran there. (WP-N)
+  const status = noTranslate
+    ? null
+    : phase === "stream"
+      ? t("pop.translating")
+      : phase === "done" && took !== null
+        ? // floored, so a cached or very short answer never reads «0,0 с»
+          t("pop.took", { sec: fmtNum(Math.max(0.1, took)) })
+        : null;
 
   const copy = useCallback(() => {
     void copyToClipboard(out).then((ok) => {
@@ -364,38 +403,23 @@ export function TranslatePopover({
               {t("model.downloadingDetail", { detail: dlProgressLine(dl) })}
             </span>
           ) : (
-            <div className="text-neutral-600 dark:text-neutral-300">
-              <div>{t("model.needed", { size: sizeLabel("main") })}</div>
-              {onSetup && (
-                <button className={`mt-1.5 underline underline-offset-2 ${LINK_HOVER}`} onClick={onSetup}>
-                  {t("model.downloadShort")}
-                </button>
-              )}
-            </div>
+            <Refusal
+              cause={t("model.needed", { size: sizeLabel("main") })}
+              verb={onSetup ? t("model.downloadShort") : undefined}
+              onVerb={onSetup}
+            />
           )
         ) : phase === "dead" ? (
-          <div className="text-neutral-600 dark:text-neutral-300">
-            <div>{t("model.dead")}</div>
-            <button
-              className={`mt-1.5 underline underline-offset-2 ${LINK_HOVER}`}
-              onClick={() => {
-                void restartModel();
-                setAttempt((a) => a + 1);
-              }}
-            >
-              {t("ui.restart")}
-            </button>
-          </div>
+          <Refusal
+            cause={t("pop.modelGone")}
+            verb={t("pop.check")}
+            onVerb={() => {
+              void restartModel();
+              setAttempt((a) => a + 1);
+            }}
+          />
         ) : phase === "error" ? (
-          <div className="text-neutral-600 dark:text-neutral-300">
-            <div>{t("pop.failed")}</div>
-            <button
-              className={`mt-1.5 underline underline-offset-2 ${LINK_HOVER}`}
-              onClick={() => setAttempt((a) => a + 1)}
-            >
-              {t("ui.retry")}
-            </button>
-          </div>
+          <Refusal cause={t("pop.failed")} verb={t("ui.retry")} onVerb={() => setAttempt((a) => a + 1)} />
         ) : (
           <>
             {out}
@@ -403,9 +427,10 @@ export function TranslatePopover({
           </>
         )}
       </div>
-      {showAltHint && (
+      {(status || showAltHint) && (
         <div className="shrink-0 border-t border-neutral-200/70 dark:border-neutral-700/70 px-3 py-1.5 text-xs text-neutral-500 dark:text-neutral-400 select-none">
-          {t("pop.altHint")}
+          {status && <div className="tabular-nums">{status}</div>}
+          {showAltHint && <div className={status ? "mt-0.5" : ""}>{t("pop.altHint")}</div>}
         </div>
       )}
     </div>
@@ -472,8 +497,11 @@ const QUIET_LINK = "transition-colors hover:text-neutral-700 dark:hover:text-neu
 // the app-wide destructive-confirm idiom (WP-Q, #11/#12): consequence text +
 // red button naming the action + «Отмена» — same classes as App.tsx
 // («Перевести заново») and Settings.tsx (model/store deletes)
-const RED_BTN = "-mx-1 px-1 rounded text-red-600 dark:text-red-400 transition-colors hover:bg-red-500/10";
-const PLAIN_BTN = "-mx-1 px-1 rounded transition-colors hover:bg-neutral-100 dark:hover:bg-neutral-700/70";
+const RED_BTN = "-mx-1 px-1 rounded-md text-red-600 dark:text-red-400 transition-colors hover:bg-red-500/10";
+// (WP-N) буква в букву PLAIN_BTN из Settings.tsx и AskSidebar.tsx: одна и та
+// же тихая кнопка в трёх файлах не имеет права наводиться по-разному
+const PLAIN_BTN =
+  "-mx-1 px-1 rounded-md transition-colors hover:bg-neutral-900/5 dark:hover:bg-neutral-100/10";
 
 export function GlossaryModal({
   bookPath,
@@ -620,7 +648,11 @@ export function GlossaryModal({
         </div>
         <textarea
           autoFocus
-          className="w-full h-64 resize-y rounded-lg bg-neutral-100 dark:bg-neutral-900 p-2.5 font-mono text-[13px] leading-relaxed outline-none focus:ring-2 focus:ring-accent/60 dark:focus:ring-accent/50"
+          // (WP-N) Поле — не кнопка: акцентного кольца на нём быть не должно.
+          // Синий в системе один и означает выбранное; каретка уже говорит, где
+          // курсор, а рамка тихо темнеет — так же, как в поиске библиотеки и
+          // графа, единственных других коробчатых полях приложения.
+          className="w-full h-64 resize-y rounded-lg border border-neutral-200 bg-neutral-100 p-2.5 font-mono text-[13px] leading-relaxed outline-none transition-colors focus:border-neutral-300 dark:border-transparent dark:bg-neutral-900 dark:focus:border-neutral-600"
           placeholder={t("gl.placeholder")}
           value={text}
           onChange={(e) => setText(e.target.value)}
@@ -715,7 +747,7 @@ export function GlossaryModal({
             <span className="flex-1" />
             {onRetranslate && (
               <button
-                className="rounded-lg px-2.5 py-1.5 text-[13px] text-neutral-500 transition-colors hover:bg-neutral-100 hover:text-neutral-700 dark:text-neutral-400 dark:hover:bg-neutral-700/60 dark:hover:text-neutral-200"
+                className="rounded-lg px-2.5 py-1.5 text-[13px] text-neutral-500 transition-colors hover:bg-neutral-900/5 hover:text-neutral-700 dark:text-neutral-400 dark:hover:bg-neutral-100/10 dark:hover:text-neutral-200"
                 title={t("gl.retranslateTitle")}
                 onClick={() => {
                   // the pipeline snapshots the glossary at start — save the
@@ -742,9 +774,11 @@ export function GlossaryModal({
               </>
             ) : (
               <>
+                {/* the verb of a failed download lives on the button beside
+                    it, so the line itself says only what happened (WP-N) */}
                 <span>
                   {auxDl.status === "error"
-                    ? dlErrorLine(auxDl.error)
+                    ? dlErrorFix(auxDl.error).cause
                     : t("gl.auxPitch", { size: sizeLabel("aux") })}
                 </span>
                 <button className={QUIET_LINK} onClick={() => startDownload("aux")}>

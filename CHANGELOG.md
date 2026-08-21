@@ -51,6 +51,101 @@
   into plural forms, so a pipe typed into ordinary prose silently truncates that
   string — which for a multi-paragraph system prompt would be invisible. An
   entry with a pipe and no `{n}` now throws at import time in dev.
+- **A knowledge graph over the whole library**, living as a second view of the
+  library rather than a screen of its own. Every book contributes one shard — a
+  JSON file under `<appDataDir>/graph`, named by the book's content key rather
+  than by its path, so moving or renaming a file does not orphan what was
+  learnt from it. The seed pass runs without any model at all and reads the
+  whole book, up to a ceiling of 1 000 pages that exists only so a scanned
+  five-thousand-page dictionary cannot hold the queue: 7 ms a page, which is
+  about two seconds for an ordinary 300-page book and 6.1 s for the 838-page
+  volume this feature was first run against. It used to read 24 pages spread
+  evenly across the book, and the spread was a good argument for a bad sample —
+  24 pages of that book is 2.9% of the text, and the graph it produced held
+  SEVEN concepts, next to the 118 terms this repo's own glossary miner had
+  already found in the same file. The same book now yields 118 concepts, each
+  carrying the pages it was met on: the miner keeps its top 120, and 114 of
+  those 118 glossary terms fall inside that 120 — so a book the reader has
+  never translated gets the graph a translated one gets. If the reader HAS
+  translated it, the glossary already sitting on disk is merged in for nothing:
+  one 6 KB read of a pass another feature has already paid for and a human has
+  already curated. On that book the two lists together came to 124 concepts,
+  under a ceiling of 180 a single book may contribute — the ceiling bounds the
+  deep pass, which is the one that costs minutes. The seed is written before
+  the deep pass starts, so a book is in the graph — searchable, drawable,
+  joined to its neighbours by the concepts they share — from the first write,
+  and a build cancelled halfway leaves a partial graph rather than none.
+  - **Singular and plural are one concept.** A concept's id folds the plural off
+    its head word, so «IR systems» and «IR system» — which on that book were two
+    nodes out of nine, counted 6 and 4 — are one node with one page list. A
+    split concept is not merely untidy: each half carries half the frequency, so
+    both halves can fall under the mining floor and vanish. The same book's
+    118-term glossary yields 118 distinct ids before the fold and 111 after,
+    seven merges, every one of them genuine. Cyrillic is deliberately left
+    alone, because Russian fuses number with case: every ending-strip is also a
+    case-strip, and case-strips collide at a rate English never approaches
+    («полка» onto «полк», «банка» onto «банк»). A Russian library therefore
+    keeps both forms until this app ships a lemma dictionary.
+  - **A licensed book never leaves the machine.** The classifier weighs the
+    front matter, the last page, the document metadata and the length, and
+    answers «Лицензионная книга», «Открытая статья» or «Происхождение неясно» —
+    and «unclear» is treated exactly as «book». Only an open article may be
+    deepened through Claude Code, and only while «Разбирать открытые статьи
+    через Claude Code» is ticked in Settings — that switch is off out of the
+    box, so until the reader asks for it every book is read by the local aux
+    model or not at all. The reader can overrule the verdict by hand on the
+    node card, and that choice is what every later build honours.
+  - **Six kinds of node, and the shape of the label decides which.** A 4B model
+    cannot hold a closed six-way vocabulary steady — handed a technical book's
+    term list it shelved «recommender systems», «search engine» and «large
+    language models» as works, fifteen spurious `work` nodes out of 117, with
+    the one-line glosses right every time. So the instruction now states the
+    base rate, says plainly that the other four kinds are for NAMES, and hands
+    over a test that can be applied to the label alone: could this be written in
+    lower case in the middle of a sentence? That wording by itself takes the
+    book's proper-noun nodes from 29 to 12, and a guard re-applies the same test
+    to whatever comes back — a mined label can no longer be a `work` at all, and
+    person, org and place survive only on a name-shaped label.
+  - **The extractor carries a generation, so an upgraded extractor re-reads the
+    library by itself.** Today's rewrite is generation 2, and the library's
+    catch-up scan queues every book whose shard is older than that — otherwise a
+    reader who switched the graph on yesterday would keep nine nodes for an
+    838-page book for ever, or until they stumbled on «Перестроить весь граф» in
+    Settings. It is not the schema version, which answers a different question —
+    whether the file can be parsed at all — and whose bump would make every
+    shard unreadable and blank the graph until each book had been read again. A
+    stale shard is read, drawn, searched and used by «Спросить» exactly like any
+    other, right up to the moment the new read finishes and writes over it, so
+    the picture never empties for a second; a shard with no generation field at
+    all predates the field and counts as generation 1. A provenance verdict the
+    reader set by hand survives the re-read, because re-seeding a book must not
+    argue back with them.
+  - The canvas draws at most **700 concept nodes**, heaviest first. The cap is
+    what keeps one force-layout tick inside a frame on a machine with no
+    discrete card; past that count the picture has long since turned to fog, so
+    the surplus is not drawn badly — it is not drawn. The frame loop stops
+    itself the moment the layout settles, and again whenever the panel scrolls
+    off screen or the window goes to the background.
+  - «Спросить» now looks at the library before it looks anywhere else. The
+    lookup is pure memory once the session's shards have been merged — no
+    model, no network, and no disk read after that first merge — so it costs
+    nothing a reader can feel, and what it finds is pasted in front of the
+    question under «Из вашей библиотеки»: the names of the concepts, the books
+    they turn up in, and the pages. A concept that lives only in licensed books
+    — none of them the book open in front of the reader — gives that list its
+    name and its pages and nothing more; its description stays on the machine
+    that read it. The system prompt teaches the order rather than the
+    citation: library first, own knowledge second, the web only when the answer
+    genuinely needs today's facts — and the web stays off entirely until the
+    reader ticks the box in Settings themselves.
+  - Three frozen keys and no more: «pdfer:lib:view» remembers whether the
+    library opens on the card grid or on the graph, «pdfer:graph:auto» is the
+    auto-build switch, and «pdfer:graph:claude» decides whether an open article
+    may be read through Claude Code — that one is OFF unless the reader turns it
+    on, since a settings key nobody has touched is not consent to send anything
+    anywhere. Turning the auto-build switch off also stops what is already
+    running, because a reader who reaches for it is asking the machine to stop
+    working, not to finish the queue quietly.
 
 ### Fixed
 

@@ -30,6 +30,9 @@
 //          для непереведённого — честные пометки (оригинал для сбойных
 //          абзацев, «[таблица или формула]» для прочего, подпись фигуры в
 //          скобках); мгновенная сборка, без рендера.
+// Гарнитура (WP-N): и PDF, и HTML несут Literata, вшитую в сам документ
+// (FONT_CSS) — экспорт обязан читаться той же гарнитурой, что переведённая
+// страница в читалке, а на чужой машине её ниоткуда не взять.
 
 import { invoke } from "@tauri-apps/api/core";
 import { save } from "@tauri-apps/plugin-dialog";
@@ -47,6 +50,14 @@ import type { FigureRegion } from "./paragraphs";
 import type { Rect, Src } from "./crops";
 import { CROP_K, blankProbe, blitCrop, cropCanvas, cropSrc, cropViewport, cropWindow, inkProbe, isBlankCrop, releaseCanvas, snapToInk } from "./crops";
 import type { CropWindow } from "./crops";
+// (WP-N) Гарнитура переведённой страницы едет в экспорт вместе с текстом:
+// документ автономный и открывается на чужой машине, где Literata не
+// установлена, — без вшитых файлов человек получил бы Georgia. `?inline` даёт
+// data:-URI уже на сборке (Vite так же ведёт себя и в dev), поэтому рантайму
+// не нужны ни fetch, ни соседние файлы. Цена — ~180 КБ base64 на документ,
+// против мегабайтов кропов это ничто.
+import literataCyrillic from "./fonts/literata-cyrillic.woff2?inline";
+import literataLatin from "./fonts/literata-latin.woff2?inline";
 
 // ---- constants mirrored from App.tsx (private there; keep values in sync) ---
 const LIST_RE = /^\s*(?:\(\d{1,3}\)|\d{1,3}[.)]|\(?[a-zа-яё]\)|[•◦▪‣–—])\s/i;
@@ -201,12 +212,39 @@ const escCites = (s: string) =>
     .map((r) => (r.cite ? `<span class="cite">${esc(r.text)}</span>` : esc(r.text)))
     .join("");
 
-// same document voice as .trPage: Georgia serif, justified, hyphenated Russian
+// (WP-N) Две ветки Literata, встроенные в документ. Диапазоны и веса — те же,
+// что в App.css: кириллица и латиница лежат в разных файлах, и unicode-range
+// решает, какой из них вообще качать (в data:-URI качать нечего, но правило
+// делит наборы так же, как на экране). font-display: swap — как в приложении:
+// пока шрифт не встал, текст читается Georgia, а не пропадает; печать при
+// худшем раскладе даст прежнюю Georgia, а не пустую страницу.
+const FONT_CSS = `
+@font-face {
+  font-family: "Literata";
+  font-style: normal;
+  font-weight: 400 700;
+  font-display: swap;
+  src: url("${literataCyrillic}") format("woff2");
+  unicode-range: U+0301, U+0400-045F, U+0490-0491, U+04B0-04B1, U+2116;
+}
+@font-face {
+  font-family: "Literata";
+  font-style: normal;
+  font-weight: 400 700;
+  font-display: swap;
+  src: url("${literataLatin}") format("woff2");
+  unicode-range: U+0000-00FF, U+0131, U+0152-0153, U+02BB-02BC, U+02C6, U+02DA, U+02DC, U+0304,
+    U+0308, U+0329, U+2000-206F, U+20AC, U+2122, U+2191, U+2193, U+2212, U+2215, U+FEFF, U+FFFD;
+}
+`;
+
+// same document voice as .trPage: Literata, justified, hyphenated Russian
 const HTML_CSS = `
 :root { color-scheme: light dark; }
 body { margin: 0; background: #faf9f7; color: #1c1c1c; }
 main { max-width: 44rem; margin: 0 auto; padding: 3rem 1.25rem 5rem;
-  font-family: Georgia, "Iowan Old Style", "Times New Roman", serif;
+  font-family: Literata, Georgia, "Iowan Old Style", "Times New Roman", serif;
+  font-optical-sizing: auto;
   font-size: 17px; line-height: 1.55; text-align: justify;
   hyphens: auto; overflow-wrap: break-word; }
 h1 { font-size: 1.5em; line-height: 1.25; margin: 0; text-align: left; }
@@ -241,7 +279,8 @@ p { margin: 0.55em 0 0; text-indent: 1.5em; }
 const PRINT_CSS = `
 :root { color-scheme: light; }
 body { margin: 0; background: #fff; color: #111;
-  font-family: Georgia, "Iowan Old Style", "Times New Roman", serif;
+  font-family: Literata, Georgia, "Iowan Old Style", "Times New Roman", serif;
+  font-optical-sizing: auto;
   font-size: 11pt; line-height: 1.5; text-align: justify;
   hyphens: auto; overflow-wrap: break-word; }
 h1 { font-size: 1.5em; line-height: 1.25; margin: 0; text-align: left;
@@ -475,7 +514,7 @@ async function assembleDoc(
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>${esc(t("exp.docTitle", { title }))}</title>
-<style>${print ? PRINT_CSS : HTML_CSS}</style>
+<style>${FONT_CSS}${print ? PRINT_CSS : HTML_CSS}</style>
 </head>
 <body>
 <main>

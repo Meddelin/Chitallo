@@ -10,6 +10,7 @@ import {
   Link2Icon,
   MessagesSquareIcon,
   RefreshCcwIcon,
+  SearchIcon,
   SparklesIcon,
   SquarePenIcon,
   TextQuoteIcon,
@@ -38,13 +39,19 @@ import {
   PromptInputTools,
 } from "@/components/ai-elements/prompt-input";
 import { Suggestion, Suggestions } from "@/components/ai-elements/suggestion";
-import { ASK_W_DEFAULT, ASK_W_MIN, askWMax } from "./askwidth";
 import { copyToClipboard } from "./clipboard";
+import { lookup } from "./graphstore";
 import { CLAUDE, installCommand } from "./host";
-import { getLang, t } from "./i18n";
+import { fmtNum, getLang, t } from "./i18n";
 import { IconClose } from "./icons";
 
-// ---- «Спросить»: chat sidebar over headless Claude Code ---------------------
+// ---- «Спросить»: тело одноимённой вкладки панели, поверх headless Claude Code
+//
+// (WP-N) Это больше не самостоятельная панель: рама — строка вкладок, крестик
+// и ручка ширины — принадлежит Panel.tsx, здесь остались строка управления
+// беседой, диалог, чипы-подсказки и композер. `open` по-прежнему приходит
+// пропсом: тело живёт смонтированным и когда вкладка не на виду (идущий поток
+// ответа не должен обрываться от переключения), и это флаг «меня видно».
 //
 // UI: shadcn AI components (shadcn.io/ai patterns — Conversation, Message,
 // Response, Actions, Prompt Input, Loader, Suggestion) restyled to the app's
@@ -56,10 +63,23 @@ import { IconClose } from "./icons";
 // and forwards every stdout NDJSON line RAW over a tauri Channel. This
 // component owns the whole NDJSON contract:
 //   stream_event/content_block_delta/text_delta  → token stream
+//   stream_event/content_block_start/tool_use    → a tool is starting
+//   assistant/message.content[]/tool_use         → the same tool, input filled
 //   result (always present, synthetic if needed) → final text, session_id,
 //                                                  is_error/subtype
 // One ask at a time (Rust rejects "busy: ..."). Cancel = ask_claude_cancel →
 // the stream still terminates with a synthetic cancelled result line.
+//
+// Where an answer comes from, in order: the reader's own knowledge graph, then
+// the model's own knowledge, then — only with the reader's permission — the web.
+//   * the graph is RETRIEVED here, not by the model: lookup() runs before the
+//     prompt is assembled and its block is prepended to whatever the prompt
+//     turned out to be, on EVERY turn (see the injection site);
+//   * `ask.graph` in the system prompt is what teaches that order;
+//   * the web is a tool the CLI may only reach for when pdfer:ask:web says so,
+//     and every search or fetch it does gets a line in the transcript. An
+//     assistant answering out of a silent network is the thing that line exists
+//     to prevent.
 //
 // Per-book persistence (localStorage), schema v2 — MANY threads per book:
 //   pdfer:claude:threads:<bookPath>     index {v,active,items[{id,title,ts,n}]}
@@ -71,9 +91,15 @@ import { IconClose } from "./icons";
 // flag — they were produced under a "plain text only" persona and keep
 // rendering as pre-wrapped plain text. New assistant messages set md: true and
 // render as markdown.
+// A record is stored and read back as a whole object (JSON.stringify of the
+// message list, JSON.parse straight back into Msg[]), so a flag added to Msg
+// survives a restart with no schema bump and no migration — which is why
+// `graph` and `tools` are persisted with the answer rather than kept in a
+// session-only side table: an answer that leaned on the library still says so
+// tomorrow morning.
 //
-// Panel width lives in pdfer:askw (workspace-wide, see useAskWidth) and is
-// dragged from the handle on the panel's left edge.
+// Panel width lives in pdfer:askw (workspace-wide, see useAskWidth); the drag
+// handle on the panel's left edge is Panel.tsx's now.
 //
 // Outside Tauri (plain-browser ?test= debugging) sends are answered with an
 // honest «доступно только в приложении» message — unless a dev mock is set:
@@ -85,6 +111,12 @@ import { IconClose } from "./icons";
 // `id` makes every «Спросить» click a fresh object so the consume effect fires.
 export type AskSeed = { id: number; quote: string; page?: number; pageText?: string };
 
+// One line of tool activity, kept with the answer it happened during. `what` is
+// the model's own query or the host it opened — never interface prose, see
+// toolNote() — and is empty when the tool announced itself before its input had
+// finished streaming and no later line filled it in.
+type ToolNote = { tool: "search" | "fetch"; what: string };
+
 type Msg = {
   role: "user" | "assistant";
   text: string;
@@ -93,12 +125,46 @@ type Msg = {
   error?: boolean; // assistant: error text (muted red)
   cancelled?: boolean; // assistant: partial answer kept after a cancel
   md?: boolean; // assistant: markdown (post-rebuild records; old ones are plain)
+  graph?: boolean; // assistant: a library block went into the prompt for this turn
+  tools?: ToolNote[]; // assistant: the searches and fetches this answer cost
+  // (WP-N) Кто ответил и за сколько — подпись под ответом. Записи старее этого
+  // поля читаются как прежде: имени нет — в подписи стоит имя самого CLI.
+  model?: string; // assistant: machine id out of the stream, «claude-sonnet-4-5-…»
+  ms?: number; // assistant: wall time from the question to the finished answer
 };
+
+// «claude-sonnet-4-5-20250929» → «Claude Sonnet 4.5». Идентификатор разбирается
+// по частям, и ни одной части к нему не добавляется: если семейство не читается,
+// показываем строку ровно такой, какой она пришла. Дата сборки (восемь цифр) —
+// не версия и в подпись не идёт.
+const TIERS: Record<string, string | undefined> = { opus: "Opus", sonnet: "Sonnet", haiku: "Haiku" };
+function modelName(id: string): string {
+  const parts = id.split("-");
+  if (parts[0] !== "claude") return id;
+  const tier = parts.map((p) => TIERS[p]).find(Boolean);
+  const ver = parts.filter((p) => /^\d{1,2}$/.test(p)).join(".");
+  const out = ["Claude", tier, ver].filter(Boolean).join(" ");
+  return out === "Claude" ? id : out;
+}
+
+// one content block of the model's turn; only `tool_use` is read here
+type ToolUse = { type?: string; id?: string; name?: string; input?: Record<string, unknown> };
 
 // minimal shape of the NDJSON lines this component reads
 type NdLine = {
   type?: string;
-  event?: { type?: string; delta?: { type?: string; text?: string } };
+  event?: {
+    type?: string;
+    delta?: { type?: string; text?: string };
+    // content_block_start: the tool is named here, but its input is still
+    // empty — the arguments arrive as input_json_delta fragments afterwards
+    content_block?: ToolUse;
+    // message_start: the turn's model, before a single token of it has arrived
+    message?: { model?: string };
+  };
+  // the assembled assistant turn: the same tool_use blocks, inputs filled in
+  message?: { content?: ToolUse[]; model?: string };
+  model?: string; // system/init: the model the CLI started the session with
   subtype?: string;
   is_error?: boolean;
   result?: string;
@@ -109,17 +175,63 @@ type MockLines = string[] | ((prompt: string) => string[]);
 
 const HIST_LIMIT = 50;
 const defaultQ = () => t("ask.defaultQ");
-// static follow-up chips after a completed answer — no extra model calls.
-// Three, wrapping, dismissible: the market rule for chips in a narrow panel
-// (cap the visible set, never a hidden scroller, never push the composer down).
+// Chips above the composer — no extra model calls. Three, wrapping,
+// dismissible: the market rule for chips in a narrow panel (cap the visible
+// set, never a hidden scroller, never push the composer down).
+// В направлении B это не «дожать ответ», а зацепки по тому, что читатель
+// сейчас видит: глава, её термины, короткий пересказ страницы (WP-N).
 // label = what the chip reads (short enough to fit one row at 400 px);
 // msg = what is actually sent, since the chip becomes the user's own turn
-const suggestions = (): { label: string; msg: string }[] => [
-  { label: t("ask.simpler"), msg: t("ask.simpler") },
-  { label: t("ask.example"), msg: t("ask.example") },
-  { label: t("ask.linkTopic"), msg: t("ask.linkTopicMsg") },
+const suggestions = (page: number): { label: string; msg: string }[] => [
+  { label: t("ask.chipChapter"), msg: t("ask.chipChapterMsg") },
+  { label: t("ask.chipTerms"), msg: t("ask.chipTermsMsg") },
+  { label: t("ask.chipShort"), msg: t("ask.chipShortMsg", { n: page }) },
 ];
 const isTauri = "__TAURI_INTERNALS__" in window;
+
+// ---- the web, and the line it leaves behind ---------------------------------
+// Frozen key (WP-M), default OFF: a reader who never opened Settings has never
+// agreed to let a question about the book they are holding leave the machine.
+// The switch itself lives in Settings («Разрешить поиск в интернете»); here it
+// is only read, and read at send time rather than cached, so unticking it takes
+// effect on the very next question instead of on the next restart.
+const WEB_KEY = "pdfer:ask:web";
+const WEB_TOOLS = "WebSearch,WebFetch";
+const webAllowed = () => {
+  try {
+    return localStorage.getItem(WEB_KEY) === "1";
+  } catch {
+    // storage denied (private mode, a locked profile): a permission nobody can
+    // read has not been given, and the safe reading of silence is «no»
+    return false;
+  }
+};
+
+// «https://arxiv.org/abs/2001.08361» → «arxiv.org». The whole URL would push the
+// row into an ellipsis on its own path, and the host is the part that answers
+// the reader's actual question — WHERE did this go.
+const hostOf = (u: string) => {
+  try {
+    return new URL(u).hostname.replace(/^www\./, "");
+  } catch {
+    return u;
+  }
+};
+
+/// One tool_use block → the row it earns in the transcript, or null for a tool
+/// the reader was never asked about (nothing else is on the allow-list, so this
+/// should be unreachable; it is a warning, not a silent drop).
+function toolNote(b: ToolUse): ToolNote | null {
+  if (b.name === "WebSearch") {
+    return { tool: "search", what: typeof b.input?.query === "string" ? b.input.query : "" };
+  }
+  if (b.name === "WebFetch") {
+    const u = typeof b.input?.url === "string" ? b.input.url : "";
+    return { tool: "fetch", what: u ? hostOf(u) : "" };
+  }
+  if (b.name) console.warn("ask: unexpected tool", b.name, b.input);
+  return null;
+}
 
 // ---- quick commands ---------------------------------------------------------
 // «/» in an empty composer opens the menu — the settled convention (ChatGPT,
@@ -128,13 +240,22 @@ const isTauri = "__TAURI_INTERNALS__" in window;
 // a command sends straight away — this is a reader, not an agent, so no
 // directive chip lingers. Menu labels are infinitives (UI voice); the payload
 // is 2nd-person imperative, because it becomes the user's own turn.
+// `here` — команда спрашивает про открытую страницу, и в промпт к ней уходит
+// текст этой страницы, а не только её номер (WP-N).
 type CmdNeed = "seed" | "answer" | "seedOrAnswer";
-type Cmd = { id: string; label: string; icon: LucideIcon; msg: (page: number) => string; need?: CmdNeed };
+type Cmd = {
+  id: string;
+  label: string;
+  icon: LucideIcon;
+  msg: (page: number) => string;
+  need?: CmdNeed;
+  here?: boolean;
+};
 const commands = (): Cmd[] => [
   { id: "explain", label: t("ask.cmdExplain"), icon: TextQuoteIcon, msg: () => t("ask.defaultQ"), need: "seed" },
   { id: "term", label: t("ask.cmdTerm"), icon: BookOpenIcon, msg: () => t("ask.cmdTermMsg"), need: "seed" },
-  { id: "page", label: t("ask.cmdPage"), icon: FileTextIcon, msg: (p) => t("ask.cmdPageMsg", { n: p }) },
-  { id: "chart", label: t("ask.cmdChart"), icon: ChartColumnIcon, msg: (p) => t("ask.cmdChartMsg", { n: p }) },
+  { id: "page", label: t("ask.cmdPage"), icon: FileTextIcon, msg: (p) => t("ask.cmdPageMsg", { n: p }), here: true },
+  { id: "chart", label: t("ask.cmdChart"), icon: ChartColumnIcon, msg: (p) => t("ask.cmdChartMsg", { n: p }), here: true },
   { id: "link", label: t("ask.cmdLink"), icon: Link2Icon, msg: () => t("ask.linkTopicMsg"), need: "seedOrAnswer" },
   { id: "simpler", label: t("ask.cmdSimpler"), icon: LightbulbIcon, msg: () => t("ask.simpler"), need: "answer" },
 ];
@@ -149,8 +270,9 @@ const HDR_BTN =
 // only the hover paint has to be taken back.
 const HDR_BTN_OFF =
   "disabled:text-neutral-300 disabled:cursor-default disabled:hover:bg-transparent disabled:hover:text-neutral-300 dark:disabled:text-neutral-600 dark:disabled:hover:bg-transparent dark:disabled:hover:text-neutral-600";
-const RED_BTN = "-mx-1 px-1 rounded text-red-600 dark:text-red-400 transition-colors hover:bg-red-500/10";
-const PLAIN_BTN = "-mx-1 px-1 rounded transition-colors hover:bg-neutral-100 dark:hover:bg-neutral-700/70";
+const RED_BTN = "-mx-1 px-1 rounded-md text-red-600 dark:text-red-400 transition-colors hover:bg-red-500/10";
+const PLAIN_BTN =
+  "-mx-1 px-1 rounded-md transition-colors hover:bg-neutral-900/5 dark:hover:bg-neutral-100/10";
 
 // ---- per-book threads (schema v2) -------------------------------------------
 // v1 kept exactly ONE thread per book, and «Новая беседа» deleted it. v2 keeps
@@ -274,107 +396,71 @@ async function replayMock(lines: string[], onLine: (l: string) => void, isCancel
 
 // Reading-assistant persona, in the interface language so the answers come back
 // in it; goes to the CLI as --append-system-prompt. With it, the two formats an
-// answer may carry besides prose — maths in LaTeX and a ```chart fence. Kept as
-// two catalogue entries rather than one:
+// answer may carry besides prose — maths in LaTeX and a ```chart fence — and
+// the order in which the assistant is to look for what it answers with. Kept as
+// three catalogue entries rather than one:
 // `ask.viz` describes a machine contract that must stay in step with
-// chart-block.tsx, and it has no business being buried inside the voice.
-const sysPrompt = (title: string) => `${t("ask.system", { title })}\n\n${t("ask.viz")}`;
+// chart-block.tsx, and it has no business being buried inside the voice;
+// `ask.graph` is a rule about ORDER — library, then own knowledge, then the web
+// — and it is what makes sense of the «Из вашей библиотеки» block the prompt
+// carries. It is appended unconditionally, even on a turn where the graph found
+// nothing: --resume replays the system prompt of the FIRST turn of a thread,
+// and a rule that came and went with the block would apply to the wrong turns.
+const sysPrompt = (title: string) =>
+  `${t("ask.system", { title })}\n\n${t("ask.viz")}\n\n${t("ask.graph")}`;
 
-// VS Code / Cursor grammar: an invisible 8 px strip on the panel edge, a 2 px
-// tint on hover or drag, col-resize cursor. No grip dots — they would be the
-// only ornamented control in an app of quiet pills (WP-K).
-function ResizeHandle({ width, onWidth }: { width: number; onWidth: (w: number) => void }) {
-  const drag = useRef<{ x: number; w: number } | null>(null);
-  const raf = useRef(0);
-
-  const onPointerDown = (e: React.PointerEvent<HTMLDivElement>) => {
-    if (e.button !== 0) return;
-    drag.current = { x: e.clientX, w: width };
-    try {
-      e.currentTarget.setPointerCapture(e.pointerId);
-    } catch {
-      /* no capture (synthetic pointer): the drag still tracks over the handle */
-    }
-    // one global flag: kills the toolbar's left-transition (it would lag a
-    // frame behind the drag) and keeps the col-resize cursor over the book
-    document.documentElement.dataset.askresize = "";
-  };
-  const onPointerMove = (e: React.PointerEvent<HTMLDivElement>) => {
-    const d = drag.current;
-    if (!d) return;
-    // the panel is on the RIGHT: dragging left grows it
-    const next = d.w - (e.clientX - d.x);
-    cancelAnimationFrame(raf.current); // one width write per frame — Conversation re-lays out on every change
-    raf.current = requestAnimationFrame(() => onWidth(next));
-  };
-  const endDrag = (e: React.PointerEvent<HTMLDivElement>) => {
-    if (!drag.current) return;
-    drag.current = null;
-    try {
-      if (e.currentTarget.hasPointerCapture(e.pointerId)) e.currentTarget.releasePointerCapture(e.pointerId);
-    } catch {
-      /* capture was never taken */
-    }
-    delete document.documentElement.dataset.askresize;
-  };
-  const onKeyDown = (e: React.KeyboardEvent<HTMLDivElement>) => {
-    const step = e.shiftKey ? 64 : 16;
-    if (e.key === "ArrowLeft") onWidth(width + step);
-    else if (e.key === "ArrowRight") onWidth(width - step);
-    else if (e.key === "Home") onWidth(ASK_W_DEFAULT);
-    else return;
-    // the keys the handle claims are ITS keys: without stopPropagation the app's
-    // window-level reading-keys listener also acts on them (Home scrolled the
-    // book back to page 1 while the handle only resized the panel)
-    e.preventDefault();
-    e.stopPropagation();
-  };
-
-  useEffect(() => () => cancelAnimationFrame(raf.current), []);
-
+// Tool activity, in the quiet register of «Остановлено» and «По графу
+// библиотеки» — under the answer's weight, never competing with it. One line,
+// truncated: an assistant that searched eleven times must not push the answer
+// itself off the screen, so these rows never scroll and never grow.
+//
+// The row carries NO interface prose — a magnifier and the query the model
+// typed, a link and the host it opened. That is a constraint, not a taste:
+// every user-visible sentence in this app comes out of the i18n catalogue,
+// `t()` takes its key from a closed union, and this task may not touch that
+// file. A query and a hostname are the model's words and the network's, so
+// neither needs translating; the tool NAME is the fallback when the input never
+// arrived, and it is a proper noun. A catalogue entry, when there is one,
+// belongs at the head of this row and nowhere else.
+const ToolRow = ({ note }: { note: ToolNote }) => {
+  const search = note.tool === "search";
+  // guillemets only around a query — it is a quotation of what the model typed;
+  // a host is a name and takes none. Same spelling as the fragment chip above
+  // the composer, which is the reader's other «this is quoted material» cue.
+  const text = note.what ? (search ? `«${note.what}»` : note.what) : search ? "WebSearch" : "WebFetch";
   return (
-    <div
-      aria-label={t("ask.panelWidth")}
-      aria-orientation="vertical"
-      aria-valuemax={askWMax()}
-      aria-valuemin={ASK_W_MIN}
-      aria-valuenow={width}
-      className="group/rz absolute left-0 top-0 z-20 h-full w-2 -translate-x-1/2 cursor-col-resize touch-none"
-      onDoubleClick={() => onWidth(ASK_W_DEFAULT)}
-      onKeyDown={onKeyDown}
-      onLostPointerCapture={endDrag}
-      onPointerCancel={endDrag}
-      onPointerDown={onPointerDown}
-      onPointerMove={onPointerMove}
-      onPointerUp={endDrag}
-      role="separator"
-      tabIndex={0}
-      title={t("ask.panelWidthTitle")}
-    >
-      <div className="pointer-events-none mx-auto h-full w-0.5 bg-transparent transition-colors group-hover/rz:bg-neutral-400/70 group-focus-visible/rz:bg-neutral-400/70 dark:group-hover/rz:bg-neutral-500/70 dark:group-focus-visible/rz:bg-neutral-500/70" />
+    <div className="flex items-center gap-1.5 text-xs text-neutral-500 dark:text-neutral-400" title={text}>
+      {search ? <SearchIcon className="size-3 shrink-0" /> : <Link2Icon className="size-3 shrink-0" />}
+      <span className="min-w-0 truncate">{text}</span>
     </div>
   );
-}
+};
 
 export function AskSidebar({
   open,
   bookPath,
   bookTitle,
   page,
+  total,
+  pageText,
   seed,
-  width,
-  onWidth,
-  onClose,
+  onCount,
 }: {
+  /** вкладка «Спросить» видна: тело остаётся смонтированным и в фоне (WP-N) */
   open: boolean;
   bookPath: string;
   bookTitle: string;
-  // current page — book context for the first message of a fresh thread
+  // current page — reading position, sent with EVERY message of a thread (WP-N)
   page: number;
+  /** страниц в книге — вторая половина «стр. N из M» */
+  total: number;
+  /** (WP-N) Текст того, что читатель видит: страница, названная в пилюле, и её
+   *  соседка по ряду, если книга открыта в две колонки. Читается в момент
+   *  вопроса — за время беседы читатель уходит на сотни страниц вперёд. */
+  pageText: (n: number) => { page: number; text: string }[];
   seed: AskSeed | null;
-  width: number;
-  onWidth: (w: number) => void;
-  onClose: () => void;
+  /** сообщений в открытой беседе — число на ярлыке вкладки панели (WP-N) */
+  onCount?: (n: number) => void;
 }) {
   const [index, setIndex] = useState<ThreadIndex>(() => loadIndex(bookPath));
   const [msgs, setMsgs] = useState<Msg[]>(() => loadThread(bookPath, index.active).msgs);
@@ -382,6 +468,7 @@ export function AskSidebar({
   const [pending, setPending] = useState<AskSeed | null>(null);
   const [busy, setBusy] = useState(false);
   const [stream, setStream] = useState(""); // streamed text of the in-flight answer
+  const [live, setLive] = useState<ToolNote[]>([]); // tool rows of the in-flight answer
   const [copied, setCopied] = useState(-1); // msg index showing the «Copied» state
   const [threadsOpen, setThreadsOpen] = useState(false);
   const [confirmDel, setConfirmDel] = useState<string | null>(null); // thread id armed for delete
@@ -392,6 +479,12 @@ export function AskSidebar({
   const msgsRef = useRef(msgs);
   const busyRef = useRef(false);
   const streamRef = useRef("");
+  const liveRef = useRef<ToolNote[]>([]);
+  // tool_use id → its row in liveRef. The CLI announces a tool twice — once at
+  // content_block_start, where the name is known and the input is still empty,
+  // and again in the assembled assistant turn with the query filled in. Without
+  // this map the reader would get every search twice, once nameless.
+  const toolAtRef = useRef(new Map<string, number>());
   const resultRef = useRef<NdLine | null>(null);
   const cancelledRef = useRef(false);
   const taRef = useRef<HTMLTextAreaElement>(null);
@@ -436,12 +529,18 @@ export function AskSidebar({
     setMsgs(msgsRef.current);
     setPending(null);
     setStream("");
+    setLive([]);
     setInput("");
     setThreadsOpen(false);
     setConfirmDel(null);
     setCmdOpen(false);
     setSugHideAt(-1);
   }, [bookPath]);
+
+  // число на ярлыке вкладки «Спросить» — сообщения открытой беседы (WP-N)
+  useEffect(() => {
+    onCount?.(msgs.length);
+  }, [msgs.length, onCount]);
 
   // unmount (book closed) with an ask in flight: kill the child
   useEffect(
@@ -526,6 +625,7 @@ export function AskSidebar({
     msgsRef.current = loadThread(bookPath, id).msgs;
     setMsgs(msgsRef.current);
     setStream("");
+    setLive([]);
     setCmdOpen(false);
     setSugHideAt(-1);
   };
@@ -578,8 +678,12 @@ export function AskSidebar({
   // core ask: q is the question text, pend the (already detached) seed.
   // The form path consumes the pending chip; suggestion/repeat sends pass null
   // and leave any pending chip for the next manual message.
-  const ask = async (q: string, pend: AskSeed | null) => {
+  // `here` — вопрос про открытую страницу (чип-подсказка, «страница»,
+  // «наглядно»): в промпт уходит текст того, что читатель видит (WP-N).
+  const ask = async (q: string, pend: AskSeed | null, here = false) => {
     if (busyRef.current || !q) return;
+    const t0 = Date.now(); // время ответа — то, что читатель прождал
+    let modelId = ""; // кто ответил: имя приходит в потоке, см. onLine
     const path = bookPath;
     const tid = tidRef.current; // this thread owns the answer even if the user switches away
     const sid = loadThread(path, tid).sid ?? null;
@@ -588,11 +692,42 @@ export function AskSidebar({
     // the delimited context (selection, surrounding page text, book/page)
     push(path, tid, { role: "user", text: q, quote: pend?.quote, page: pend?.page });
 
+    // Busy goes up BEFORE retrieval, not after it as it used to. The question is
+    // already on screen (push above is synchronous and stays above this line),
+    // but lookup() is the first thing in a session to touch the graph, and
+    // graph() reads every shard off disk to merge them — hundreds of
+    // milliseconds on a real library, during which a composer that still looked
+    // idle would invite a second Enter.
+    busyRef.current = true;
+    setBusy(true);
+    streamRef.current = "";
+    setStream("");
+    liveRef.current = [];
+    setLive([]);
+    toolAtRef.current = new Map();
+    resultRef.current = null;
+    cancelledRef.current = false;
+
+    let graphCtx: string | null = null;
+    try {
+      graphCtx = await lookup(q, pend?.quote ?? null, path);
+    } catch (e) {
+      // A graph that cannot be read costs this answer its library context and
+      // nothing else — the question itself must still go through, and the model
+      // has been told to say plainly what the library does not cover. The detail
+      // goes to the console rather than into the reader's thread.
+      console.warn("ask: graph lookup failed", e);
+    }
+
     let prompt: string;
     if (pend) {
+      // (WP-N) Номер у цитаты может и не быть: выделение, начавшееся вне
+      // [data-page], приходит из extractAskContext без страницы. Тогда позицию
+      // называет пилюля — читатель выделял то, на что смотрел, и ответ без
+      // позиции хуже ответа с соседней страницей.
       const where = t("ask.quoteFrom", {
         title: bookTitle,
-        page: pend.page ? t("ask.quotePage", { n: pend.page }) : "",
+        page: t("ask.quotePage", { n: pend.page ?? page }),
       });
       prompt =
         `${where}\n<<<\n${pend.quote}\n>>>\n\n` +
@@ -601,15 +736,58 @@ export function AskSidebar({
     } else if (!sid) {
       prompt = `${t("ask.readingCtx", { title: bookTitle, page })}\n\n${q}`;
     } else {
-      prompt = q; // follow-up: the resumed session already has the context
+      // (WP-N) Продолжение беседы больше не голый вопрос. --resume помнит ту
+      // страницу, что стояла в ПЕРВОМ сообщении, а читатель за разговор уходит
+      // на сотни страниц вперёд — и модель отвечала про давно прочитанное.
+      // Строка стоит одну фразу и идёт с каждым сообщением.
+      prompt = `${t("ask.readingHere", { title: bookTitle, page, total })}\n\n${q}`;
     }
 
-    busyRef.current = true;
-    setBusy(true);
-    streamRef.current = "";
-    setStream("");
-    resultRef.current = null;
-    cancelledRef.current = false;
+    // Вопрос про «здесь» получает САМ ТЕКСТ открытой страницы: номер модель
+    // прочесть не может, и без текста она отвечала по обрывкам, оставшимся в
+    // истории беседы от прошлых вопросов. Каждый блок идёт со своим номером —
+    // в две колонки их два, и модель обязана видеть, где чей. Ручной вопрос
+    // текста не получает: раздувать страницей книги каждое сообщение незачем.
+    if (here) {
+      const seen = pageText(page)
+        .map((p) => `${t("ask.openPage", { n: p.page })}\n<<<\n${p.text}\n>>>`)
+        .join("\n\n");
+      if (seen) prompt = `${seen}\n\n${prompt}`;
+    }
+
+    // The injection sits AFTER the chain, and that placement is the whole point.
+    // The obvious place is inside it — one more branch, one more template — and
+    // it is wrong: the follow-up branch above carries the reading position and
+    // the question, nothing more, so a graph built into the branches would reach
+    // the model on the first turn of a thread and silently vanish from the
+    // second one onwards. Nothing would
+    // look broken; the answers would just quietly stop knowing about the
+    // library. Prepending here is the only shape that cannot drift out of step
+    // with the branches, whatever anyone adds to them later.
+    if (graphCtx) prompt = `${t("ask.graphCtx")}\n<<<\n${graphCtx}\n>>>\n\n${prompt}`;
+    const usedGraph = !!graphCtx;
+
+    // Add or refine one tool row. Refine, because the first sight of a tool has
+    // no input yet: replacing the row in place is what turns a bare «WebSearch»
+    // into the query the model actually ran, on the same line, without the
+    // transcript jumping.
+    const noteTool = (b: ToolUse) => {
+      const note = toolNote(b);
+      if (!note) return;
+      // no id (a shape the CLI has never emitted, but the field is optional):
+      // fall back to a key that can never collide, and accept the duplicate
+      const key = b.id ?? `${b.name}#${liveRef.current.length}`;
+      const at = toolAtRef.current.get(key);
+      if (at === undefined) {
+        toolAtRef.current.set(key, liveRef.current.length);
+        liveRef.current = [...liveRef.current, note];
+      } else if (liveRef.current[at]?.what !== note.what) {
+        liveRef.current = liveRef.current.map((n, i) => (i === at ? note : n));
+      } else {
+        return; // the same row again — a repaint nobody would see
+      }
+      if (pathRef.current === path && tidRef.current === tid) setLive(liveRef.current);
+    };
 
     const onLine = (line: string) => {
       let j: NdLine;
@@ -623,13 +801,33 @@ export function AskSidebar({
         if (ev?.type === "content_block_delta" && ev.delta?.type === "text_delta" && ev.delta.text) {
           streamRef.current += ev.delta.text;
           if (pathRef.current === path && tidRef.current === tid) setStream(streamRef.current);
+        } else if (ev?.type === "content_block_start" && ev.content_block?.type === "tool_use") {
+          noteTool(ev.content_block);
+        } else if (ev?.type === "message_start" && ev.message?.model) {
+          modelId = ev.message.model;
+        }
+      } else if (j.type === "assistant") {
+        // имя модели приходит с самим ходом — фронт его просто не читал (WP-N)
+        if (j.message?.model) modelId = j.message.model;
+        for (const b of j.message?.content ?? []) {
+          if (b?.type === "tool_use") noteTool(b);
         }
       } else if (j.type === "result") {
         resultRef.current = j;
+      } else if (j.type === "system" && j.model) {
+        modelId = j.model; // событие старта сессии — на случай, если ход не назвался
       }
     };
 
     try {
+      // «Стоп» pressed while the graph was being read: the button is live from
+      // the moment busy went up, but there is no child process to kill yet, so
+      // the cancel would be swallowed and the answer to an abandoned question
+      // would arrive as if nothing had happened.
+      if (cancelledRef.current) {
+        push(path, tid, { role: "assistant", text: t("ask.cancelled"), error: true });
+        return;
+      }
       const mock = getMock();
       if (mock) {
         await replayMock(typeof mock === "function" ? mock(prompt) : mock, onLine, () => cancelledRef.current);
@@ -641,6 +839,11 @@ export function AskSidebar({
           sessionId: sid ?? undefined,
           systemPrompt: sysPrompt(bookTitle),
           onEvent: ch,
+          // Read now, not at mount: the reader may have just ticked the box in
+          // Settings, and «next question» is the promise that switch makes. The
+          // empty string is not «no opinion» — it is an explicit empty
+          // allow-list, which is what keeps the default ask offline.
+          tools: webAllowed() ? WEB_TOOLS : "",
         });
       } else {
         push(path, tid, { role: "assistant", text: t("ask.appOnly"), error: true });
@@ -648,11 +851,26 @@ export function AskSidebar({
       }
       // assertion: TS narrows the ref to its pre-await null, blind to onLine's writes
       const r = resultRef.current as NdLine | null;
+      // Where the answer came from travels WITH the answer: the graph mark and
+      // the tool rows are set on the message, not held in a side table, so they
+      // survive a thread switch and a restart. Refusals below get neither —
+      // there is no answer under them to attribute.
+      const from = { graph: usedGraph || undefined, tools: liveRef.current.length ? liveRef.current : undefined };
+      // (WP-N) Подпись едет с ответом по той же причине, что и строки поиска:
+      // кто ответил, читатель должен видеть и завтра утром, а не только пока
+      // сообщение свежее. Отказам подписи не достаётся — под ними нет ответа.
+      const by = { model: modelId || undefined, ms: Date.now() - t0 };
       if (r && !r.is_error) {
-        push(path, tid, { role: "assistant", text: r.result || streamRef.current || t("ask.emptyAnswer"), md: true });
+        push(path, tid, {
+          role: "assistant",
+          text: r.result || streamRef.current || t("ask.emptyAnswer"),
+          md: true,
+          ...from,
+          ...by,
+        });
         if (r.session_id) saveSid(path, tid, r.session_id); // --resume is per THREAD now
       } else if ((cancelledRef.current || r?.subtype === "cancelled") && streamRef.current) {
-        push(path, tid, { role: "assistant", text: streamRef.current, cancelled: true, md: true });
+        push(path, tid, { role: "assistant", text: streamRef.current, cancelled: true, md: true, ...from, ...by });
       } else if (r) {
         // the backend puts only the raw process detail in `result` (it never
         // words anything the reader sees) — the sentence is composed here
@@ -661,8 +879,13 @@ export function AskSidebar({
           r.subtype === "cancelled"
             ? t("ask.cancelled")
             : r.subtype === "error_process"
-              ? t("ask.exited", { detail: detail || (r.subtype ?? t("ask.errUnknownWhat")) })
+              ? t("ask.exited")
               : detail || t("ask.errUnknown", { what: r.subtype ?? t("ask.errUnknownWhat") });
+        // (WP-N) «вышел без ответа» больше не несёт сырой детали процесса:
+        // читателю остаётся одна причина, а глагол под ней — кнопка повтора в
+        // строке действий сообщения. Диагностика уходит в консоль, чтобы не
+        // пропасть совсем.
+        console.warn("ask failed", r.subtype, detail);
         push(path, tid, { role: "assistant", text, error: true });
       } else if (cancelledRef.current) {
         push(path, tid, { role: "assistant", text: t("ask.cancelled"), error: true });
@@ -672,7 +895,7 @@ export function AskSidebar({
     } catch (e) {
       const s = String(e);
       const text = s.startsWith("claude_not_found")
-        ? `${t("ask.notFound", { path: s.slice("claude_not_found:".length).trim() })}\n\n${installCommand(CLAUDE) ?? CLAUDE.docs}`
+        ? `${t("ask.notFound")}\n\n${installCommand(CLAUDE) ?? CLAUDE.docs}`
         : s.startsWith("busy")
           ? t("ask.busy")
           : t("ask.launchFail", { detail: s });
@@ -681,6 +904,10 @@ export function AskSidebar({
       busyRef.current = false;
       setBusy(false);
       setStream("");
+      // the rows are on the pushed message now; the live copy would otherwise
+      // hang under the next question before its own first tool line
+      liveRef.current = [];
+      setLive([]);
     }
   };
 
@@ -701,6 +928,16 @@ export function AskSidebar({
     window.setTimeout(() => setCopied((c) => (c === i ? -1 : c)), 1500);
   };
 
+  // (WP-N) Подпись под ответом: имя модели · время, тем же складом, что «HY-MT1.5
+  // · 0,8 с» у поповера перевода. Имени в записи может не быть — у бесед, что
+  // старше этого поля, и у потока, который его не назвал; тогда стоит имя самого
+  // CLI: отвечает здесь только он, и это единственное место, где приложение
+  // выходит в сеть. Секунды с сотой снизу — «0,0 с» не бывает.
+  const sigOf = (m: Msg) => {
+    const name = m.model ? modelName(m.model) : CLAUDE.name;
+    return m.ms ? t("ask.took", { model: name, sec: fmtNum(Math.max(0.1, m.ms / 1000)) }) : name;
+  };
+
   // «Повторить» on an assistant message: resend the user question that led to it
   const repeat = (i: number) => {
     if (busyRef.current) return;
@@ -715,8 +952,13 @@ export function AskSidebar({
   const canAsk = isTauri || !!getMock();
   const sendable = !!input.trim() || !!pending;
   const last = msgs[msgs.length - 1];
+  // видны и в пустой беседе: чипы направления B — заход в разговор, а не
+  // только продолжение уже начатого
   const showSuggestions =
-    !busy && canAsk && !!last && last.role === "assistant" && !last.error && sugHideAt !== turn.current;
+    !busy &&
+    canAsk &&
+    (msgs.length === 0 || (!!last && last.role === "assistant" && !last.error)) &&
+    sugHideAt !== turn.current;
 
   // ---- quick commands ----
   const hasAnswer = msgs.some((m) => m.role === "assistant" && !m.error);
@@ -745,7 +987,7 @@ export function AskSidebar({
     if (pend) setPending(null);
     if (input.startsWith("/")) setInput(""); // the typed «/filter» was the trigger, not a question
     taRef.current?.focus();
-    void ask(c.msg(page), pend);
+    void ask(c.msg(page), pend, c.here);
   };
 
   const onInput = (v: string) => {
@@ -800,21 +1042,21 @@ export function AskSidebar({
       ? new Date(ts).toLocaleTimeString(getLang(), { hour: "2-digit", minute: "2-digit" })
       : new Date(ts).toLocaleDateString(getLang(), { day: "numeric", month: "short" });
 
+  // «Беседа · сегодня» — заголовок панели съеден вкладкой, и здесь остаётся
+  // ровно то, чего у вкладки нет: КАКАЯ беседа открыта. Метка дня идёт со
+  // строчной — она стоит в середине фразы, а не начинает её.
+  const activeMeta = index.items.find((x) => x.id === index.active);
+  const when = (activeMeta ? groups.find((g) => g.items.includes(activeMeta))?.key : null) ?? t("ask.today");
+
   return (
-    <aside
-      data-asksb
-      className={`${open ? "flex" : "hidden"} relative shrink-0 flex-col h-full border-l border-neutral-300/70 dark:border-neutral-700/70 bg-neutral-50 dark:bg-neutral-800 text-sm text-neutral-800 dark:text-neutral-100`}
-      onKeyDownCapture={onKeyCapture}
-      style={{ width }}
-    >
-      {/* scoped here, not in App.css (contended): only the drag needs them */}
-      <style>{
-        "html[data-askresize]{cursor:col-resize;user-select:none}" +
-        "html[data-askresize] .toolbar{transition:none}"
-      }</style>
-      <ResizeHandle onWidth={onWidth} width={width} />
-      <div className="flex items-center gap-1 h-10 pl-3.5 pr-2 border-b border-neutral-200 dark:border-neutral-700 select-none shrink-0">
-        <span className="truncate font-medium">{t("ask.title")}</span>
+    // (WP-N) без data-asksb: маркер для цепочки Esc теперь один и стоит на
+    // <aside> панели — он накрывает все три вкладки, а не одну «Спросить»
+    <div className="relative flex min-h-0 flex-1 flex-col" onKeyDownCapture={onKeyCapture}>
+      {/* строка управления беседой: какая беседа открыта + беседы + новая */}
+      <div className="flex h-[30px] shrink-0 select-none items-center gap-1 px-3">
+        <span className="min-w-0 truncate text-xs text-neutral-400 dark:text-neutral-500">
+          {t("ask.threadOn", { when: when.toLocaleLowerCase(getLang()) })}
+        </span>
         <span className="flex-1" />
         <button
           aria-expanded={threadsOpen}
@@ -840,14 +1082,11 @@ export function AskSidebar({
           <SquarePenIcon className="size-3.5" />
           <span className="sr-only">{t("ask.newThreadTitle")}</span>
         </button>
-        <button className={HDR_BTN} onClick={onClose} title={t("ask.closeKey")}>
-          <IconClose />
-        </button>
       </div>
 
       {threadsOpen && (
         <div
-          className="absolute left-2 right-2 top-10 z-30 max-h-[60%] overflow-y-auto rounded-xl border border-neutral-200 bg-white py-1 shadow-xl dark:border-neutral-700 dark:bg-neutral-800"
+          className="absolute left-2 right-2 top-8 z-30 max-h-[60%] overflow-y-auto rounded-xl border border-neutral-200 bg-white py-1 shadow-xl dark:border-neutral-700 dark:bg-neutral-800"
           data-askthreads
         >
           <div className="px-3 pb-1 pt-1.5 text-xs font-medium text-neutral-500 dark:text-neutral-400 select-none">
@@ -865,8 +1104,11 @@ export function AskSidebar({
               </div>
               {g.items.map((th) => (
                 <div
-                  className={`group/th relative px-3 py-1.5 transition-colors hover:bg-neutral-100 dark:hover:bg-neutral-700/60 ${
-                    th.id === index.active ? "bg-neutral-100/70 dark:bg-neutral-700/40" : ""
+                  // (WP-N) наведение — единственный язык приложения, открытая
+                  // беседа — та же заливка «выбрано», что у строк палитры и
+                  // контекстного меню; полоска слева и так называет активную
+                  className={`group/th relative px-3 py-1.5 transition-colors hover:bg-neutral-900/5 dark:hover:bg-neutral-100/10 ${
+                    th.id === index.active ? "bg-neutral-100 dark:bg-neutral-100/8" : ""
                   }`}
                   key={th.id}
                 >
@@ -943,6 +1185,11 @@ export function AskSidebar({
             ) : (
               <Message from="assistant" key={i}>
                 <MessageContent>
+                  {/* what the answer cost, ABOVE it: this is the order it
+                      happened in, and the reader who scrolls back to an answer
+                      full of facts the book does not contain should meet the
+                      searches before the prose, not after it */}
+                  {m.tools?.map((n, k) => <ToolRow key={k} note={n} />)}
                   {m.md && !m.error ? (
                     <MessageResponse>{m.text}</MessageResponse>
                   ) : (
@@ -959,23 +1206,44 @@ export function AskSidebar({
                       {m.text}
                     </span>
                   )}
+                  {/* «По графу библиотеки» — под ответом, в том же тихом
+                      регистре, что и «Остановлено». Это не похвальба фичей:
+                      ответ, опирающийся на другие книги читателя, обязан
+                      сказать, откуда он их взял, иначе совпадение выглядит
+                      всезнанием. Ставится только там, где блок и правда ушёл
+                      в промпт. */}
+                  {m.graph && (
+                    <span className="text-xs text-neutral-500 dark:text-neutral-400">{t("ask.graphUsed")}</span>
+                  )}
                   {m.cancelled && (
                     <span className="text-xs text-neutral-500 dark:text-neutral-400">{t("ask.stopped")}</span>
                   )}
                 </MessageContent>
-                {!m.error && (
+                {/* (WP-N) У отказа тоже есть строка действий, и в ней ровно одна
+                    кнопка — повтор: это тот самый случай, когда действие обязано
+                    стоять рядом с причиной (§1), поэтому сами тексты отказов
+                    глагола больше не несут. Копировать нечего: копируют ответ. */}
+                {/* (WP-N) Подпись-факт слева от кнопок и, в отличие от них, без
+                    угасания: чей это ответ, видно без наведения — «Спросить»
+                    единственной в приложении уходит в сеть. */}
+                <div className="-ml-1.5 flex items-center gap-1.5">
+                  {!m.error && (
+                    <span className="pl-1.5 text-[11px] text-neutral-500 dark:text-neutral-400">{sigOf(m)}</span>
+                  )}
                   <MessageActions
-                    className={`-ml-1.5 transition-opacity ${
+                    className={`transition-opacity ${
                       i === msgs.length - 1 ? "opacity-100" : "opacity-0 group-hover:opacity-100"
                     }`}
                   >
-                    <MessageAction
-                      className="text-neutral-500 dark:text-neutral-400"
-                      onClick={() => copyMsg(i, m.text)}
-                      tooltip={copied === i ? t("ui.copied") : t("ui.copy")}
-                    >
-                      {copied === i ? <CheckIcon /> : <CopyIcon />}
-                    </MessageAction>
+                    {!m.error && (
+                      <MessageAction
+                        className="text-neutral-500 dark:text-neutral-400"
+                        onClick={() => copyMsg(i, m.text)}
+                        tooltip={copied === i ? t("ui.copied") : t("ui.copy")}
+                      >
+                        {copied === i ? <CheckIcon /> : <CopyIcon />}
+                      </MessageAction>
+                    )}
                     <MessageAction
                       className="text-neutral-500 dark:text-neutral-400"
                       disabled={busy}
@@ -985,13 +1253,17 @@ export function AskSidebar({
                       <RefreshCcwIcon />
                     </MessageAction>
                   </MessageActions>
-                )}
+                </div>
               </Message>
             ),
           )}
           {busy && (
             <Message data-askstream from="assistant">
               <MessageContent>
+                {/* the wait with the web on is not the wait it used to be: a
+                    search can take ten seconds before the first token, and the
+                    spinner alone said nothing about where they went */}
+                {live.map((n, k) => <ToolRow key={k} note={n} />)}
                 {stream ? (
                   <MessageResponse>{stream}</MessageResponse>
                 ) : (
@@ -1010,11 +1282,14 @@ export function AskSidebar({
           // it becomes two rows instead of hiding a chip behind a scrollbar that
           // Radix renders as nothing
           <Suggestions className="mb-1.5" wrap>
-            {suggestions().map((s) => (
+            {suggestions(page).map((s) => (
               <Suggestion
                 className="h-6 px-2.5 text-xs text-neutral-600 dark:text-neutral-300"
                 key={s.label}
-                onClick={() => void ask(s.msg, null)}
+                // чип — вопрос про то, что читатель ВИДИТ: с ним уходит текст
+                // открытой страницы, иначе модель отвечает по обрывкам из
+                // истории беседы (WP-N)
+                onClick={() => void ask(s.msg, null, true)}
                 suggestion={s.label}
               />
             ))}
@@ -1062,7 +1337,7 @@ export function AskSidebar({
                   className={`flex w-full items-start gap-2.5 px-3 py-1.5 text-left transition-colors ${
                     why
                       ? "cursor-default text-neutral-400 dark:text-neutral-500"
-                      : `hover:bg-neutral-100 dark:hover:bg-neutral-700/60 ${sel ? "bg-neutral-100 dark:bg-neutral-700/60" : ""}`
+                      : `hover:bg-neutral-900/5 dark:hover:bg-neutral-100/10 ${sel ? "bg-neutral-100 dark:bg-neutral-100/8" : ""}`
                   }`}
                   disabled={!!why}
                   key={c.id}
@@ -1122,6 +1397,6 @@ export function AskSidebar({
           </PromptInputToolbar>
         </PromptInput>
       </div>
-    </aside>
+    </div>
   );
 }

@@ -14,7 +14,10 @@ import type { MermaidConfig } from "mermaid";
 // never encodes a quantity in a hue, and it never reaches for the --chart-*
 // ramp, which belongs to charts alone.
 
-export const UI_FONT = '"Inter", "Segoe UI Variable Text", "Segoe UI", system-ui, sans-serif';
+// (WP-N) буква в буква --font-sans из App.css: диаграмма — часть ответа во
+// вкладке «Спросить», и набирается тем же, чем набран сам ответ. Стек, а не
+// var(--font-sans): mermaid запекает значение в SVG, переменных там нет.
+export const UI_FONT = '"Golos Text", "Segoe UI Variable Text", "Segoe UI", system-ui, sans-serif';
 
 /// Base config. Two lines carry the security of the whole feature:
 ///

@@ -10,13 +10,16 @@ import { useCallback, useEffect, useState } from "react";
 // flex sibling of the panel, so the panel can never cover the book — but it CAN
 // squeeze it, hence READ_MIN.
 
-export const ASK_W_DEFAULT = 400;
+// (WP-N) Direction B fixes the panel: 380 by default, dragged between 320 and
+// 560. The old ceiling was a share of the window (60%), which on a wide monitor
+// let the panel grow past the point where it reads as a panel at all.
+export const ASK_W_DEFAULT = 380;
 export const ASK_W_MIN = 320;
+export const ASK_W_MAX = 560;
 const READ_MIN = 360; // the book keeps at least this much, at any window size
 const ASK_W_KEY = "pdfer:askw";
 
-export const askWMax = () =>
-  Math.max(ASK_W_MIN, Math.min(Math.round(window.innerWidth * 0.6), window.innerWidth - READ_MIN));
+export const askWMax = () => Math.max(ASK_W_MIN, Math.min(ASK_W_MAX, window.innerWidth - READ_MIN));
 export const clampAskW = (w: number) => Math.max(ASK_W_MIN, Math.min(Math.round(w), askWMax()));
 
 const stored = () => {

@@ -22,6 +22,59 @@ export type PaletteCommand = {
 
 type BookEntry = { path: string; name: string; title: string };
 type Row = { key: string; label: string; hint?: string; tag?: string; run: () => void };
+// A shelf of the empty palette: heading, its commands, and — for «Переход» —
+// the one line that is syntax rather than a command.
+type Section = { id: Group; title: string; rows: Row[]; note?: { label: string; hint: string } };
+
+// (WP-N) The palette is the only surface where every command stands next to
+// every other, so it is the only one that has to shelve them — and to name
+// them as verbs: a button in the pill can be «Библиотека», a row among twenty
+// cannot. Both tables key off the command id, which App owns and never
+// translates; an id nobody claimed lands on the first shelf.
+type Group = "book" | "view" | "tr" | "jump";
+
+const GROUP: Record<string, Group> = {
+  find: "book",
+  open: "book",
+  lib: "book",
+  graph: "book",
+  settings: "book",
+  keys: "book",
+  about: "book",
+  view: "view",
+  zin: "view",
+  zout: "view",
+  zwidth: "view",
+  zpage: "view",
+  c1: "view",
+  c2: "view",
+  cauto: "view",
+  dark: "view",
+  trstart: "tr",
+  trpause: "tr",
+  selorig: "tr",
+  gloss: "tr",
+  exportpdf: "tr",
+  export: "tr",
+  ask: "tr",
+  toc: "jump",
+  back: "jump",
+  fwd: "jump",
+};
+
+const RENAMED: Record<string, () => string> = {
+  lib: () => t("cmd.openLibrary"),
+  zwidth: () => t("cmd.fitWidth"),
+};
+
+// Order is fixed — the reader learns where things live and stops reading the
+// headings.
+const SHELVES: { id: Group; title: () => string }[] = [
+  { id: "book", title: () => t("pal.grpBook") },
+  { id: "view", title: () => t("pal.grpView") },
+  { id: "tr", title: () => t("pal.grpTr") },
+  { id: "jump", title: () => t("pal.grpJump") },
+];
 
 const WORD_START = /[\s\-–—_.():,/\\«»"']/;
 
@@ -86,11 +139,32 @@ export function Palette({
     }
   }, []);
 
-  const rows = useMemo<Row[]>(() => {
+  // Two shapes, one list. Empty query: the cheat-sheet, shelved and in App's
+  // order. Typed query: one flat run of everything that matched, best first —
+  // headings there would only fight the ranking. (WP-N)
+  const { rows, sections } = useMemo<{ rows: Row[]; sections: Section[] | null }>(() => {
     const q = query.trim();
+    const named = (c: PaletteCommand) => RENAMED[c.id]?.() ?? c.label;
+
+    if (!q) {
+      const shelves: Section[] = SHELVES.map(({ id, title }) => ({
+        id,
+        title: title(),
+        rows: commands
+          .filter((c) => (GROUP[c.id] ?? "book") === id)
+          .map((c) => ({ key: c.id, label: named(c), hint: c.hint, run: c.run })),
+      })).filter((sh) => sh.rows.length > 0);
+      // «Перейти на страницу» is not a command but the syntax for one — typing
+      // digits IS the command — and the empty list is the only place it can be
+      // taught. It names the range and stays out of the keyboard's way.
+      const jump = shelves.find((sh) => sh.id === "jump");
+      if (jump && numPages) jump.note = { label: t("cmd.goToPage"), hint: `1–${numPages}` };
+      return { rows: shelves.flatMap((sh) => sh.rows), sections: shelves };
+    }
+
     const scored: { s: number; row: Row }[] = [];
     // digits → «Page N», always on top
-    if (q && /^\d+$/.test(q) && numPages) {
+    if (/^\d+$/.test(q) && numPages) {
       const n = Math.min(numPages, Math.max(1, parseInt(q, 10)));
       scored.push({
         s: 1e6,
@@ -98,28 +172,27 @@ export function Palette({
       });
     }
     for (const c of commands) {
-      const s = q ? Math.max(fuzzy(q, c.label) ?? -1, c.keywords ? (fuzzy(q, c.keywords) ?? -1) : -1) : 0;
-      if (s >= 0) scored.push({ s: s + 1, row: { key: c.id, label: c.label, hint: c.hint, run: c.run } });
+      const label = named(c);
+      const s = Math.max(fuzzy(q, label) ?? -1, c.keywords ? (fuzzy(q, c.keywords) ?? -1) : -1);
+      if (s >= 0) scored.push({ s: s + 1, row: { key: c.id, label, hint: c.hint, run: c.run } });
     }
-    if (q) {
-      // books join only for a non-empty query (the empty palette is a command
-      // cheat-sheet), capped so one common word can't flood the list
-      books
-        .filter((b) => b.path !== currentPath)
-        .map((b) => ({ b, s: fuzzy(q, `${b.title} ${b.name}`) }))
-        .filter((x): x is { b: BookEntry; s: number } => x.s !== null)
-        .sort((a, b) => b.s - a.s)
-        .slice(0, 6)
-        .forEach(({ b, s }) =>
-          scored.push({
-            s,
-            row: { key: `book:${b.path}`, label: b.title || b.name, tag: t("pal.bookTag"), run: () => onOpenBook(b.path) },
-          }),
-        );
-      // full-text fallback — always last (score below any match)
-      if (onFind) scored.push({ s: -1, row: { key: "findq", label: t("pal.findQ", { q }), run: () => onFind(q) } });
-    }
-    return scored.sort((a, b) => b.s - a.s).map((x) => x.row);
+    // books join only for a non-empty query (the empty palette is a command
+    // cheat-sheet), capped so one common word can't flood the list
+    books
+      .filter((b) => b.path !== currentPath)
+      .map((b) => ({ b, s: fuzzy(q, `${b.title} ${b.name}`) }))
+      .filter((x): x is { b: BookEntry; s: number } => x.s !== null)
+      .sort((a, b) => b.s - a.s)
+      .slice(0, 6)
+      .forEach(({ b, s }) =>
+        scored.push({
+          s,
+          row: { key: `book:${b.path}`, label: b.title || b.name, tag: t("pal.bookTag"), run: () => onOpenBook(b.path) },
+        }),
+      );
+    // full-text fallback — always last (score below any match)
+    if (onFind) scored.push({ s: -1, row: { key: "findq", label: t("pal.findQ", { q }), run: () => onFind(q) } });
+    return { rows: scored.sort((a, b) => b.s - a.s).map((x) => x.row), sections: null };
   }, [query, commands, books, numPages, currentPath, onGoToPage, onOpenBook, onFind]);
 
   useEffect(() => setSel(0), [query]);
@@ -150,6 +223,31 @@ export function Palette({
     }
   };
 
+  // one row, wherever it sits: the shelved list and the ranked list draw the
+  // same button, and `i` is its place in the flat list the keyboard walks
+  const renderRow = (r: Row, i: number) => (
+    <button
+      key={r.key}
+      data-idx={i}
+      data-sel={i === cur || undefined}
+      className={`w-full text-left px-2.5 py-1.5 rounded-lg flex items-center gap-2 ${
+        i === cur ? "bg-neutral-100 dark:bg-neutral-100/8" : ""
+      }`}
+      // preserve input focus (Enter keeps working) — same pattern as FindBar's buttons
+      onMouseDown={(e) => e.preventDefault()}
+      onMouseMove={() => setSel(i)} // move only — scroll under a still cursor must not steal selection
+      onClick={() => run(r)}
+    >
+      <span className="flex-1 min-w-0 truncate">{r.label}</span>
+      {r.tag && <span className="shrink-0 text-xs text-neutral-500 dark:text-neutral-400">{r.tag}</span>}
+      {r.hint && (
+        <span className="shrink-0 text-xs text-neutral-500 dark:text-neutral-400 tabular-nums whitespace-nowrap">
+          {r.hint}
+        </span>
+      )}
+    </button>
+  );
+
   return (
     <div
       data-palette
@@ -174,29 +272,24 @@ export function Palette({
         >
           {rows.length === 0 ? (
             <div className="px-2.5 py-1.5 text-neutral-500 dark:text-neutral-400 cursor-default">{t("ui.notFound")}</div>
+          ) : sections ? (
+            sections.map((sh, si) => {
+              const offset = sections.slice(0, si).reduce((n, x) => n + x.rows.length, 0);
+              return (
+                <div key={sh.id}>
+                  <div className="px-2.5 pt-2 pb-1 text-[11px] text-neutral-500 dark:text-neutral-400">{sh.title}</div>
+                  {sh.rows.map((r, k) => renderRow(r, offset + k))}
+                  {sh.note && (
+                    <div className="flex cursor-default items-center gap-2 px-2.5 py-1.5 text-neutral-500 dark:text-neutral-400">
+                      <span className="min-w-0 flex-1 truncate">{sh.note.label}</span>
+                      <span className="shrink-0 text-xs tabular-nums whitespace-nowrap">{sh.note.hint}</span>
+                    </div>
+                  )}
+                </div>
+              );
+            })
           ) : (
-            rows.map((r, i) => (
-              <button
-                key={r.key}
-                data-idx={i}
-                data-sel={i === cur || undefined}
-                className={`w-full text-left px-2.5 py-1.5 rounded-lg flex items-center gap-2 ${
-                  i === cur ? "bg-neutral-100 dark:bg-neutral-700/70" : ""
-                }`}
-                // preserve input focus (Enter keeps working) — same pattern as FindBar's buttons
-                onMouseDown={(e) => e.preventDefault()}
-                onMouseMove={() => setSel(i)} // move only — scroll under a still cursor must not steal selection
-                onClick={() => run(r)}
-              >
-                <span className="flex-1 min-w-0 truncate">{r.label}</span>
-                {r.tag && <span className="shrink-0 text-xs text-neutral-500 dark:text-neutral-400">{r.tag}</span>}
-                {r.hint && (
-                  <span className="shrink-0 text-xs text-neutral-500 dark:text-neutral-400 tabular-nums whitespace-nowrap">
-                    {r.hint}
-                  </span>
-                )}
-              </button>
-            ))
+            rows.map((r, i) => renderRow(r, i))
           )}
         </div>
       </div>
@@ -239,6 +332,13 @@ function groups(): { name: string; rows: [string, string][] }[] {
         [K("Ctrl+K"), t("keys.palette")],
         [K("Ctrl+F"), t("keys.find")],
         [K("Ctrl+O"), t("keys.openFile")],
+        // the graph is a shelf-wide surface, not a per-book one, so it sits
+        // with «Open file» rather than with the reading keys
+        [K("Ctrl+G"), t("gr.title")],
+        // (WP-N) Ctrl+F is listed twice on purpose: over a book it is «find in
+        // page», over the graph it is «find in graph», and the second binding
+        // exists in the graph regardless of whether this sheet admits it
+        [K("Ctrl+F"), t("gr.search")],
         [K("Ctrl+,"), t("keys.settings")],
         ["Esc", t("keys.close")],
         [K("? / Ctrl+/"), t("keys.keys")],
@@ -285,8 +385,10 @@ export function ShortcutsOverlay({ onClose }: { onClose: () => void }) {
           {groups().map((g) => (
             <div key={g.name}>
               <div className="mb-1 text-xs font-medium text-neutral-500 dark:text-neutral-400">{g.name}</div>
-              {g.rows.map(([keys, label]) => (
-                <div key={keys} className="flex items-center justify-between gap-3 py-[3px]">
+              {/* по индексу, а не по имени клавиши: Ctrl+F стоит в списке дважды
+                  (книга и граф), и одинаковые ключи React ссорят между собой */}
+              {g.rows.map(([keys, label], i) => (
+                <div key={i} className="flex items-center justify-between gap-3 py-[3px]">
                   <span className="text-neutral-600 dark:text-neutral-300">{label}</span>
                   <span className="shrink-0 rounded-md bg-neutral-100 dark:bg-neutral-900/60 px-1.5 py-0.5 text-[11px] tabular-nums text-neutral-600 dark:text-neutral-400 whitespace-nowrap">
                     {keys}

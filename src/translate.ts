@@ -327,7 +327,11 @@ export type ChatMessage = { role: "system" | "user" | "assistant"; content: stri
 export async function auxComplete(
   messages: ChatMessage[],
   signal?: AbortSignal,
-  opts?: { temperature?: number },
+  // maxTokens defaults to 512 — plenty for one term's rendering, and far too
+  // little for a caller that asks for a dozen answers in one reply (graphgen's
+  // typing chunks), where the truncation would look like a model that simply
+  // stopped answering halfway down the list.
+  opts?: { temperature?: number; maxTokens?: number },
 ): Promise<string> {
   await auxPool.acquire(signal);
   try {
@@ -338,7 +342,7 @@ export async function auxComplete(
         messages,
         temperature: opts?.temperature ?? 0.2,
         top_p: 0.8,
-        max_tokens: 512,
+        max_tokens: opts?.maxTokens ?? 512,
         chat_template_kwargs: { enable_thinking: false },
       }),
       signal,

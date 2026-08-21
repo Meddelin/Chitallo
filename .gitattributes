@@ -19,3 +19,6 @@
 # diffable locally — a dependency change is exactly the thing worth reading.
 package-lock.json linguist-generated=true
 src-tauri/Cargo.lock linguist-generated=true
+
+# Web fonts are binary: shipped subsets, never diffed, never normalised.
+*.woff2 binary

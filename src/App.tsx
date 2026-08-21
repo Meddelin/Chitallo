@@ -21,6 +21,10 @@ import type { CtxItem } from "./ContextMenu";
 import { AskSidebar } from "./AskSidebar";
 import { useAskWidth } from "./askwidth";
 import type { AskSeed } from "./AskSidebar";
+import { Panel } from "./Panel";
+import type { PanelTab } from "./Panel";
+import { TranslatePanel } from "./TranslatePanel";
+import type { TrExportError, TrState } from "./TranslatePanel";
 import { FIG_CONTAIN, buildFrags, growParagraph, interArea, medianLineH, paraText } from "./paragraphs";
 import type { FigureRegion, Word } from "./paragraphs";
 import type { Rect } from "./crops";
@@ -29,14 +33,16 @@ import type { CropWindow } from "./crops";
 import { splitCitations } from "./cite";
 import * as booktranslate from "./booktranslate";
 import type { TrParagraph } from "./booktranslate";
-import { hydrateGlossary, loadGlossaryText, saveGlossaryText } from "./translate";
+import { hydrateGlossary, loadGlossaryText, parseGlossary, saveGlossaryText } from "./translate";
 import * as glossarygen from "./glossarygen";
-import { ModelSetupModal, Spinner, dlBusy, dlPct, fetchModelStatus, restartModel, sizeLabel, statusUp, useDownload } from "./ModelSetup";
+import { ModelSetupModal, fetchModelStatus, restartModel, statusUp, useDownload } from "./ModelSetup";
 import { AboutModal } from "./About";
 import { SettingsModal, TR_FONT_DEFAULT, TR_FONT_MAX, TR_FONT_MIN } from "./Settings";
 import { exportTranslationPdf, exportTranslationToDownloads, exportTranslationTxt } from "./export";
 import * as exportmod from "./export";
-import { IconChevronDown, IconColumns, IconMoon, IconSliders, IconSun } from "./icons";
+import { IconColumns, IconMoon, IconSun } from "./icons";
+// (WP-N) единственный глиф пилюли, которого нет в icons.tsx: створка панели
+import { PanelRightIcon } from "lucide-react";
 import "./App.css";
 import { baseName, host, isMac, joinPath, macKeys } from "./host";
 import { copyToClipboard } from "./clipboard";
@@ -50,22 +56,22 @@ pdfjs.GlobalWorkerOptions.workerSrc = workerUrl;
 const K = (s: string) => (isMac() ? macKeys(s) : s);
 
 const DEFAULT_SCALE = 1.25;
-// every open path (cover, Ctrl+O, palette, pdfer:last) fails into one toast
 const PAGE_GAP = 16;
-// «Спросить» sidebar width: the reading area shrinks by it (flex row, no
-// overlay), the fixed toolbar shifts left by half to stay centered over it.
-// Live value + drag/persist live in AskSidebar (useAskWidth, pdfer:askw).
+// Panel width: the reading area shrinks by it (flex row, no overlay), the
+// fixed toolbar shifts left by half to stay centered over it. Live value +
+// drag/persist live in askwidth.ts (useAskWidth, pdfer:askw); the drag handle
+// belongs to Panel.tsx (WP-N).
 
-// full-width action row of the «Перевод» dropdown menu
+// full-width row of a toolbar flyout (only the zoom presets are left — the
+// «Перевод ▾» menu became the panel's third tab, WP-N)
+// (WP-N) наведение здесь — тот же единственный язык, что у TB_BTN ниже и у
+// строк ContextMenu/Palette: раньше эта строка красилась сплошным neutral-700,
+// и одна выпадашка наводилась не так, как весь остальной интерфейс
 const MENU_ROW =
-  "w-full text-left px-2.5 py-1.5 rounded-lg transition-colors hover:bg-neutral-100 dark:hover:bg-neutral-700/70 whitespace-nowrap";
+  "w-full text-left px-2.5 py-1.5 rounded-lg transition-colors hover:bg-neutral-900/5 dark:hover:bg-neutral-100/10 whitespace-nowrap";
 // pill/toolbar controls: ONE hover language (WP-K) — a quiet bg tint, never an
 // opacity dim; padding is added per call site
 const TB_BTN = "rounded-md transition-colors hover:bg-neutral-900/5 dark:hover:bg-neutral-100/10";
-// quiet footer rows of the «Перевод» menu (statuses that double as actions):
-// explicit ≥4.5:1 colors, hover strengthens the text — the link grammar
-const MENU_QUIET =
-  "w-full text-left text-neutral-500 dark:text-neutral-400 transition-colors hover:text-neutral-700 dark:hover:text-neutral-200";
 
 type Size = { w: number; h: number };
 // zoom fit presets: «По ширине» / «Страница целиком» — sticky until a manual zoom
@@ -110,6 +116,15 @@ function fmtEta(ms?: number): string {
   return t("tr.etaHour", { n: h < 10 ? fmtNum(h) : Math.round(h) });
 }
 
+// (WP-N) причина отказа экспорта — фрагмент с маленькой буквы, каким его пишет
+// каталог («нет места на диске»). Когда сказать нечего, остаётся машинный
+// текст: он честнее, чем выдуманная причина
+function exportReason(e: unknown): string {
+  const s = String(e).replace(/^Error:\s*/, "");
+  if (/ENOSPC|no space|disk\s*full|not enough space/i.test(s)) return t("err.noDiskSpace");
+  return s.slice(0, 80);
+}
+
 // for 1-2 word selections: pull the containing sentence out of the surrounding
 // text (text-layer spans, or the whole paragraph block for reflowed-translation
 // selections), so the model can disambiguate the word
@@ -151,19 +166,11 @@ function sentenceAround(range: Range, selText: string): string | undefined {
   return sent.split(" ").length > selText.split(" ").length ? sent : undefined;
 }
 
-// «Спросить» context: page number + surrounding page text for the model. The
-// page element the selection starts in supplies its text layer (orig mode) or
-// reflowed translation blocks (tr mode); capped to ~2200 chars around the
-// selection so long pages don't bloat the prompt.
-const ASK_CTX_CAP = 2200;
-function extractAskContext(selText: string): { page?: number; pageText?: string } {
-  const s = document.getSelection();
-  if (!s || s.rangeCount === 0) return {};
-  const n = s.getRangeAt(0).startContainer;
-  const el = n instanceof Element ? n : n.parentElement;
-  const pageEl = el?.closest("[data-page]") as HTMLElement | null;
-  if (!pageEl) return {};
-  const page = Number(pageEl.dataset.page) || undefined;
+// Весь текст ОДНОЙ страницы, как её сейчас видно: переведённая страница отдаёт
+// свои блоки, обычная — слой текста pdf.js. (WP-N) Разбор вынесен сюда, потому
+// что дорог к модели стало две: выделение (extractAskContext) и вопрос про то,
+// что открыто на экране (askPageText).
+function pageElText(pageEl: HTMLElement): string {
   let txt = "";
   const tr = pageEl.querySelector(".trPage");
   if (tr) {
@@ -177,6 +184,23 @@ function extractAskContext(selText: string): { page?: number; pageText?: string 
       .replace(/\s+/g, " ")
       .trim();
   }
+  return txt;
+}
+
+// «Спросить» context: page number + surrounding page text for the model. The
+// page element the selection starts in supplies its text layer (orig mode) or
+// reflowed translation blocks (tr mode); capped to ~2200 chars around the
+// selection so long pages don't bloat the prompt.
+const ASK_CTX_CAP = 2200;
+function extractAskContext(selText: string): { page?: number; pageText?: string } {
+  const s = document.getSelection();
+  if (!s || s.rangeCount === 0) return {};
+  const n = s.getRangeAt(0).startContainer;
+  const el = n instanceof Element ? n : n.parentElement;
+  const pageEl = el?.closest("[data-page]") as HTMLElement | null;
+  if (!pageEl) return {};
+  const page = Number(pageEl.dataset.page) || undefined;
+  let txt = pageElText(pageEl);
   if (!txt) return { page };
   if (txt.length > ASK_CTX_CAP) {
     const pos = txt.toLowerCase().indexOf(selText.toLowerCase());
@@ -186,6 +210,40 @@ function extractAskContext(selText: string): { page?: number; pageText?: string 
       (start > 0 ? "…" : "") + txt.slice(start, start + ASK_CTX_CAP) + (start + ASK_CTX_CAP < txt.length ? "…" : "");
   }
   return { page, pageText: txt };
+}
+
+// (WP-N) Текст того, что читатель ВИДИТ СЕЙЧАС, — для вопросов, которые про
+// «здесь»: чипы-подсказки и команды «страница» / «наглядно». Номер страницы им
+// не помощник, нужен сам текст.
+//
+// В две колонки на экране два листа, и берутся оба: читатель смотрит на
+// разворот целиком, а пилюля называет лишь левый его лист. Каждый блок уходит
+// в промпт со СВОИМ номером — так модель не выдаёт соседнюю страницу за
+// спрошенную. Бюджет — две страницы текста на всю выборку, иначе «авто» на
+// мелком масштабе (пять листов в ряду) утащил бы в промпт полглавы.
+function askPageText(root: HTMLElement | null, page: number): { page: number; text: string }[] {
+  const first = root?.querySelector<HTMLElement>(`[data-page="${page}"]`);
+  if (!root || !first) return [];
+  // страницы одного ряда сетки делят offsetTop — тот же признак «ряда», по
+  // которому onScroll выбирает текущую страницу
+  const row = Array.from(root.querySelectorAll<HTMLElement>("[data-page]")).filter(
+    (c) => c.offsetTop === first.offsetTop && Number(c.dataset.page) >= page,
+  );
+  const out: { page: number; text: string }[] = [];
+  let left = 2 * ASK_CTX_CAP;
+  for (const el of row.length ? row : [first]) {
+    const n = Number(el.dataset.page);
+    // страница ещё не отрисована (текстового слоя нет) — молча пропускаем:
+    // пустой блок в промпте хуже отсутствующего
+    const full = n ? pageElText(el) : "";
+    if (!full) continue;
+    const cap = Math.min(ASK_CTX_CAP, left);
+    const text = full.length > cap ? `${full.slice(0, cap)}…` : full;
+    out.push({ page: n, text });
+    left -= text.length;
+    if (left <= 0) break;
+  }
+  return out;
 }
 
 // Поле ввода текста — там системное меню незаменимо: вставка требует прав на
@@ -917,14 +975,21 @@ export default function App() {
   // Chitallo's right-click menu (см. ContextMenu.tsx): items are built per event
   const [ctxMenu, setCtxMenu] = useState<{ at: Anchor; items: CtxItem[]; keyboard?: boolean } | null>(null);
   const [glossOpen, setGlossOpen] = useState(false);
-  // ---- «Спросить» sidebar ----
+  // ---- правая панель: «Оглавление · Спросить · Перевод» (WP-N) ----
   // open state is per SESSION (sessionStorage), not per book; the thread
-  // itself is per book (AskSidebar persists it in localStorage)
-  const [askOpen, setAskOpen] = useState(() => sessionStorage.getItem("pdfer:ask:open") === "1");
+  // itself is per book (AskSidebar persists it in localStorage). Ключ прежний —
+  // сайдбар «Спросить» стал одной из вкладок, а не отдельной поверхностью.
+  const [panelOpen, setPanelOpen] = useState(() => sessionStorage.getItem("pdfer:ask:open") === "1");
+  const [panelTab, setPanelTab] = useState<PanelTab>(() => {
+    const s = sessionStorage.getItem("pdfer:panel:tab");
+    return s === "outline" || s === "translate" ? s : "ask";
+  });
   // width is a workspace preference (pdfer:askw) — the panel owns the drag
   const [askW, setAskW] = useAskWidth();
   const [askSeed, setAskSeed] = useState<AskSeed | null>(null);
   const askSeedIdRef = useRef(0);
+  // сообщений в открытой беседе — число на ярлыке вкладки «Спросить»
+  const [askCount, setAskCount] = useState(0);
   // ---- Ctrl+F find bar ----
   const [findOpen, setFindOpen] = useState(false);
   // bumped on every Ctrl+F: an already-open bar refocuses + selects its input
@@ -948,21 +1013,15 @@ export default function App() {
     const v = parseFloat(localStorage.getItem("pdfer:trfont") ?? "");
     return Number.isFinite(v) && v >= TR_FONT_MIN && v <= TR_FONT_MAX ? v : TR_FONT_DEFAULT;
   });
-  // ---- page-navigation flyout (indicator click: go-to-page + оглавление) ----
-  const [navOpen, setNavOpen] = useState(false);
   // ---- zoom-preset flyout (клик по «125%»: По ширине / целиком / числа) ----
   const [zoomOpen, setZoomOpen] = useState(false);
-  // ---- «Перевод» dropdown menu ----
-  const [menuOpen, setMenuOpen] = useState(false);
-  // inline confirm for «Перезапустить перевод»; reset whenever the menu closes
-  const [confirmRestart, setConfirmRestart] = useState(false);
   // llama-server state, single vocabulary via ModelSetup.fetchModelStatus:
   // "none"|"external"|"starting"|"spawned"|"dead"; null until the first fetch.
-  // Feeds the trigger dot, the menu status row and the startTr gate.
+  // Feeds the panel's model line and the startTr gate.
   const [modelStatus, setModelStatus] = useState<string | null>(null);
   // model setup modal (license + user-initiated download) — where none/dead route
   const [setupOpen, setSetupOpen] = useState(false);
-  // main model download, surfaced in the menu row while it runs
+  // main model download, surfaced in the panel's model line while it runs
   const dlMain = useDownload("main");
   // ---- whole-book translation state ----
   const [viewMode, setViewMode] = useState<ViewMode>("orig");
@@ -972,17 +1031,20 @@ export default function App() {
   // booktranslate's manager and outlive the doc; other books' runs are
   // invisible here — the toolbar reflects only the matching book)
   const [run, setRun] = useState<booktranslate.RunInfo | null>(null);
-  // a run somewhere (any book) is waiting out a model outage → sticky toast
+  // a run somewhere (any book) is waiting out a model outage: янтарная точка
+  // на ярлыке вкладки «Перевод» здесь и строка на карточке в библиотеке (WP-N)
   const [anyStall, setAnyStall] = useState(false);
-  // startTr is waiting for a "starting" model to come up (auto-starts then)
-  const [trWait, setTrWait] = useState(false);
+  // startTr is waiting for a "starting" model to come up (auto-starts then).
+  // Ref, not state: ждать видно по строке модели в карточке «Перевод»
   const trWaitRef = useRef(false);
   // text-layer probe of the open book: null = probing, false = scan (no text)
   const [hasText, setHasText] = useState<boolean | null>(null);
   const hasTextProbeRef = useRef<Promise<boolean> | null>(null);
-  // transient bottom toast (auto-hides); sticky engine states override it in
-  // render. An optional action renders as an inline button («Открыть» after
-  // export) — such toasts live longer, a button needs time to be clicked
+  // transient bottom toast (auto-hides). (WP-N) От всех тостов остался один —
+  // отказ проводника, и только потому, что рядом с ним стоит глагол-выход
+  // «Повторить». Всё остальное печатают карточки на месте действия: прогон и
+  // экспорт — вкладка «Перевод», книга, которая не открылась, — её карточка в
+  // библиотеке. Тост с кнопкой живёт дольше: по кнопке надо успеть щёлкнуть
   const [notice, setNotice] = useState<{ msg: string; action?: { label: string; run: () => void } } | null>(null);
   const noticeTimer = useRef<number>(undefined);
   const showNotice = useCallback((msg: string, action?: { label: string; run: () => void }) => {
@@ -990,6 +1052,22 @@ export default function App() {
     clearTimeout(noticeTimer.current);
     noticeTimer.current = window.setTimeout(() => setNotice(null), action ? 10000 : 6000);
   }, []);
+  // «Показать в папке» из контекстного меню карточки. Отказ проводника печатать
+  // негде — меню к этому времени закрыто, — поэтому он и остаётся единственным
+  // тостом приложения: причина слева, глагол-выход справа (WP-N)
+  const reveal = useCallback(
+    (p: string) => {
+      // объявлением, а не const: «Повторить» ссылается на себя же
+      function go(): Promise<void> {
+        return revealItemInDir(p).catch((e) => {
+          console.warn("reveal failed", e);
+          showNotice(t("ui.openFolderFailed"), { label: t("ui.retry"), run: () => void go() });
+        });
+      }
+      return go();
+    },
+    [showNotice],
+  );
   // bumped whenever trStoreRef content changes — tr-mode Pages re-read overlays
   const [trVersion, setTrVersion] = useState(0);
   const trStoreRef = useRef<booktranslate.BookTranslation | null>(null);
@@ -1005,8 +1083,6 @@ export default function App() {
   popRef.current = pop;
   const glossRef = useRef(glossOpen);
   glossRef.current = glossOpen;
-  const menuRef = useRef(menuOpen);
-  menuRef.current = menuOpen;
   const findRef = useRef(findOpen);
   findRef.current = findOpen;
   const paletteRef = useRef(paletteOpen);
@@ -1017,8 +1093,6 @@ export default function App() {
   aboutRef.current = aboutOpen;
   const settingsRef = useRef(settingsOpen);
   settingsRef.current = settingsOpen;
-  const navOpenRef = useRef(navOpen);
-  navOpenRef.current = navOpen;
   const zoomOpenRef = useRef(zoomOpen);
   zoomOpenRef.current = zoomOpen;
   const docRef = useRef<PDFDocumentProxy | null>(null);
@@ -1033,8 +1107,10 @@ export default function App() {
   });
   const setupRef = useRef(setupOpen);
   setupRef.current = setupOpen;
-  const askOpenRef = useRef(askOpen);
-  askOpenRef.current = askOpen;
+  const panelOpenRef = useRef(panelOpen);
+  panelOpenRef.current = panelOpen;
+  const panelTabRef = useRef(panelTab);
+  panelTabRef.current = panelTab;
   const scrollRef = useRef<HTMLDivElement>(null);
   const scaleRef = useRef(scale);
   scaleRef.current = scale;
@@ -1128,12 +1204,37 @@ export default function App() {
   const getTrPage = useCallback((n: number) => trStoreRef.current?.pages[n], []);
   const getTrFigs = useCallback((n: number) => trStoreRef.current?.figures[n] ?? [], []);
   const getBodyFh = useCallback(() => trStoreRef.current?.bodyFh ?? 0, []);
+  // (WP-N) Текст открытой страницы для «Спросить» — читается в момент вопроса,
+  // а не при рендере: читатель листает книгу между сообщениями, и панель обязана
+  // спрашивать про ту страницу, что перед ним сейчас. Режим просмотра учтён сам
+  // собой — pageElText берёт переведённые блоки, когда они на странице стоят.
+  const getAskPageText = useCallback((n: number) => askPageText(scrollRef.current, n), []);
   // refPages is a short sorted list (a handful of bibliography pages) —
   // linear includes() per Page render is fine
   const isRefPage = useCallback((n: number) => trStoreRef.current?.refPages.includes(n) ?? false, []);
 
+  // (WP-N) Оглавление теперь смонтировано, пока открыта книга, а свой обход
+  // назначений оно перезапускает на каждую новую identity trTitle. Раньше
+  // флайаут жил секунды и trVersion был безобиден; постоянной вкладке он бы не
+  // дал ни разу дойти до конца — номера страниц пропадали бы каждые пару
+  // секунд, пока идёт прогон. Поэтому идентичность двигает редкий тик: раз в
+  // 15 с и только если с прошлого тика что-то доперевелось.
+  const [trTick, setTrTick] = useState(0);
+  const trVersionRef = useRef(trVersion);
+  trVersionRef.current = trVersion;
+  useEffect(() => {
+    if (viewMode !== "tr") return; // в режиме оригинала заголовки не переводятся
+    let seen = trVersionRef.current;
+    const id = window.setInterval(() => {
+      if (trVersionRef.current === seen) return;
+      seen = trVersionRef.current;
+      setTrTick((v) => v + 1);
+    }, 15000);
+    return () => window.clearInterval(id);
+  }, [viewMode]);
+
   // Outline row → its translated heading (matchHeadingTr), only in translation
-  // mode. Identity changes with trVersion so a navigator left open while the
+  // mode. Identity changes with the tick above, so an outline open while the
   // engine runs picks up headings as their pages land.
   const trOutlineTitle = useCallback(
     (page: number, title: string) => {
@@ -1142,7 +1243,7 @@ export default function App() {
       return st ? matchHeadingTr(st.pages[page], st.bodyFh, title) : null;
     },
     // eslint-disable-next-line react-hooks/exhaustive-deps
-    [viewMode, trVersion],
+    [viewMode, trTick],
   );
 
   // selection mini-toolbar: after a pointerup that leaves a non-empty selection
@@ -1240,22 +1341,9 @@ export default function App() {
     return booktranslate.onRunsChange(sync);
   }, [path]);
 
-  // «Перевод» menu: click outside closes (capture, same pattern as the
-  // popover); closing always disarms the restart confirm
-  useEffect(() => {
-    if (!menuOpen) {
-      setConfirmRestart(false);
-      return;
-    }
-    const onDown = (e: PointerEvent) => {
-      if (!(e.target as Element | null)?.closest?.("[data-trmenu]")) setMenuOpen(false);
-    };
-    document.addEventListener("pointerdown", onDown, true);
-    return () => document.removeEventListener("pointerdown", onDown, true);
-  }, [menuOpen]);
-
-  // model status poll: background while a book is open (feeds the trigger
-  // dot), faster while the menu is open — "starting" resolves on its own
+  // model status poll: background while a book is open (feeds the panel's
+  // model line), faster while the «Перевод» tab is on screen — "starting"
+  // resolves on its own and the line has to see it (WP-N)
   useEffect(() => {
     if (!doc) return;
     let cancelled = false;
@@ -1264,12 +1352,12 @@ export default function App() {
       if (!cancelled) setModelStatus(s);
     };
     poll();
-    const t = window.setInterval(poll, menuOpen ? 3000 : 12000);
+    const t = window.setInterval(poll, panelOpen && panelTab === "translate" ? 3000 : 12000);
     return () => {
       cancelled = true;
       window.clearInterval(t);
     };
-  }, [doc, menuOpen]);
+  }, [doc, panelOpen, panelTab]);
 
   // Alt+click on text → translate the whole visual paragraph; on a reflowed
   // translated block the translation is already on screen, so show the stored
@@ -1308,17 +1396,32 @@ export default function App() {
     [paragraphPopover],
   );
 
-  // «Спросить» sidebar open/close (session-persisted)
-  const setAsk = useCallback((v: boolean | ((o: boolean) => boolean)) => {
-    setAskOpen((o) => {
-      const next = typeof v === "function" ? v(o) : v;
-      sessionStorage.setItem("pdfer:ask:open", next ? "1" : "0");
-      return next;
-    });
+  // панель: открыть/закрыть и на какой вкладке (открытость — на сессию, вкладка
+  // рядом с ней: вернувшись из библиотеки, читатель застаёт ту же вкладку)
+  const setPanel = useCallback((v: boolean) => {
+    sessionStorage.setItem("pdfer:ask:open", v ? "1" : "0");
+    setPanelOpen(v);
   }, []);
-  const toggleAsk = useCallback(() => setAsk((o) => !o), [setAsk]);
+  const selectTab = useCallback((tab: PanelTab) => {
+    sessionStorage.setItem("pdfer:panel:tab", tab);
+    setPanelTab(tab);
+  }, []);
+  // всё, что раньше открывало флайаут или меню, теперь просит вкладку
+  const openPanel = useCallback(
+    (tab: PanelTab) => {
+      selectTab(tab);
+      setPanel(true);
+    },
+    [selectTab, setPanel],
+  );
+  // Ctrl+J: вторым нажатием панель закрывается, но только если «Спросить» уже
+  // на виду — иначе клавиша переводит на неё, а не гасит панель
+  const toggleAsk = useCallback(() => {
+    if (panelOpenRef.current && panelTabRef.current === "ask") setPanel(false);
+    else openPanel("ask");
+  }, [openPanel, setPanel]);
 
-  // SelectionBar «Спросить»: open the sidebar seeded with the quoted selection
+  // SelectionBar «Спросить»: open the panel seeded with the quoted selection
   // + auto-extracted page context; the selection bar goes away like on translate
   const askFromSelection = useCallback(() => {
     const bar = selBarRef.current;
@@ -1326,8 +1429,8 @@ export default function App() {
     const ctx = extractAskContext(bar.text);
     setSelBar(null);
     setAskSeed({ id: ++askSeedIdRef.current, quote: bar.text, page: ctx.page, pageText: ctx.pageText });
-    setAsk(true);
-  }, [setAsk]);
+    openPanel("ask");
+  }, [openPanel]);
 
   // SelectionBar «Оригинал» (tr-selections; also O / Enter / palette): replay
   // the originals captured at selection time in the popover — noTranslate, the
@@ -1358,6 +1461,14 @@ export default function App() {
     setFindSeed(null); // plain open never re-applies a stale palette seed
     setFindOpen(true);
     setFindNonce((n) => n + 1);
+  }, []);
+
+  // Ctrl+K и бейдж «Ctrl K» в пилюле — один вход в палитру (WP-N)
+  const togglePalette = useCallback(() => {
+    setZoomOpen(false);
+    setShortcutsOpen(false);
+    setPaletteSel(selBarRef.current); // before the input focus kills the bar
+    setPaletteOpen((o) => !o);
   }, []);
 
   // Ctrl+F with a query already in hand — палитра и контекстное меню
@@ -1436,17 +1547,7 @@ export default function App() {
     [goToPage, histNav],
   );
 
-  // page-nav flyout: click outside closes (same pattern as the «Перевод» menu)
-  useEffect(() => {
-    if (!navOpen) return;
-    const onDown = (e: PointerEvent) => {
-      if (!(e.target as Element | null)?.closest?.("[data-pagenav]")) setNavOpen(false);
-    };
-    document.addEventListener("pointerdown", onDown, true);
-    return () => document.removeEventListener("pointerdown", onDown, true);
-  }, [navOpen]);
-
-  // zoom-preset flyout: click outside closes (same pattern as the page-nav)
+  // zoom-preset flyout: click outside closes (the one flyout the pill still has)
   useEffect(() => {
     if (!zoomOpen) return;
     const onDown = (e: PointerEvent) => {
@@ -1465,12 +1566,13 @@ export default function App() {
   const toggleView = useCallback(() => {
     if (!docRef.current) return;
     if (!trAvailRef.current) {
-      // T with nothing to toggle: point at the entry instead of silence (Н5)
-      showNotice(t("tr.needTranslated"));
+      // T с нечем переключать: вместо тоста «книга не переведена» открываем
+      // вкладку, где эта же причина стоит рядом с глаголом (WP-N)
+      openPanel("translate");
       return;
     }
     setView(viewModeRef.current === "tr" ? "orig" : "tr");
-  }, [setView, showNotice]);
+  }, [openPanel, setView]);
 
   // One-button whole-book translation. The run itself lives in booktranslate's
   // path-keyed manager (Р-6): it opens its own doc, keeps going when the book
@@ -1484,41 +1586,61 @@ export default function App() {
   // update === true routes into «Update the translation» (incremental re-clustering,
   // booktranslate.updateBookTranslation) instead of a translation run; the
   // model gate is shared — an update may need the wire for changed paragraphs
+  // (WP-N) Прогон не начался (книга не переоткрылась): причина печатается
+  // строкой в карточке вкладки «Перевод», рядом с глаголом «Повторить» —
+  // тоста для неё больше нет. Держится до следующей попытки.
+  const [startError, setStartError] = useState(false);
   const startTr = useCallback(async (update?: boolean) => {
     if (!doc || !path || booktranslate.getRun(path) || trWaitRef.current) return;
+    setStartError(false);
     if ((await hasTextProbeRef.current) === false) {
-      if (pathRef.current === path) showNotice(t("tr.noTextLayer"));
+      // скан: отказ печатает карточка вкладки «Перевод», а не тост — статус
+      // стоит там, где живёт действие (WP-N)
+      if (pathRef.current === path) openPanel("translate");
       return;
     }
     if (pathRef.current !== path || booktranslate.getRun(path)) return; // book changed during the probe
+    // (WP-N) ожидание «Модель запускается» печатает строка модели в карточке
+    // вкладки «Перевод» — статус стоит там, где живёт действие. Отсюда каждый
+    // опрос кладётся в modelStatus сразу, не дожидаясь фонового поллинга
     let status = await fetchModelStatus();
+    setModelStatus(status);
     if (status === "starting") {
       trWaitRef.current = true;
-      setTrWait(true);
       try {
         while (status === "starting") {
           await new Promise((r) => setTimeout(r, 2000));
           if (pathRef.current !== path || booktranslate.getRun(path)) return;
           status = await fetchModelStatus();
+          setModelStatus(status);
         }
       } finally {
         trWaitRef.current = false;
-        setTrWait(false);
       }
     }
     if (pathRef.current !== path || booktranslate.getRun(path)) return;
     if (status !== "spawned" && status !== "external") {
       // none/dead: no honest run possible — route into the model setup flow
       // (license + download / «Перезапустить») instead of a dead-end toast
-      setMenuOpen(false);
       setSetupOpen(true);
       return;
     }
-    // rejects only when the book file cannot be re-opened for the run's doc
-    (update === true ? booktranslate.updateBookTranslation(path) : booktranslate.startRun(path)).catch(() => {
-      if (pathRef.current === path) showNotice(t("app.openFail"));
+    // rejects only when the book file cannot be re-opened for the run's doc.
+    // (WP-N) Тоста здесь больше нет: место этой строки — карточка вкладки
+    // «Перевод», рядом с глаголом «Повторить» (startError → TranslatePanel).
+    (update === true ? booktranslate.updateBookTranslation(path) : booktranslate.startRun(path)).catch((e) => {
+      console.error("run start failed", e);
+      if (pathRef.current === path) setStartError(true);
     });
-  }, [doc, path, showNotice]);
+  }, [doc, path, openPanel]);
+
+  // «Проверить модель» на паузе (WP-N): спросить состояние заново и, если
+  // модель так и не поднялась, открыть тот же вход, что и в отказе запуска
+  const checkModel = useCallback(async () => {
+    const s = await fetchModelStatus();
+    setModelStatus(s);
+    if (s !== "starting" && !statusUp(s)) setSetupOpen(true);
+  }, []);
 
   // «Перевести заново» (glossary modal): drop the store, restart from page 1
   const retranslate = useCallback(async () => {
@@ -1602,9 +1724,8 @@ export default function App() {
     // background (Р-6 — the manager owns its doc); only swap per-book UI state
     setFindOpen(false); // find state is per book
     setFindSeed(null);
-    setNavOpen(false);
     histRef.current = { back: [], fwd: [] }; // jump history is per book
-    setAskSeed(null); // a stale seed must not leak into the next book's sidebar
+    setAskSeed(null); // a stale seed must not leak into the next book's panel
     trStoreRef.current = null;
     setTrInfo(null);
     setViewMode(localStorage.getItem(`pdfer:view:${key}`) === "tr" ? "tr" : "orig");
@@ -1681,22 +1802,26 @@ export default function App() {
     }
   }, [loadBytes]);
 
-  // every «открыть эту книгу» path (обложка, Ctrl+O, палитра, контекстное
-  // меню) fails into the same toast (Н4); returns the promise so the library
-  // card can hold its spinner until the load settles
+  // (WP-N) Отказ печатает та карточка, по которой щёлкнули: промис долетает до
+  // библиотеки отклонённым — она держит спиннер до конца загрузки и сама
+  // помечает книгу, которая не открылась. Тоста здесь больше нет; входы без
+  // карточки (Ctrl+O, палитра, контекстное меню) гасят отказ явным .catch.
   const openPath = useCallback(
     (p: string) =>
       loadFile(p).catch((e) => {
         console.error("open failed", e);
-        showNotice(t("app.openFail"));
+        throw e;
       }),
-    [loadFile, showNotice],
+    [loadFile],
   );
+
+  // те самые входы без карточки: жаловаться некуда, отказ уже в консоли
+  const openPathQuiet = useCallback((p: string) => void openPath(p).catch(() => {}), [openPath]);
 
   const openDialog = useCallback(async () => {
     const p = await open({ multiple: false, filters: [{ name: "PDF", extensions: ["pdf"] }] });
-    if (typeof p === "string") void openPath(p);
-  }, [openPath]);
+    if (typeof p === "string") openPathQuiet(p);
+  }, [openPathQuiet]);
 
   // reopen last book on start; ?test=<url> loads a PDF over HTTP (browser-based UI debugging)
   useEffect(() => {
@@ -1709,11 +1834,13 @@ export default function App() {
     }
     const last = localStorage.getItem("pdfer:last");
     if (last)
-      loadFile(last).catch(() => {
+      loadFile(last).catch((e) => {
+        // the book moved/vanished since last session: забываем её и открываем
+        // библиотеку — она и есть ответ, тост поверх неё сказал бы то же (WP-N)
         localStorage.removeItem("pdfer:last");
-        showNotice(t("app.openFail")); // the book moved/vanished since last session
+        console.error("last book gone", e);
       });
-  }, [loadFile, loadBytes, showNotice]);
+  }, [loadFile, loadBytes]);
 
   const zoomTo = useCallback(
     (next: number, opts?: { at?: { x: number; y: number }; fit?: FitMode }) => {
@@ -1774,11 +1901,11 @@ export default function App() {
     (mode: FitMode): number | null => {
       if (!baseSize) return null;
       // live clientWidth/clientHeight, not the memoized viewport state: the
-      // state is re-measured only on resize/sidebar changes, and a transient
+      // state is re-measured only on resize/panel changes, and a transient
       // horizontal scrollbar (overflow at the pre-fit zoom) would otherwise
       // keep shaving ~15px off clientHeight long after it's gone.
       // viewportW/viewportH stay in the deps so the sticky-fit effect still
-      // recomputes on resize/sidebar changes
+      // recomputes on resize/panel changes
       const vw = scrollRef.current?.clientWidth ?? viewportW;
       const vh = scrollRef.current?.clientHeight ?? viewportH;
       const n = Math.max(
@@ -1810,7 +1937,7 @@ export default function App() {
     [fitScaleFor, zoomTo],
   );
 
-  // sticky fit: window resizes, the «Спросить» sidebar and column-mode
+  // sticky fit: window resizes, the panel and column-mode
   // changes all land in fitScaleFor's inputs — recompute until a manual zoom
   // clears the mode. Deferred via setTimeout: zoomTo flushSyncs, which React
   // rejects when this effect is flushed inside another sync render
@@ -1835,22 +1962,51 @@ export default function App() {
     setSelBar(null);
     setPop(null);
     setGlossOpen(false);
-    setMenuOpen(false);
     setZoomOpen(false);
     setFitMode(null);
     setFindOpen(false);
     setFindSeed(null);
-    setNavOpen(false);
     setPaletteOpen(false);
     setShortcutsOpen(false);
     histRef.current = { back: [], fwd: [] };
-    setAskSeed(null); // askOpen itself survives — it's a session preference
+    setAskSeed(null); // panelOpen itself survives — it's a session preference
+    setExportError(null); // отказ экспорта принадлежал закрытой книге
+    setStartError(false); // как и отказ запуска прогона
     try {
       getCurrentWindow().setTitle("Chitallo").catch(() => {});
     } catch {
       document.title = "Chitallo";
     }
   }, [savePos]);
+
+  // Граф знаний — не отдельный экран, а вкладка библиотеки, поэтому «открыть
+  // граф» это всегда «вернуться в библиотеку и переключить вид». Возврат идёт
+  // тем же closeBook, что и кнопка «Библиотека» с Esc: второй путь закрытия
+  // книги разошёлся бы с первым на первой же правке (позиция не сохранилась
+  // бы, заголовок окна остался бы от закрытой книги).
+  //
+  // Ключ пишем ДО закрытия, а событие шлём после: пока открыта книга,
+  // библиотека размонтирована и прочтёт выбор из localStorage на свежем
+  // монтировании; уже висящая библиотека читает ключ один раз и о смене
+  // узнаёт только из события — ровно как «pdfer:libdir» из настроек.
+  const openGraph = useCallback(() => {
+    localStorage.setItem("pdfer:lib:view", "graph");
+    if (pathRef.current) closeBook();
+    window.dispatchEvent(new CustomEvent("pdfer:lib:view", { detail: "graph" }));
+  }, [closeBook]);
+
+  // (WP-N) При закрытой книге Ctrl+G — переключатель «сетка ⇄ граф»: библиотека
+  // уже на экране, и обратной дороги из графа с клавиатуры нет вовсе — пилюля
+  // вида есть только у мыши. Над открытой книгой аккорд остаётся односторонним:
+  // «показать граф» там значит «уйти с книги», и возвращать второму нажатию
+  // нечего. Текущий вид спрашиваем у localStorage: ключ пишут синхронно оба
+  // владельца — openGraph выше и Library.chooseView, каждый до своего setView, —
+  // поэтому он, а не собственная память App, знает, что сейчас на экране.
+  const toggleGraph = useCallback(() => {
+    if (pathRef.current || localStorage.getItem("pdfer:lib:view") !== "graph") return void openGraph();
+    localStorage.setItem("pdfer:lib:view", "grid");
+    window.dispatchEvent(new CustomEvent("pdfer:lib:view", { detail: "grid" }));
+  }, [openGraph]);
 
   const toggleDark = useCallback(() => {
     setDark((d) => {
@@ -1892,9 +2048,12 @@ export default function App() {
   // прежний диалог сохранения.
   const exportBusyRef = useRef(false);
   // PDF-экспорт на большой книге живёт минуты (рендер кропов + печать) — на
-  // это время строка меню «Экспорт в PDF» становится спиннером «Подготовка
-  // PDF…», а меню при клике не закрывается: эффект клика виден на месте
+  // это время строка вкладки «Экспортировать в PDF» становится спиннером
+  // «Подготовка PDF…»: эффект клика виден ровно там, где кликнули
   const [pdfBusy, setPdfBusy] = useState(false);
+  // (WP-N) отказ экспорта печатается строкой в панели, на месте самого
+  // действия, и держится до следующей попытки — тоста об ошибке больше нет
+  const [exportError, setExportError] = useState<TrExportError | null>(null);
   const exportTitle = useCallback(() => {
     const p = pathRef.current!;
     const file = baseName(p).replace(/\.pdf$/i, "") || t("tr.untitled");
@@ -1905,66 +2064,54 @@ export default function App() {
       return file; // no index — the file name stands
     }
   }, []);
+  // (WP-N) Успех молчит: «Сохранено в Загрузки» — одна из строк, которых в B
+  // не осталось. Куда лёг файл, скажет сама строка экспорта в карточке
+  // «Перевод», превратившись в «Показать в папке»; отказ печатается там же,
+  // строкой exportError. Тоста об экспорте здесь нет ни успешного, ни нет.
   const exportTr = useCallback(async () => {
     const p = pathRef.current;
     if (!p || exportBusyRef.current) return;
     exportBusyRef.current = true;
+    setExportError(null);
     try {
-      const res = await exportTranslationToDownloads(p, exportTitle(), (done, total) => {
-        if (done === total || done % 5 === 0)
-          showNotice(t("tr.exporting", { pct: Math.floor((100 * done) / total) }));
-      });
-      if (res === "none") return; // the menu item is hidden without finished pages anyway
-      showNotice(t("tr.savedToDownloads"), {
-        label: t("ui.open"),
-        run: () => void revealItemInDir(res.path).catch(() => showNotice(t("ui.openFolderFailed"))),
-      });
+      await exportTranslationToDownloads(p, exportTitle());
     } catch (e) {
       console.error("export failed", e);
-      showNotice(t("tr.exportFailed"));
+      setExportError({ kind: "html", reason: exportReason(e) });
     } finally {
       exportBusyRef.current = false;
     }
-  }, [exportTitle, showNotice]);
+  }, [exportTitle]);
   const exportPdf = useCallback(async () => {
     const p = pathRef.current;
     if (!p || exportBusyRef.current) return;
     exportBusyRef.current = true;
+    setExportError(null);
     setPdfBusy(true);
     try {
-      showNotice(t("tr.pdfPreparing"));
-      const res = await exportTranslationPdf(p, exportTitle(), (done, total) => {
-        if (done === total || done % 5 === 0)
-          showNotice(t("tr.pdfPreparingPct", { pct: Math.floor((100 * done) / total) }));
-      });
-      if (res === "none") return; // the menu item is hidden without finished pages anyway
-      showNotice(t("tr.savedToDownloads"), {
-        label: t("ui.open"),
-        run: () => void revealItemInDir(res.path).catch(() => showNotice(t("ui.openFolderFailed"))),
-      });
+      await exportTranslationPdf(p, exportTitle());
     } catch (e) {
       console.error("pdf export failed", e);
-      // the platform with no silent print pipeline says so, instead of failing mutely
-      showNotice(String(e).includes("pdf_unsupported") ? t("tr.pdfUnsupported") : t("tr.pdfFailed"));
+      setExportError({ kind: "pdf", reason: exportReason(e) });
     } finally {
       exportBusyRef.current = false;
       setPdfBusy(false);
     }
-  }, [exportTitle, showNotice]);
+  }, [exportTitle]);
   const exportTxt = useCallback(async () => {
     const p = pathRef.current;
     if (!p || exportBusyRef.current) return;
     exportBusyRef.current = true;
+    setExportError(null);
     try {
-      const res = await exportTranslationTxt(p, exportTitle());
-      if (res === "saved") showNotice(t("tr.saved"));
+      await exportTranslationTxt(p, exportTitle());
     } catch (e) {
       console.error("export failed", e);
-      showNotice(t("tr.exportFailed"));
+      setExportError({ kind: "html", reason: exportReason(e) });
     } finally {
       exportBusyRef.current = false;
     }
-  }, [exportTitle, showNotice]);
+  }, [exportTitle]);
 
   // the OS-side window chrome (titlebar) follows the app theme (WP-K); also
   // runs once on start so a persisted dark theme gets a dark titlebar
@@ -1982,7 +2129,7 @@ export default function App() {
   }, []);
 
   // viewport size for "auto" columns and the fit presets (clientWidth
-  // excludes the scrollbar); askOpen is a dep — the sidebar changes the
+  // excludes the scrollbar); panelOpen is a dep — the panel changes the
   // reading width with no resize event
   useEffect(() => {
     const measure = () => {
@@ -1994,7 +2141,7 @@ export default function App() {
     const onResize = () => { clearTimeout(t); t = window.setTimeout(measure, 150); };
     window.addEventListener("resize", onResize);
     return () => { clearTimeout(t); window.removeEventListener("resize", onResize); };
-  }, [doc, askOpen, askW]);
+  }, [doc, panelOpen, askW]);
 
   // «Добавить в глоссарий»: the term lands in the book's list with the «?»
   // placeholder the auto-builder uses — visible in the modal, never fed into a
@@ -2012,12 +2159,13 @@ export default function App() {
     setGlossOpen(true);
   }, []);
 
-  const copyText = useCallback(
-    (text: string) => {
-      void copyToClipboard(text).then((ok) => showNotice(t(ok ? "ui.copied" : "ui.copyFailed")));
-    },
-    [showNotice],
-  );
+  // копирование молчит в обе стороны (§4.5, Voice): успех обратимого действия
+  // не сообщается, а отказ буфера читателю нечем исправить
+  const copyText = useCallback((text: string) => {
+    void copyToClipboard(text).then((ok) => {
+      if (!ok) console.warn("clipboard write refused");
+    });
+  }, []);
 
   // ---- right click: our own menu instead of the platform webview's ---------
   //
@@ -2070,11 +2218,14 @@ export default function App() {
       if (card) {
         const p = card.dataset.path!;
         items.push(
-          { id: "open", label: t("ui.open"), run: () => void openPath(p) },
+          { id: "open", label: t("ui.open"), run: () => openPathQuiet(p) },
           {
             id: "reveal",
             label: t("ctx.revealInFolder"),
-            run: () => void revealItemInDir(p).catch(() => showNotice(t("ui.openFolderFailed"))),
+            // отказ проводника — единственное, о чём нечем сказать на месте:
+            // меню к этому времени закрыто. Тост остаётся, но с глаголом-
+            // выходом рядом — иначе это сообщение в никуда (WP-N)
+            run: () => void reveal(p),
           },
         );
         // Export is deliberately absent here: whether THIS book has a finished
@@ -2133,7 +2284,7 @@ export default function App() {
       }
 
       // ---- the page: its own group, but only inside the reading area ----
-      // A click on the chrome (toolbar, sidebar, the empty field around) gets
+      // A click on the chrome (toolbar, panel, the empty field around) gets
       // NOTHING: the system menu is suppressed and there is no menu of ours —
       // «Reload» and «Inspect» have no place in a reader, and the page items
       // have no place there. A selection inside an «Ask» answer is not the book
@@ -2147,7 +2298,7 @@ export default function App() {
             hint: "T",
             run: toggleView,
           });
-        page.push({ id: "toc", label: t("cmd.toc"), run: () => setNavOpen(true) });
+        page.push({ id: "toc", label: t("cmd.toc"), run: () => openPanel("outline") });
         if (!selText) page.push({ id: "findplain", label: t("cmd.find"), hint: "Ctrl+F", run: openFind });
         if (page.length) {
           if (items.length) items.push({ sep: true });
@@ -2157,8 +2308,6 @@ export default function App() {
 
       // one popup over the book at a time — the same rule Ctrl+K follows
       if (!items.length) return void setCtxMenu(null);
-      setMenuOpen(false);
-      setNavOpen(false);
       setZoomOpen(false);
       setCtxMenu({ at, items, keyboard: byKey });
     };
@@ -2169,8 +2318,8 @@ export default function App() {
     path,
     trInfo,
     viewMode,
-    openPath,
-    showNotice,
+    openPathQuiet,
+    reveal,
     peekOriginal,
     translateSelection,
     askFromSelection,
@@ -2180,6 +2329,7 @@ export default function App() {
     paragraphPopover,
     toggleView,
     openFind,
+    openPanel,
   ]);
 
   // keyboard: Ctrl+O open, Ctrl +/-/0 zoom, D dark (e.code = layout-independent)
@@ -2201,15 +2351,16 @@ export default function App() {
       else if (ctrl && e.code === "Digit2") { e.preventDefault(); setColsMode(2); }
       else if (ctrl && e.code === "Digit3") { e.preventDefault(); setColsMode("auto"); }
       else if (ctrl && e.code === "KeyJ") { e.preventDefault(); toggleAsk(); }
-      // Ctrl+K — command palette (flyouts close: one floating layer at a time)
+      // Ctrl+G — граф знаний. Свободный аккорд: «следующее совпадение» в этой
+      // читалке висит на ⏎ («Следующее · Enter» в строке поиска), так что
+      // привычного Ctrl/⌘+G здесь не у кого отнимать. Голая G не годится:
+      // в библиотеке любая одиночная буква с карточки уходит в фильтр
+      // (Library.onGridKey), и G открывала бы граф и печаталась одновременно
+      else if (ctrl && e.code === "KeyG") { e.preventDefault(); toggleGraph(); }
+      // Ctrl+K — command palette (the zoom flyout closes: one floating layer at a time)
       else if (ctrl && e.code === "KeyK") {
         e.preventDefault();
-        setMenuOpen(false);
-        setNavOpen(false);
-        setZoomOpen(false);
-        setShortcutsOpen(false);
-        setPaletteSel(selBarRef.current); // before the input focus kills the bar
-        setPaletteOpen((o) => !o);
+        togglePalette();
       }
       // «?» / Ctrl+/ — every key on one screen
       else if (ctrl && e.code === "Slash") { e.preventDefault(); setPaletteOpen(false); setShortcutsOpen((o) => !o); }
@@ -2271,7 +2422,7 @@ export default function App() {
       }
       else if (e.key === "Escape") {
         // Esc peels UI layers before closing the book:
-        // контекстное меню → палитра → шорткаты → «О Chitallo» → настройки → оглавление → масштаб → меню → модель → глоссарий → перевод → поиск → сайдбар (только при фокусе в нём) → выделение
+        // контекстное меню → палитра → шорткаты → «О Chitallo» → настройки → масштаб → модель → глоссарий → перевод → поиск → панель (только при фокусе в ней) → выделение
         // (Esc typed INSIDE the find/page/palette inputs is handled there and never reaches this chain)
         // Контекстное меню снимает себя само (capture на document в
         // ContextMenu.tsx) — иначе Esc из поля поиска до сюда не дошёл бы;
@@ -2282,19 +2433,19 @@ export default function App() {
         else if (shortcutsRef.current) setShortcutsOpen(false);
         else if (aboutRef.current) setAboutOpen(false);
         else if (settingsRef.current) setSettingsOpen(false);
-        else if (navOpenRef.current) setNavOpen(false);
         else if (zoomOpenRef.current) setZoomOpen(false);
-        else if (menuRef.current) setMenuOpen(false);
         else if (setupRef.current) setSetupOpen(false);
         else if (glossRef.current) setGlossOpen(false);
         else if (popRef.current) setPop(null);
         else if (findRef.current) setFindOpen(false);
-        else if (askOpenRef.current && ae?.closest("[data-asksb]")) {
-          // focus inside the sidebar: leave the input first; a focused
-          // non-input control closes the panel. An unfocused sidebar is
+        else if (panelOpenRef.current && ae?.closest("[data-asksb]")) {
+          // focus inside the panel: leave the input first; a focused
+          // non-input control closes the panel. An unfocused panel is
           // NEVER closed by Esc — the chain falls through to the book.
+          // (поле «Оглавления» гасит Esc само: сначала чистит запрос, потом
+          // закрывает панель — сюда такой Esc не доходит)
           if (ae.tagName === "TEXTAREA") ae.blur();
-          else setAsk(false);
+          else setPanel(false);
         } else if (selBarRef.current) {
           setSelBar(null);
           document.getSelection()?.removeAllRanges();
@@ -2303,7 +2454,7 @@ export default function App() {
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [openDialog, openFind, zoomTo, applyFit, toggleDark, closeBook, setColsMode, toggleView, toggleAsk, setAsk, histNav, peekOriginal]);
+  }, [openDialog, openFind, zoomTo, applyFit, toggleDark, closeBook, toggleGraph, setColsMode, toggleView, toggleAsk, setPanel, togglePalette, histNav, peekOriginal]);
 
   // Ctrl+wheel zoom, anchored at the cursor (non-passive, to suppress webview
   // page zoom). metaKey too, for Cmd+wheel on macOS — trackpad pinch already
@@ -2360,6 +2511,25 @@ export default function App() {
   const updPct = trInfo && (trStoreRef.current?.updatedThrough ?? 0) > 0
     ? Math.floor((100 * (trStoreRef.current?.updatedThrough ?? 0)) / Math.max(1, trInfo.total))
     : 0;
+  // (WP-N) одно из четырёх состояний карточки вкладки «Перевод». Живой прогон
+  // главнее хранилища: он знает и про паузу по недоступной модели (stalled).
+  const trState: TrState =
+    run !== null
+      ? run.stalled
+        ? "paused"
+        : "running"
+      : trInfo === null
+        ? "idle"
+        : trInfo.done < trInfo.total
+          ? "paused"
+          : "done";
+  // терминов в глоссарии книги — число справа в строке «Открыть глоссарий».
+  // Правят его в модалке, поэтому пересчёт привязан к её закрытию и к книге.
+  const glossaryTerms = useMemo(
+    () => (path ? parseGlossary(loadGlossaryText(path)).length : 0),
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [path, glossOpen, trVersion],
+  );
 
   // Ctrl+K commands — every action already in the UI, one name each, with its
   // key as the hint (the palette doubles as the cheat-sheet). Built only while
@@ -2370,7 +2540,7 @@ export default function App() {
       paletteCommands.push(
         // keywords stay bilingual on purpose: the palette should answer to
         // whichever word comes to mind, not only to the current interface language
-        { id: "toc", label: t("cmd.toc"), keywords: "toc contents содержание оглавление страница", run: () => setNavOpen(true) },
+        { id: "toc", label: t("cmd.toc"), keywords: "toc contents содержание оглавление страница", run: () => openPanel("outline") },
         { id: "find", label: t("cmd.find"), hint: K("Ctrl+F"), keywords: "поиск найти search find", run: openFind },
       );
       if (trInfo !== null)
@@ -2392,12 +2562,17 @@ export default function App() {
           keywords: "оригинал выделение original selection",
           run: () => peekOriginal(paletteSel),
         });
+      // (WP-N) прогон и экспорт жили в меню «Перевод ▾», а оно исчезло: их дом —
+      // вкладка «Перевод», и только там видно, чем действие кончилось (проценты,
+      // пауза, причина отказа экспорта). Поэтому команда сначала открывает
+      // вкладку, а потом действует — иначе результат остался бы за кадром.
       if (trRun)
         paletteCommands.push({
           id: "trpause",
           label: t("cmd.pauseTr"),
           keywords: "пауза pause стоп stop",
           run: () => {
+            openPanel("translate");
             if (path) void booktranslate.stopRun(path);
           },
         });
@@ -2406,7 +2581,10 @@ export default function App() {
           id: "trstart",
           label: trInfo === null ? t("cmd.translateBook") : t("cmd.resumeTr", { pct: trPct }),
           keywords: "translate перевод книга book",
-          run: startTr,
+          run: () => {
+            openPanel("translate");
+            void startTr();
+          },
         });
       if (trInfo !== null && trInfo.done > 0)
         paletteCommands.push(
@@ -2416,7 +2594,10 @@ export default function App() {
                   id: "exportpdf",
                   label: t("tr.exportPdf"),
                   keywords: "экспорт сохранить export pdf печать print загрузки downloads",
-                  run: exportPdf,
+                  run: () => {
+                    openPanel("translate");
+                    void exportPdf();
+                  },
                 },
               ]
             : []),
@@ -2424,7 +2605,10 @@ export default function App() {
             id: "export",
             label: t("tr.exportHtml"),
             keywords: "экспорт сохранить export html загрузки downloads",
-            run: exportTr,
+            run: () => {
+              openPanel("translate");
+              void exportTr();
+            },
           },
         );
       paletteCommands.push(
@@ -2444,21 +2628,17 @@ export default function App() {
     }
     paletteCommands.push(
       { id: "open", label: t("cmd.openFile"), hint: K("Ctrl+O"), keywords: "open file pdf открыть", run: openDialog },
+      // граф стоит в блоке «без книги» намеренно: он про всю полку сразу, и
+      // из открытой книги команда сама вернёт в библиотеку
+      // (WP-N) одно имя на одну вещь: «Граф знаний» пишется ключом gr.title
+      // здесь, в листе клавиш и в настройках — синонимов у названия нет
+      { id: "graph", label: t("gr.title"), hint: K("Ctrl+G"), keywords: "граф знания связи понятия graph knowledge links concepts", run: openGraph },
       { id: "dark", label: dark ? t("cmd.lightTheme") : t("cmd.darkTheme"), hint: "D", keywords: "тема theme dark light", run: toggleDark },
       { id: "keys", label: t("cmd.keys"), hint: "?", keywords: "шорткаты клавиатура shortcuts keyboard помощь help", run: () => setShortcutsOpen(true) },
       { id: "settings", label: t("cmd.settings"), hint: K("Ctrl+,"), keywords: "настройки settings тема размер модели хранилище", run: () => setSettingsOpen(true) },
       { id: "about", label: t("app.about"), keywords: "версия лицензии приватность about version license", run: () => setAboutOpen(true) },
     );
   }
-
-  // sticky engine states outrank the transient notice; stall clears itself on
-  // recovery. anyStall covers BACKGROUND runs too — a model outage while the
-  // library (or another book) is on screen must not fail silently.
-  const toast = anyStall
-    ? { msg: t("tr.modelStalled") }
-    : trWait
-      ? { msg: t("tr.modelWarming") }
-      : notice;
 
   return (
     /* no transition-colors on the root: the theme switches everywhere in the
@@ -2468,416 +2648,156 @@ export default function App() {
       // translated type size: every .trPage reads this variable, zoom multiplies it
       style={{ "--tr-font-size": `${trFont}px` } as React.CSSProperties}
     >
-      <div
-        className="toolbar fixed top-3 -translate-x-1/2 z-10 flex items-center gap-1 rounded-full bg-white/85 dark:bg-neutral-800/85 backdrop-blur px-3 py-1.5 shadow-lg text-sm text-neutral-700 dark:text-neutral-200 select-none transition-[left] duration-150"
-        // stay centered over the READING area: shift by half the sidebar width
-        style={{ left: doc && askOpen ? `calc(50% - ${askW / 2}px)` : "50%" }}
-      >
-        {/* run progress — 2px band along the pill's bottom edge; the trigger
-            label stays constant so the pill never resizes mid-run (WP-H).
-            bandPct, not trPct: an update run's store is already 100% done */}
-        {doc && trRun && trInfo && (
-          <span aria-hidden className="pointer-events-none absolute inset-0 overflow-hidden rounded-full">
-            <span
-              className="absolute bottom-0 left-0 h-0.5 bg-accent transition-[width] duration-300"
-              // 2% floor: a run at 0 swept pages must still show a living
-              // sliver — a zero-width band reads as «the click did nothing»
-              style={{ width: `${Math.max(2, bandPct)}%` }}
-            />
-          </span>
-        )}
-        {/* left: library */}
-        <button
-          className={`${TB_BTN} px-1`}
-          onClick={doc ? closeBook : openDialog}
-          title={doc ? t("tb.libraryEsc") : t("tb.openFileKey")}
+      {/* (WP-N) Пилюля — часть читалки. Над библиотекой её нет: открыть файл,
+          тему и настройки там держит строка заголовка самой библиотеки, а
+          клавиши Ctrl+O · D · Ctrl+, и палитра Ctrl+K работают и без книги */}
+      {doc && (
+        <div
+          className="toolbar fixed top-3 -translate-x-1/2 z-10 flex items-center gap-1 rounded-full bg-white/85 dark:bg-neutral-800/85 backdrop-blur px-3 py-1.5 shadow-lg text-sm text-neutral-700 dark:text-neutral-200 select-none transition-[left] duration-150"
+          // stay centered over the READING area: shift by half the panel width
+          style={{ left: panelOpen ? `calc(50% - ${askW / 2}px)` : "50%" }}
         >
-          {doc ? t("tb.library") : t("tb.openFile")}
-        </button>
-        {doc && (
-          <>
-            {/* the «navigation» group: library + page; the indicator opens the
-                go-to-page + contents flyout. Width is reserved for the widest
-                page number so the pill never shifts while scrolling */}
-            <span className="relative" data-pagenav>
-              <button
-                className={`${TB_BTN} tabular-nums text-neutral-600 dark:text-neutral-300 hover:text-neutral-800 dark:hover:text-neutral-100 px-1 whitespace-nowrap text-center`}
-                style={{ minWidth: `calc(${2 * String(doc.numPages).length + 3}ch + 0.5rem)` }}
-                onClick={() => setNavOpen((o) => !o)}
-                title={t("tb.pageAndToc")}
-              >
-                {curPage} / {doc.numPages}
-              </button>
-              {navOpen && (
-                <Outline
-                  doc={doc}
-                  trTitle={trOutlineTitle}
-                  onJump={(p, frac) => {
-                    setNavOpen(false);
-                    goToPage(p, frac);
-                  }}
-                  onClose={() => setNavOpen(false)}
-                />
-              )}
+          {/* run progress — 2px band along the pill's bottom edge; the pill's
+              composition stays constant so it never resizes mid-run (WP-H).
+              bandPct, not trPct: an update run's store is already 100% done.
+              Акцент, пока идёт; янтарь, когда встало (WP-N) */}
+          {trInfo && (trRun || trState === "paused") && (
+            <span aria-hidden className="pointer-events-none absolute inset-0 overflow-hidden rounded-full">
+              <span
+                className={`absolute bottom-0 left-0 h-0.5 transition-[width] duration-300 ${
+                  trState === "paused" ? "bg-amber-500" : "bg-accent"
+                }`}
+                // 2% floor: a run at 0 swept pages must still show a living
+                // sliver — a zero-width band reads as «the click did nothing»
+                style={{ width: `${Math.max(2, bandPct)}%` }}
+              />
             </span>
-            <span className="mx-2 h-4 w-px bg-neutral-900/15 dark:bg-neutral-100/20" />
-            {/* the «view» group: zoom · columns · theme */}
-            <button className={`${TB_BTN} px-1.5`} onClick={() => zoomTo(scale - 0.125)} title={t("tb.zoomOut")}>
-              −
-            </button>
-            <span className="relative" data-zoommenu>
-              <button
-                className={`${TB_BTN} tabular-nums text-neutral-600 dark:text-neutral-300 hover:text-neutral-800 dark:hover:text-neutral-100 w-11 text-center`}
-                onClick={() => setZoomOpen((o) => !o)}
-                title={t("tb.zoomPresets")}
-              >
-                {Math.round(scale * 100)}%
-              </button>
-              {zoomOpen && (
-                <div className="overlay-pop absolute left-1/2 -translate-x-1/2 top-full mt-2.5 z-20 rounded-xl bg-white/95 dark:bg-neutral-800/95 backdrop-blur shadow-xl p-1.5 text-left">
-                  {(
-                    [
-                      ["width", t("tb.fitWidth"), K("Ctrl+0")],
-                      ["page", t("tb.fitPage"), null],
-                    ] as const
-                  ).map(([m, label, hint]) => (
-                    <button
-                      key={m}
-                      className={`${MENU_ROW} flex items-baseline justify-between gap-4${fitMode === m ? " text-accent" : ""}`}
-                      onClick={() => { setZoomOpen(false); applyFit(m); }}
-                    >
-                      {label}
-                      {hint && <span className="text-xs text-neutral-400 dark:text-neutral-500">{hint}</span>}
-                    </button>
-                  ))}
-                  <div className="mx-1 my-1 h-px bg-neutral-900/10 dark:bg-neutral-100/10" />
-                  {[1, 1.25, 1.5, 2].map((s) => (
-                    <button
-                      key={s}
-                      className={`${MENU_ROW} tabular-nums${fitMode === null && Math.round(scale * 100) === s * 100 ? " text-accent" : ""}`}
-                      onClick={() => { setZoomOpen(false); zoomTo(s); }}
-                    >
-                      {s * 100}%
-                    </button>
-                  ))}
-                </div>
-              )}
-            </span>
-            <button className={`${TB_BTN} px-1.5`} onClick={() => zoomTo(scale + 0.125)} title={t("tb.zoomIn")}>
-              +
-            </button>
-            <span className="ml-1 flex items-center gap-1">
-              {/* active column mode carries the accent — the app's one active color */}
-              {([1, 2, "auto"] as const).map((c) => (
-                <button
-                  key={String(c)}
-                  className={`${TB_BTN} px-1.5 py-0.5 ${cols === c ? "text-accent" : "text-neutral-500 dark:text-neutral-400"}`}
-                  onClick={() => setColsMode(c)}
-                  title={c === 1 ? t("tb.col1") : c === 2 ? t("tb.col2") : t("tb.colAuto")}
-                >
-                  <IconColumns n={c === "auto" ? 3 : c} />
-                </button>
-              ))}
-            </span>
+          )}
+          {/* left: library */}
+          <button className={`${TB_BTN} px-1`} onClick={closeBook} title={t("tb.libraryEsc")}>
+            {t("tb.library")}
+          </button>
+          {/* the «navigation» group: library + page. Оглавление стало первой
+              вкладкой панели, и номер страницы — вход в неё. Width is
+              reserved for the widest page number so the pill never shifts
+              while scrolling */}
+          <button
+            className={`${TB_BTN} tabular-nums text-neutral-600 dark:text-neutral-300 hover:text-neutral-800 dark:hover:text-neutral-100 px-1 whitespace-nowrap text-center`}
+            style={{ minWidth: `calc(${2 * String(doc.numPages).length + 3}ch + 0.5rem)` }}
+            onClick={() => openPanel("outline")}
+            title={t("tb.pageOfTitle", { page: curPage, total: doc.numPages })}
+          >
+            {t("tb.pageOf", { page: curPage, total: doc.numPages })}
+          </button>
+          <span className="mx-2 h-4 w-px bg-neutral-900/15 dark:bg-neutral-100/20" />
+          {/* the «view» group: zoom · columns · theme */}
+          <button className={`${TB_BTN} px-1.5`} onClick={() => zoomTo(scale - 0.125)} title={t("tb.zoomOut")}>
+            −
+          </button>
+          <span className="relative" data-zoommenu>
             <button
-              className={`${TB_BTN} ml-1 px-1 py-0.5`}
-              onClick={toggleDark}
-              title={dark ? t("tb.light") : t("tb.dark")}
+              className={`${TB_BTN} tabular-nums text-neutral-600 dark:text-neutral-300 hover:text-neutral-800 dark:hover:text-neutral-100 w-11 text-center`}
+              onClick={() => setZoomOpen((o) => !o)}
+              title={t("tb.zoomPresets")}
             >
-              {dark ? <IconSun /> : <IconMoon />}
+              {Math.round(scale * 100)}%
             </button>
-            <span className="mx-2 h-4 w-px bg-neutral-900/15 dark:bg-neutral-100/20" />
-            {/* the «translation + tools» group: the Orig|Translation segment
-                (mirrors T), the run menu, «Ask» */}
-            {trInfo !== null && (
-              <div className="flex gap-0.5 p-0.5 mr-1 rounded-full bg-neutral-100 dark:bg-neutral-900/50">
-                {(["orig", "tr"] as const).map((m) => (
+            {zoomOpen && (
+              <div className="overlay-pop absolute left-1/2 -translate-x-1/2 top-full mt-2.5 z-20 rounded-xl bg-white/95 dark:bg-neutral-800/95 backdrop-blur shadow-xl p-1.5 text-left">
+                {(
+                  [
+                    ["width", t("tb.fitWidth"), K("Ctrl+0")],
+                    ["page", t("tb.fitPage"), null],
+                  ] as const
+                ).map(([m, label, hint]) => (
                   <button
                     key={m}
-                    className={`rounded-full px-2 transition-colors ${
-                      viewMode === m
-                        ? "bg-white dark:bg-neutral-700 shadow-sm"
-                        : "text-neutral-500 dark:text-neutral-400 hover:bg-neutral-900/5 dark:hover:bg-neutral-100/10"
-                    }`}
-                    onClick={() => setView(m)}
-                    title={m === "orig" ? t("tb.originalKey") : t("tb.translationKey")}
+                    className={`${MENU_ROW} flex items-baseline justify-between gap-4${fitMode === m ? " text-accent" : ""}`}
+                    onClick={() => { setZoomOpen(false); applyFit(m); }}
                   >
-                    {m === "orig" ? t("tb.original") : t("tb.translation")}
+                    {label}
+                    {hint && <span className="text-xs text-neutral-400 dark:text-neutral-500">{hint}</span>}
+                  </button>
+                ))}
+                <div className="mx-1 my-1 h-px bg-neutral-900/10 dark:bg-neutral-100/10" />
+                {[1, 1.25, 1.5, 2].map((s) => (
+                  <button
+                    key={s}
+                    className={`${MENU_ROW} tabular-nums${fitMode === null && Math.round(scale * 100) === s * 100 ? " text-accent" : ""}`}
+                    onClick={() => { setZoomOpen(false); zoomTo(s); }}
+                  >
+                    {s * 100}%
                   </button>
                 ))}
               </div>
             )}
-            <span className="relative" data-trmenu>
+          </span>
+          <button className={`${TB_BTN} px-1.5`} onClick={() => zoomTo(scale + 0.125)} title={t("tb.zoomIn")}>
+            +
+          </button>
+          <span className="ml-1 flex items-center gap-1">
+            {/* active column mode carries the accent — the app's one active color */}
+            {([1, 2, "auto"] as const).map((c) => (
               <button
-                className={`${TB_BTN} px-1 whitespace-nowrap`}
-                onClick={() => setMenuOpen((o) => !o)}
-                title={t("tb.trMenu")}
+                key={String(c)}
+                className={`${TB_BTN} px-1.5 py-0.5 ${cols === c ? "text-accent" : "text-neutral-500 dark:text-neutral-400"}`}
+                onClick={() => setColsMode(c)}
+                title={c === 1 ? t("tb.col1") : c === 2 ? t("tb.col2") : t("tb.colAuto")}
               >
-                {modelStatus !== null && !statusUp(modelStatus) && (
-                  // model not ready — the single «look here» signal
-                  <span
-                    className={`mr-1.5 inline-block h-1.5 w-1.5 rounded-full bg-amber-500 align-middle ${
-                      modelStatus === "starting" || dlBusy(dlMain) ? "animate-pulse" : ""
-                    }`}
-                  />
-                )}
-                {t("tb.translation")} <IconChevronDown className="ml-0.5" />
+                <IconColumns n={c === "auto" ? 3 : c} />
               </button>
-              {menuOpen && (
-                <div className="overlay-pop absolute right-0 top-full mt-2.5 z-20 w-64 rounded-xl bg-white/95 dark:bg-neutral-800/95 backdrop-blur shadow-xl p-1.5 text-left">
-                  <div>
-                    {trRun ? (
-                      // the status is not clickable, pause is its own button, and
-                      // the caption is constant (the engine writes every page at once)
-                      <div className="px-2.5 py-1.5 select-none">
-                        <div className="tabular-nums">
-                          {/* update sweeps a 100%-done store — its progress is
-                              the run's swept-pages counter, not donePages */}
-                          {run?.update
-                            ? t("tr.updating", { pct: Math.floor((100 * run.done) / Math.max(1, run.total)) })
-                            : `${trPct}%`}
-                          {run?.stalled ? t("tr.modelGone") : fmtEta(run?.etaMs)}
-                        </div>
-                        <button
-                          className="mt-1 -mx-1 px-1 rounded transition-colors hover:bg-neutral-100 dark:hover:bg-neutral-700/70"
-                          onClick={() => {
-                            if (path) void booktranslate.stopRun(path);
-                          }}
-                        >
-                          {t("tr.pause")}
-                        </button>
-                        <div className="mt-1 text-xs text-neutral-500 dark:text-neutral-400">{t("tr.pagesKept")}</div>
-                      </div>
-                    ) : trInfo === null ? (
-                      hasText === false ? (
-                        // scan: nothing to feed the model — honest refusal
-                        // instead of an instantly-«done» empty translation
-                        <div className="px-2.5 py-1.5 text-neutral-500 dark:text-neutral-400 cursor-default">
-                          {t("tr.noTextLayer")}
-                        </div>
-                      ) : (
-                        <button
-                          className={MENU_ROW}
-                          onClick={() => {
-                            setMenuOpen(false);
-                            startTr();
-                          }}
-                          title={t("tr.startTitle")}
-                        >
-                          {t("tr.start")}
-                        </button>
-                      )
-                    ) : trInfo.done < trInfo.total ? (
-                      <button
-                        className={`${MENU_ROW} tabular-nums`}
-                        onClick={() => {
-                          setMenuOpen(false);
-                          startTr();
-                        }}
-                        title={t("tr.resumeTitle", { done: trInfo.done, total: trInfo.total })}
-                      >
-                        {t("tr.resume", { pct: trPct })}
-                      </button>
-                    ) : (
-                      <div className="px-2.5 py-1.5 text-neutral-500 dark:text-neutral-400">{t("tr.complete")}</div>
-                    )}
-                    {/* «Обновить перевод»: инкрементальная пересборка готового
-                        with the current engine — the non-destructive twin of
-                        «Translate again», hidden while any run is going. An
-                        interrupted update (the updatedThrough watermark) shows
-                        in the caption — a click resumes from there */}
-                    {trInfo !== null && !trRun && (
-                      <button
-                        className={`${MENU_ROW}${updPct > 0 ? " tabular-nums" : ""}`}
-                        onClick={() => {
-                          setMenuOpen(false);
-                          startTr(true);
-                        }}
-                        title={t("tr.updateTitle")}
-                      >
-                        {updPct > 0 ? t("tr.updateResume", { pct: updPct }) : t("tr.update")}
-                      </button>
-                    )}
-                    {/* деструктивное подтверждение (#11): следствие + кнопка,
-                        naming the action; «Translate again» */}
-                    {trInfo !== null &&
-                      (confirmRestart ? (
-                        <div className="px-2.5 py-1.5">
-                          <div className="text-neutral-600 dark:text-neutral-300">{t("tr.redoWarn")}</div>
-                          <div className="mt-1 flex flex-col items-start gap-1">
-                            <button
-                              className="-mx-1 px-1 rounded text-red-600 dark:text-red-400 transition-colors hover:bg-red-500/10"
-                              onClick={() => {
-                                setConfirmRestart(false);
-                                setMenuOpen(false);
-                                retranslate();
-                              }}
-                            >
-                              {t("tr.redoConfirm")}
-                            </button>
-                            <button
-                              className="-mx-1 px-1 rounded transition-colors hover:bg-neutral-100 dark:hover:bg-neutral-700/70"
-                              onClick={() => setConfirmRestart(false)}
-                            >
-                              {t("ui.cancel")}
-                            </button>
-                          </div>
-                        </div>
-                      ) : (
-                        <button
-                          className={MENU_ROW}
-                          onClick={() => setConfirmRestart(true)}
-                          title={t("tr.redoTitle")}
-                        >
-                          {t("tr.redo")}
-                        </button>
-                      ))}
-                    {/* export: one click and the file is in Downloads.
-                        PDF is the main path (the original's
-                        illustrations are embedded); while the hidden window
-                        prints, the row is a spinner and the menu stays open, so
-                        the effect of the click is visible where it happened.
-                        On a partial translation the caption says honestly how
-                        many pages will land in the file */}
-                    {trInfo !== null && trInfo.done > 0 && (
-                      <>
-                        {/* PDF export leans on the platform's own silent print
-                            pipeline; where there is none, the row is absent
-                            rather than a button that always fails */}
-                        {!host().pdfExport ? null : pdfBusy ? (
-                          <div className="px-2.5 py-1.5 flex items-center gap-1.5 text-neutral-500 dark:text-neutral-400">
-                            <Spinner /> {t("tr.pdfPreparing")}
-                          </div>
-                        ) : (
-                          <button
-                            className={MENU_ROW}
-                            onClick={exportPdf}
-                            title={t("tr.exportPdfTitle")}
-                          >
-                            {t("tr.exportPdf")}
-                            {trInfo.done < trInfo.total && (
-                              <div className="text-xs text-neutral-500 dark:text-neutral-400 tabular-nums">
-                                {t("tr.exportPartial", { done: trInfo.done, total: trInfo.total })}
-                              </div>
-                            )}
-                          </button>
-                        )}
-                        <button
-                          className={MENU_ROW}
-                          onClick={() => {
-                            setMenuOpen(false);
-                            exportTr();
-                          }}
-                          title={t("tr.exportHtmlTitle")}
-                        >
-                          {t("tr.exportHtml")}
-                        </button>
-                      </>
-                    )}
-                    <button
-                      className={MENU_ROW}
-                      onClick={() => {
-                        setMenuOpen(false);
-                        setGlossOpen(true);
-                      }}
-                      title={t("tr.glossaryTitle")}
-                    >
-                      {t("tr.glossary")}
-                    </button>
-                  </div>
-                  {/* model status row — one status vocabulary, app-wide */}
-                  {modelStatus && (
-                    <div className="mt-1 border-t border-neutral-200 dark:border-neutral-700 px-2.5 pt-1.5 pb-1 text-xs">
-                      {dlBusy(dlMain) ? (
-                        <button
-                          className={`${MENU_QUIET} tabular-nums`}
-                          onClick={() => {
-                            setMenuOpen(false);
-                            setSetupOpen(true);
-                          }}
-                          title={t("model.bgDownload")}
-                        >
-                          {t("model.downloading", { pct: dlPct(dlMain) })}
-                        </button>
-                      ) : modelStatus === "starting" || (dlMain.status === "done" && !statusUp(modelStatus)) ? (
-                        <span className="flex items-center gap-1.5 text-neutral-500 dark:text-neutral-400">
-                          <Spinner /> {t("model.starting")}
-                        </span>
-                      ) : statusUp(modelStatus) ? (
-                        <span className="text-neutral-500 dark:text-neutral-400">{t("model.ready")}</span>
-                      ) : modelStatus === "dead" ? (
-                        <button
-                          className={MENU_QUIET}
-                          onClick={() => restartModel().then((s) => setModelStatus(s))}
-                        >
-                          {t("model.deadRestart")}
-                        </button>
-                      ) : (
-                        <button
-                          className={MENU_QUIET}
-                          onClick={() => {
-                            setMenuOpen(false);
-                            setSetupOpen(true);
-                          }}
-                        >
-                          {modelStatus === "noengine"
-                            ? t("model.noEngine")
-                            : t("model.notInstalled", { size: sizeLabel("main") })}
-                        </button>
-                      )}
-                    </div>
-                  )}
-                  {/* «Settings» + «About Chitallo» */}
-                  <div className="mt-1 flex flex-col gap-1 border-t border-neutral-200 dark:border-neutral-700 px-2.5 pt-1.5 pb-1 text-xs">
-                    <button
-                      className={MENU_QUIET}
-                      onClick={() => {
-                        setMenuOpen(false);
-                        setSettingsOpen(true);
-                      }}
-                    >
-                      {t("cmd.settings")}
-                    </button>
-                    <button
-                      className={MENU_QUIET}
-                      onClick={() => {
-                        setMenuOpen(false);
-                        setAboutOpen(true);
-                      }}
-                    >
-                      {t("app.about")}
-                    </button>
-                  </div>
-                </div>
-              )}
-            </span>
-            {/* «Спросить»: chat sidebar over Claude, empty thread from here */}
-            <button className={`${TB_BTN} px-1`} onClick={toggleAsk} title={t("tb.askTitle")}>
-              {t("tb.ask")}
-            </button>
-          </>
-        )}
-        {!doc && (
-          <>
-            <button
-              className={`${TB_BTN} px-1 py-0.5`}
-              onClick={toggleDark}
-              title={dark ? t("tb.light") : t("tb.dark")}
-            >
-              {dark ? <IconSun /> : <IconMoon />}
-            </button>
-            {/* in the reader, Settings lives in the «Translation» menu; here it
-                gets its own glyph */}
-            <button
-              className={`${TB_BTN} px-1 py-0.5`}
-              onClick={() => setSettingsOpen(true)}
-              title={t("tb.settingsKey")}
-            >
-              <IconSliders />
-            </button>
-          </>
-        )}
-      </div>
+            ))}
+          </span>
+          <button
+            className={`${TB_BTN} ml-1 px-1 py-0.5`}
+            onClick={toggleDark}
+            title={dark ? t("tb.light") : t("tb.dark")}
+          >
+            {dark ? <IconSun /> : <IconMoon />}
+          </button>
+          <span className="mx-2 h-4 w-px bg-neutral-900/15 dark:bg-neutral-100/20" />
+          {/* последняя группа: сегмент «Оригинал | Перевод» (зеркало T —
+              вид принадлежит тулбару), вход в палитру и створка панели.
+              Прогон, оглавление и «Спросить» уехали во вкладки (WP-N) */}
+          {trInfo !== null && (
+            <div className="flex gap-0.5 p-0.5 mr-1 rounded-full bg-neutral-100 dark:bg-neutral-900/50">
+              {(["orig", "tr"] as const).map((m) => (
+                <button
+                  key={m}
+                  className={`rounded-full px-2 transition-colors ${
+                    viewMode === m
+                      ? "bg-white dark:bg-neutral-700 shadow-sm"
+                      : "text-neutral-500 dark:text-neutral-400 hover:bg-neutral-900/5 dark:hover:bg-neutral-100/10"
+                  }`}
+                  onClick={() => setView(m)}
+                  title={m === "orig" ? t("tb.originalKey") : t("tb.translationKey")}
+                >
+                  {m === "orig" ? t("tb.original") : t("tb.translation")}
+                </button>
+              ))}
+            </div>
+          )}
+          {/* Ctrl K — палитра команд; бейдж-клавиша, а не слово: он
+              называет вход и заодно учит клавише */}
+          <button
+            className={`${TB_BTN} ml-0.5 rounded-md border border-neutral-200 bg-white px-1.5 py-px font-mono text-[10px] text-neutral-400 dark:border-transparent dark:bg-neutral-100/8 dark:text-neutral-500`}
+            onClick={togglePalette}
+            title={t("tb.palette")}
+          >
+            {K("Ctrl K")}
+          </button>
+          {/* створка панели: акцент, пока она открыта */}
+          <button
+            className={`${TB_BTN} ml-0.5 px-1 py-0.5 ${
+              panelOpen ? "text-accent" : "text-neutral-500 dark:text-neutral-400"
+            }`}
+            onClick={() => setPanel(!panelOpen)}
+            title={t("tb.panel")}
+          >
+            <PanelRightIcon aria-hidden className="inline-block size-3.5 align-[-0.125em]" strokeWidth={1.5} />
+          </button>
+        </div>
+      )}
 
       {/* Ctrl+F — sibling pill under the toolbar, same centering shift */}
       {doc && findOpen && (
@@ -2890,12 +2810,12 @@ export default function App() {
           curPage={curPage}
           focusNonce={findNonce}
           seed={findSeed}
-          leftShift={askOpen ? askW / 2 : 0}
+          leftShift={panelOpen ? askW / 2 : 0}
           onClose={() => setFindOpen(false)}
         />
       )}
 
-      {/* flex row: reading area shrinks when the «Спросить» sidebar is open — never an overlay */}
+      {/* flex row: reading area shrinks when the panel is open — never an overlay */}
       <div className="flex h-full">
         {doc && baseSize ? (
           <div ref={scrollRef} className="h-full flex-1 min-w-0 overflow-y-auto" onScroll={onScroll} onClick={onAltClick}>
@@ -2922,20 +2842,87 @@ export default function App() {
           </div>
         ) : (
           <div className="flex-1 min-w-0 h-full">
-            <Library onOpen={openPath} onAbout={() => setAboutOpen(true)} />
+            {/* (WP-N) пилюли над библиотекой нет, поэтому её строка заголовка
+                держит оба входа, что раньше висели на пилюле: настройки (Ctrl+,)
+                и «Открыть файл» (Ctrl+O) — последний единственный доступен мышью
+                для книги вне папки библиотеки */}
+            <Library
+              onOpen={openPath}
+              onAbout={() => setAboutOpen(true)}
+              onSettings={() => setSettingsOpen(true)}
+              onOpenFile={openDialog}
+            />
           </div>
         )}
-        {/* mounted (hidden) while a book is open so an in-flight ask streams on across toggles */}
+        {/* Панель — последний флекс-ребёнок того же ряда: область чтения
+            сжимается, страницу панель не накрывает. Смонтирована, пока открыта
+            книга (даже закрытой): поток ответа «Спросить» переживает
+            переключения, а вкладка «Перевод» — единственное место, где видно
+            прогон. */}
         {doc && path && (
-          <AskSidebar
-            open={askOpen}
-            bookPath={path}
-            bookTitle={baseName(path).replace(/\.pdf$/i, "")}
-            page={curPage}
-            seed={askSeed}
+          <Panel
+            open={panelOpen}
+            tab={panelTab}
+            onTab={selectTab}
+            onClose={() => setPanel(false)}
             width={askW}
             onWidth={setAskW}
-            onClose={() => setAsk(false)}
+            askCount={askCount}
+            trPct={trInfo ? bandPct : null}
+            trAttention={trState === "paused" || anyStall}
+            outline={
+              <Outline
+                doc={doc}
+                page={curPage}
+                active={panelOpen && panelTab === "outline"}
+                trTitle={trOutlineTitle}
+                // прыжок панель не закрывает: оглавление стоит открытым, пока читают
+                onJump={goToPage}
+                onClose={() => setPanel(false)}
+              />
+            }
+            ask={
+              <AskSidebar
+                open={panelOpen && panelTab === "ask"}
+                bookPath={path}
+                bookTitle={baseName(path).replace(/\.pdf$/i, "")}
+                page={curPage}
+                total={doc.numPages}
+                pageText={getAskPageText}
+                seed={askSeed}
+                onCount={setAskCount}
+              />
+            }
+            translate={
+              <TranslatePanel
+                state={trState}
+                done={trInfo?.done ?? 0}
+                total={trInfo?.total ?? doc.numPages}
+                pct={bandPct}
+                eta={trState === "running" ? fmtEta(run?.etaMs) : undefined}
+                reason={run?.stalled ? t("tr.modelGone") : undefined}
+                noTextLayer={hasText === false}
+                updPct={updPct}
+                glossaryTerms={glossaryTerms}
+                pdfExport={host().pdfExport}
+                pdfBusy={pdfBusy}
+                exportError={exportError}
+                startError={startError}
+                modelStatus={modelStatus}
+                modelDl={dlMain}
+                onStart={() => void startTr()}
+                onPause={() => void booktranslate.stopRun(path)}
+                onResume={() => void startTr()}
+                onUpdate={() => void startTr(true)}
+                onRetranslate={() => void retranslate()}
+                onCheckModel={checkModel}
+                onGlossary={() => setGlossOpen(true)}
+                onExportPdf={() => void exportPdf()}
+                onExportHtml={() => void exportTr()}
+                onModelSetup={() => setSetupOpen(true)}
+                onModelRestart={() => void restartModel().then(setModelStatus)}
+              />
+            }
           />
         )}
       </div>
@@ -2953,7 +2940,7 @@ export default function App() {
           // selection inside them — Chromium fires no selectionchange for that,
           // so without this key the bar would hang over dead nodes with a stale
           // payload while the book translates under the reader.
-          layoutKey={`${scale}|${nColsEff}|${viewMode}|${trFont}|${askOpen ? askW : 0}|${trVersion}`}
+          layoutKey={`${scale}|${nColsEff}|${viewMode}|${trFont}|${panelOpen ? askW : 0}|${trVersion}`}
           onGone={() => setSelBar(null)}
           // tr-selections swap «Перевести» for «Оригинал» — translating the
           // translation back is nonsense (choice documented in SelectionBar)
@@ -3015,7 +3002,7 @@ export default function App() {
           commands={paletteCommands}
           numPages={doc?.numPages}
           currentPath={path}
-          onOpenBook={openPath}
+          onOpenBook={openPathQuiet}
           onGoToPage={goToPage}
           onFind={doc ? findSeeded : undefined}
           onClose={() => setPaletteOpen(false)}
@@ -3030,28 +3017,28 @@ export default function App() {
           onClose={() => setCtxMenu(null)}
         />
       )}
-      {toast && (
+      {notice && (
         /* z-40 and last in the DOM: the toast reads even over a modal's scrim
            (TXT export from Settings); the palette (z-50) still wins. The toast
            itself passes clicks through — only its action button is live */
         <div
           className="overlay-pop fixed bottom-6 -translate-x-1/2 z-40 rounded-2xl bg-white/95 dark:bg-neutral-800/95 backdrop-blur px-4 py-2 shadow-xl text-sm text-neutral-700 dark:text-neutral-200 select-none pointer-events-none text-center"
           // centered over the READING area, like the toolbar: a nowrap pill at
-          // 50% ran under the «Спросить» panel (118 px at a 1100 px window). Width
+          // 50% ran under the panel (118 px at a 1100 px window). Width
           // is capped against that same reading area, not the viewport: the panel
           // is draggable, and a viewport-wide cap let a long message run under it.
           style={{
-            left: doc && askOpen ? `calc(50% - ${askW / 2}px)` : "50%",
-            maxWidth: `calc(min(40rem, 100vw - ${doc && askOpen ? askW : 0}px - 2rem))`,
+            left: doc && panelOpen ? `calc(50% - ${askW / 2}px)` : "50%",
+            maxWidth: `calc(min(40rem, 100vw - ${doc && panelOpen ? askW : 0}px - 2rem))`,
           }}
         >
-          {toast.msg}
-          {toast.action && (
+          {notice.msg}
+          {notice.action && (
             <button
               className="pointer-events-auto ml-3 font-medium text-neutral-900 dark:text-neutral-50 transition-colors hover:text-neutral-500 dark:hover:text-neutral-300"
-              onClick={toast.action.run}
+              onClick={notice.action.run}
             >
-              {toast.action.label}
+              {notice.action.label}
             </button>
           )}
         </div>

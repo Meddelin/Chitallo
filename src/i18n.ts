@@ -9,8 +9,14 @@
 // Plurals: a value may carry its forms separated by `|` — three for Russian
 // (one / few / many), two for English (one / other). `t()` picks the form from
 // `vars.n`, so call sites never think about grammar:
-//   t("lib.covers", { done: 3, total: 12 })
-//   t("settings.books", { n: 5 })          → «5 книг» / "5 books"
+//   t("set.coversTitle", { n: 12 })
+//   t("set.books", { n: 5 })               → «5 книг» / "5 books"
+//
+// Direction B says status out loud in numbers, so a line often carries two of
+// them: «84 из 210 страниц сохранены». Only one can govern the grammar, and it
+// is always `n` — the total the noun belongs to. Hence the convention across
+// this catalogue: `{n}` is the counted noun, `{done}` and friends are the rest.
+//   t("tr.pagesKept", { done: 84, n: 210 })   (WP-N)
 //
 // The chosen language is also the language books are translated INTO: a reader
 // who runs Chitallo in Russian wants Russian pages, one who runs it in English
@@ -28,8 +34,8 @@ const LS_KEY = "pdfer:lang";
 
 const S = {
   // -- shared verbs and nouns --
-  "ui.close": ["Закрыть (Esc)", "Close (Esc)"],
-  "ui.cancel": ["Отмена", "Cancel"],
+  "ui.close": ["Закрыть · Esc", "Close · Esc"],
+  "ui.cancel": ["Отменить", "Cancel"],
   "ui.delete": ["Удалить", "Delete"],
   "ui.download": ["Скачать", "Download"],
   "ui.retry": ["Повторить", "Try again"],
@@ -37,272 +43,282 @@ const S = {
   "ui.open": ["Открыть", "Open"],
   "ui.copy": ["Копировать", "Copy"],
   "ui.copied": ["Скопировано", "Copied"],
-  "ui.back": ["Назад", "Back"],
   "ui.next": ["Далее", "Next"],
-  "ui.skip": ["Пропустить", "Skip"],
-  "ui.done": ["Готово", "Done"],
   "ui.none": ["нет", "none"],
   "ui.notFound": ["Ничего не нашлось", "Nothing found"],
-  "ui.copyFailed": ["Не удалось скопировать", "Could not copy"],
-  "ui.openFolderFailed": ["Не удалось открыть папку", "Could not open the folder"],
+  "ui.openFolderFailed": ["Папка не открылась", "The folder did not open"],
+  // (WP-N) the checklist and every «not found» line ends in the same verb.
+  "ui.install": ["Установить", "Install"],
 
   // -- app identity --
-  "app.tagline": ["Читалка с локальным переводом", "A reader that translates books locally"],
+  "app.tagline": [
+    "Локальный перевод книг и вопросы по тексту",
+    "Local book translation, and questions about the text",
+  ],
   "app.privacy": [
-    "Работает полностью офлайн. Книги и переводы не покидают ваш компьютер",
-    "Works fully offline. Your books and translations never leave this computer",
+    "Работает офлайн · книги и переводы остаются на компьютере",
+    "Works offline · books and translations stay on this computer",
   ],
   "app.privacyAsk": [
-    "Исключение — «Спросить»: вопрос и фрагмент книги отправляются в Claude.",
-    "One exception — «Ask»: your question and a fragment of the book go to Claude.",
+    "Кроме «Спросить»: вопрос и фрагмент книги уходят в Claude",
+    "Except «Ask»: the question and a fragment of the book go to Claude",
   ],
   "app.about": ["О Chitallo", "About Chitallo"],
-  "app.openFail": [
-    "Не удалось открыть файл — он перемещён или повреждён",
-    "Could not open the file — it was moved or is damaged",
-  ],
 
   // -- onboarding --
-  "ob.langTitle": ["Выберите язык", "Choose your language"],
+  "ob.langTitle": ["Язык", "Language"],
   "ob.langBody": [
-    "На этом языке будет интерфейс — и на него Chitallo будет переводить книги.",
-    "This is the language of the interface — and the language Chitallo will translate books into.",
+    "Язык интерфейса и язык, на который переводим книги",
+    "The language of the interface, and the language we translate books into",
   ],
-  "ob.step": ["Шаг {n} из {total}", "Step {n} of {total}"],
-  "ob.engineTitle": ["Движок перевода", "Translation engine"],
   "ob.engineFound": ["llama.cpp найден", "llama.cpp found"],
   "ob.engineMissing": ["llama.cpp не найден", "llama.cpp not found"],
   "ob.engineRecheck": ["Проверить снова", "Check again"],
-  "ob.engineAfter": [
-    "Поставили — нажмите «Проверить снова». Приложение перезапускать не нужно.",
-    "Once it is installed, hit «Check again». No need to restart the app.",
-  ],
   "ob.weightsTitle": ["Модель перевода", "Translation model"],
-  "ob.weightsBody": [
-    "Веса модели скачиваются один раз и остаются на компьютере. Дальше перевод работает без интернета.",
-    "The model weights download once and stay on your computer. After that, translation needs no internet.",
-  ],
-  "ob.weightsReady": ["Модель на месте", "Model is in place"],
-  "ob.claudeTitle": ["Вопросы по книге", "Questions about the book"],
-  "ob.claudeBody": [
-    "«Спросить» задаёт вопросы о том, что вы читаете, через Claude Code. Это единственная функция, которой нужен интернет, и она полностью необязательна.",
-    "«Ask» answers questions about what you are reading, through Claude Code. It is the only feature that needs the internet, and it is entirely optional.",
-  ],
-  "ob.claudeFound": ["Claude Code подключён", "Claude Code connected"],
   "ob.claudeMissing": ["Claude Code не найден", "Claude Code not found"],
-  "ob.claudeAccount": [
-    "Нужна подписка Claude Pro или Max — после установки выполните «claude» в терминале и войдите.",
-    "Requires a Claude Pro or Max plan — after installing, run «claude» in a terminal and sign in.",
-  ],
   "ob.claudeDocs": ["Инструкция по установке", "Installation guide"],
   "ob.copyCmd": ["Скопировать команду", "Copy the command"],
-  "ob.readyTitle": ["Всё готово", "You are set"],
-  "ob.readyBody": [
-    "Откройте PDF — выделите предложение, и перевод появится рядом. Alt+клик переводит абзац целиком, «Перевод ▾» — всю книгу.",
-    "Open a PDF — select a sentence and the translation appears next to it. Alt+click translates a whole paragraph, «Translate ▾» the whole book.",
-  ],
+  "ob.readyTitle": ["Готово", "Ready"],
   "ob.start": ["Открыть библиотеку", "Open the library"],
-  "ob.later": ["Настроить позже", "Set this up later"],
-  "ob.skipAll": ["Пропустить настройку", "Skip setup"],
-  "ob.rerun": ["Пройти настройку заново", "Run setup again"],
+  "ob.rerun": ["Пройти заново", "Run it again"],
+  // (WP-N) The first run is one checklist, not a five-screen wizard: what is
+  // already in place, what is missing and what each item buys — all at once,
+  // and the library opens from any line of it.
+  "ob.setupTitle": ["Настройка", "Setup"],
+  "ob.setupBody": [
+    "Любой пункт можно отложить — читалка откроется и так",
+    "Any item can wait — the reader opens either way",
+  ],
+  "ob.rowLang": ["Язык интерфейса и перевода", "Interface and translation language"],
+  "ob.claudeWhy": [
+    "Нужен только для «Спросить» · подписка Claude Pro или Max",
+    "Only «Ask» needs it · a Claude Pro or Max plan",
+  ],
+  "ob.readyLib": ["Библиотека: {path}", "Library: {path}"],
+  "ob.readyTr": ["Перевод: {model} · офлайн", "Translation: {model} · offline"],
+  "ob.readyAskOn": ["Спросить: включено", "Ask: on"],
+  "ob.readyAskOff": ["Спросить: выключено", "Ask: off"],
 
   // -- model status vocabulary (one wording, every surface) --
   "model.title": ["Модель перевода", "Translation model"],
-  "model.ready": ["Модель перевода: готова", "Translation model: ready"],
-  "model.starting": ["Модель перевода: запускается…", "Translation model: starting…"],
-  "model.startingShort": ["Модель запускается… ≈20 с", "Model is starting… ~20 s"],
+  "model.starting": ["Модель перевода: запускается", "Translation model: starting"],
+  "model.startingShort": ["Модель запускается · ~20 с", "Model starting · ~20 s"],
   "model.dead": ["Модель не отвечает", "The model is not responding"],
   "model.deadRestart": ["Модель не отвечает · Перезапустить", "Model not responding · Restart"],
-  "model.notInstalled": [
-    "Модель не установлена · Скачать ({size})",
-    "Model not installed · Download ({size})",
-  ],
+  "model.notInstalled": ["Модель не установлена · Скачать {size}", "Model not installed · Download {size}"],
   "model.noEngine": ["llama.cpp не установлен · Как поставить", "llama.cpp not installed · How to install"],
-  "model.noEngineTitle": ["Нужен llama.cpp", "llama.cpp is required"],
   "model.noEngineBody": [
-    "Перевод выполняет llama.cpp — Chitallo его не приносит с собой. Одна команда, и он на месте:",
-    "Translation runs on llama.cpp, which Chitallo does not ship. One command installs it:",
+    "Перевод выполняет llama.cpp · одна команда, и он на месте",
+    "Translation runs on llama.cpp · one command puts it in place",
   ],
-  "model.downloading": ["Модель скачивается · {pct}%", "Downloading the model · {pct}%"],
-  "model.downloadingDetail": ["Модель скачивается · {detail}", "Downloading the model · {detail}"],
+  "model.downloading": ["Скачиваю модель · {pct}%", "Downloading the model · {pct}%"],
+  "model.downloadingDetail": ["Скачиваю модель · {detail}", "Downloading the model · {detail}"],
   "model.downloadingBg": [
-    "Модель скачивается — можно читать, скачивание продолжится в фоне.",
-    "The model is downloading — you can read meanwhile, it continues in the background.",
+    "Скачиваю модель в фоне · можно читать",
+    "Downloading the model in the background · you can read",
   ],
   "model.readyHint": [
-    "Модель перевода: готова. Выделите текст или Alt+кликните по абзацу — перевод появится рядом.",
-    "Translation model: ready. Select some text, or Alt+click a paragraph, and the translation appears next to it.",
+    "Модель перевода: готова · выделите текст или Alt+клик по абзацу",
+    "Translation model: ready · select text, or Alt+click a paragraph",
   ],
   "model.pitch": [
-    "Chitallo переводит книги локально, без интернета и подписок. Нужна модель перевода — она скачивается один раз и остаётся на компьютере.",
-    "Chitallo translates books locally — no internet, no subscription. It needs a translation model, downloaded once and kept on your computer.",
-  ],
-  "model.pitchShort": [
-    "Chitallo переводит книги локально, без интернета и подписок",
-    "Chitallo translates books locally — no internet, no subscription",
+    "Локальный перевод книг · модель скачивается один раз и остаётся на компьютере",
+    "Local book translation · the model downloads once and stays on this computer",
   ],
   "model.line": ["HY-MT1.5 · {size} · перевод офлайн", "HY-MT1.5 · {size} · offline translation"],
-  "model.downloadCta": ["Скачать модель перевода ({size})", "Download the translation model ({size})"],
+  "model.downloadCta": ["Скачать модель перевода · {size}", "Download the translation model · {size}"],
   "model.resumeCta": ["Продолжить скачивание · {pct}%", "Resume the download · {pct}%"],
   "model.downloadShort": ["Скачать модель", "Download the model"],
   "model.needed": [
-    "Для перевода нужна модель — {size}, скачивается один раз, работает офлайн",
-    "Translation needs a model — {size}, downloaded once, then offline",
+    "Для перевода нужна модель · {size} · один раз, дальше офлайн",
+    "Translation needs a model · {size} · once, then offline",
   ],
   "model.neededShort": [
-    "Для перевода нужна модель — {size}, скачивается один раз",
-    "Translation needs a model — {size}, downloaded once",
+    "Для перевода нужна модель · {size}",
+    "Translation needs a model · {size}",
   ],
-  "model.later": ["Позже — просто читать", "Later — just read"],
-  "model.verifying": ["Проверка файла…", "Verifying the file…"],
-  "model.noSpace": [
-    "Недостаточно места на диске — нужно ещё {size}",
-    "Not enough disk space — {size} more is needed",
-  ],
-  "model.checksum": [
-    "Файл повреждён при скачивании — попробуйте ещё раз",
-    "The file was damaged during download — please try again",
-  ],
-  "model.interrupted": [
-    "Скачивание прервалось — можно продолжить с того же места",
-    "The download stopped — it can resume from where it left off",
-  ],
+  "model.later": ["Читать без перевода", "Read without translation"],
+  "model.verifying": ["Проверяю файл", "Verifying the file"],
+  // (WP-N) A failed download is one row: the cause here, the verb beside it —
+  // and the verb is a real button, not a word inside a sentence. Surfaces with
+  // no button of their own get the two joined back by dlErrorLine().
+  "model.noSpace": ["Не хватает {size}", "{size} short"],
+  "model.freeSpace": ["Освободить место", "Free up space"],
+  "model.checksum": ["Файл повреждён", "The file is damaged"],
+  "model.redownload": ["Скачать заново", "Download again"],
+  "model.interrupted": ["Скачивание прервалось", "The download stopped"],
   "model.license": [
-    "Модель HY-MT1.5 (Tencent) — лицензия Hunyuan Community: бесплатно, в том числе для коммерческого использования; не действует в ЕС, Великобритании и Южной Корее.",
-    "The HY-MT1.5 model (Tencent) is under the Hunyuan Community License: free, commercial use included; not available in the EU, the UK or South Korea.",
+    "Лицензия Hunyuan Community · бесплатно, в том числе коммерчески · не действует в ЕС, Великобритании и Южной Корее",
+    "Hunyuan Community License · free, commercial use included · not valid in the EU, the UK or South Korea",
   ],
   "model.licenseTerms": ["Условия", "Terms"],
-  "model.bgDownload": [
-    "Скачивается в фоне — подробности и отмена",
-    "Downloading in the background — details and cancel",
-  ],
+  "model.bgDownload": ["Скачиваю в фоне · Подробности", "Downloading in the background · Details"],
+  // (WP-N) the pieces a status line is assembled from, so no surface writes its own
+  "model.licenseShort": ["Лицензия Hunyuan Community", "Hunyuan Community License"],
 
   // -- library --
   "lib.title": ["Библиотека", "Library"],
-  "lib.pick": ["Выбрать папку с книгами", "Choose a folder with books"],
+  "lib.pick": ["Выбрать папку", "Choose a folder"],
   "lib.pickNested": ["Включая все вложенные папки", "Subfolders included"],
-  "lib.changeFolder": ["Сменить папку", "Change folder"],
   "lib.pickOther": ["Выбрать другую папку", "Choose another folder"],
-  "lib.covers": ["Обложки: {done} из {total}", "Covers: {done} of {total}"],
-  "lib.search": ["Найти книгу…", "Find a book…"],
-  "lib.scanning": ["Поиск PDF…", "Looking for PDFs…"],
-  "lib.empty": ["В этой папке не нашлось PDF", "No PDFs in this folder"],
+  "lib.search": ["Найти книгу", "Find a book"],
+  "lib.scanning": [
+    "Сканирую папку · {n} файл|Сканирую папку · {n} файла|Сканирую папку · {n} файлов",
+    "Scanning the folder · {n} file|Scanning the folder · {n} files",
+  ],
+  "lib.empty": ["PDF не найдены", "No PDFs found"],
   "lib.reading": ["Читаю", "Reading"],
-  "lib.all": ["Все книги", "All books"],
-  "lib.hint": [
-    "Выделите текст — {tr} · Alt+клик — абзац · {t} — перевод/оригинал",
-    "Select text — {tr} · Alt+click — paragraph · {t} — translation/original",
-  ],
-  "lib.hintHide": ["Скрыть подсказку", "Hide this hint"],
-  "lib.translating": ["Книга переводится", "Translating this book"],
-  "lib.stalled": [
-    "Модель недоступна — перевод приостановлен, готовые страницы сохранены",
-    "The model is unavailable — translation paused, finished pages are saved",
-  ],
+  "lib.all": ["Все", "All"],
+  "lib.translating": ["Перевод · {pct}%", "Translation · {pct}%"],
+  "lib.stalled": ["Пауза · модель недоступна", "Paused · model unavailable"],
+  // (WP-N) the segmented filter took over from the «Reading» / «All books»
+  // headings, and a card says its state in one line of numbers.
+  "lib.filterTranslating": ["Переводится", "Translating"],
+  "lib.notOpened": ["не открывали", "not opened yet"],
+  "lib.pageOf": ["стр. {page} из {total}", "p. {page} of {total}"],
+  "lib.trPct": ["перевод {pct}%", "translated {pct}%"],
 
   // -- toolbar / reader --
   "tb.library": ["Библиотека", "Library"],
-  "tb.libraryEsc": ["Библиотека (Esc)", "Library (Esc)"],
-  "tb.openFile": ["Открыть файл", "Open a file"],
-  "tb.openFileKey": ["Открыть файл (Ctrl+O)", "Open a file (Ctrl+O)"],
-  "tb.pageAndToc": ["Страница и оглавление", "Page and contents"],
-  "tb.zoomOut": ["Мельче (Ctrl −, Ctrl+0 — по ширине)", "Zoom out (Ctrl −, Ctrl+0 fits width)"],
-  "tb.zoomIn": ["Крупнее (Ctrl +, Ctrl+0 — по ширине)", "Zoom in (Ctrl +, Ctrl+0 fits width)"],
-  "tb.zoomPresets": ["Масштаб: пресеты (Ctrl+0 — по ширине)", "Zoom presets (Ctrl+0 fits width)"],
+  "tb.libraryEsc": ["Библиотека · Esc", "Library · Esc"],
+  "tb.zoomOut": ["Мельче · Ctrl −", "Zoom out · Ctrl −"],
+  "tb.zoomIn": ["Крупнее · Ctrl +", "Zoom in · Ctrl +"],
+  "tb.zoomPresets": ["Пресеты масштаба · Ctrl+0 — по ширине", "Zoom presets · Ctrl+0 fits width"],
   "tb.fitWidth": ["По ширине", "Fit width"],
   "tb.fitPage": ["Страница целиком", "Whole page"],
-  "tb.col1": ["Одна страница в ряд (Ctrl+1)", "One page per row (Ctrl+1)"],
-  "tb.col2": ["Две страницы в ряд (Ctrl+2)", "Two pages per row (Ctrl+2)"],
-  "tb.colAuto": ["Автоподбор по ширине (Ctrl+3)", "Fit as many as fit (Ctrl+3)"],
-  "tb.dark": ["Тёмная тема (D)", "Dark theme (D)"],
-  "tb.light": ["Светлая тема (D)", "Light theme (D)"],
-  "tb.settingsKey": ["Настройки (Ctrl+,)", "Settings (Ctrl+,)"],
+  "tb.col1": ["Одна страница в ряд · Ctrl+1", "One page per row · Ctrl+1"],
+  "tb.col2": ["Две страницы в ряд · Ctrl+2", "Two pages per row · Ctrl+2"],
+  "tb.colAuto": ["Подобрать по ширине · Ctrl+3", "Fit as many as fit · Ctrl+3"],
+  "tb.dark": ["Тёмная тема · D", "Dark theme · D"],
+  "tb.light": ["Светлая тема · D", "Light theme · D"],
+  "tb.settingsKey": ["Настройки · Ctrl+,", "Settings · Ctrl+,"],
   "tb.ask": ["Спросить", "Ask"],
-  "tb.askTitle": ["Вопросы по книге (Ctrl+J)", "Questions about this book (Ctrl+J)"],
   "tb.original": ["Оригинал", "Original"],
   "tb.translation": ["Перевод", "Translation"],
-  "tb.originalKey": ["Оригинал (T)", "Original (T)"],
-  "tb.translationKey": ["Перевод (T)", "Translation (T)"],
-  "tb.trMenu": ["Перевод книги", "Translate the book"],
+  "tb.originalKey": ["Оригинал · T", "Original · T"],
+  "tb.translationKey": ["Перевод · T", "Translation · T"],
+  // (WP-N) what is left in the pill once the «Translate ▾» menu and the «Ask»
+  // button move into the panel: where you are, and two ways in.
+  "tb.pageOf": ["{page} / {total}", "{page} / {total}"],
+  "tb.pageOfTitle": ["Страница {page} из {total}", "Page {page} of {total}"],
+  "tb.palette": ["Палитра команд · Ctrl+K", "Command palette · Ctrl+K"],
+  "tb.panel": ["Панель · Ctrl+J", "The panel · Ctrl+J"],
 
-  // -- translation menu --
-  "tr.updating": ["Обновление · {pct}%", "Updating · {pct}%"],
+  // -- the panel: three tabs, always in this order (WP-N) --
+  "panel.outline": ["Оглавление", "Contents"],
+  "panel.ask": ["Спросить", "Ask"],
+  "panel.translate": ["Перевод", "Translation"],
+  "panel.close": ["Закрыть панель · Esc", "Close the panel · Esc"],
+  // A tab badge carries a number when it has one; a paused or broken run shows
+  // an amber dot instead, and this is what the dot says when pointed at.
+  "panel.attention": ["Требует внимания", "Needs attention"],
+  "panel.askBadge": ["{n} сообщение|{n} сообщения|{n} сообщений", "{n} message|{n} messages"],
+  "panel.trBadge": ["Перевод · {pct}%", "Translation · {pct}%"],
+  "panel.pageOf": ["{page} из {total} · {pct}%", "{page} of {total} · {pct}%"],
+
+  // -- refusals: cause on the left, verb on the right, one line each (WP-N) --
+  "err.needOcr": ["Нет текстового слоя · нужен OCR", "No text layer · it needs OCR"],
+  "err.whatIsThis": ["Что это значит", "What this means"],
+  // (WP-N) Одно предложение под отказом по скану: что именно случилось и что с
+  // этим делать. Разворачивается «Что это значит» прямо в карточке вкладки.
+  "err.needOcrBody": [
+    "Страницы книги — картинки · распознайте текст в другой программе, и перевод пойдёт",
+    "The pages are images · run text recognition elsewhere, then the translation will work",
+  ],
+  "err.notOpened": ["Не открылся", "Did not open"],
+  "err.exportPdf": ["Экспортировать в PDF не вышло · {reason}", "Export to PDF failed · {reason}"],
+  "err.exportHtml": ["Экспортировать в HTML не вышло · {reason}", "Export to HTML failed · {reason}"],
+  "err.noDiskSpace": ["нет места на диске", "no space on the disk"],
+
+  // -- the «Translation» tab (WP-N: the «Translate ▾» menu it replaced is gone) --
   "tr.modelGone": [" · модель недоступна", " · model unavailable"],
   "tr.pause": ["Приостановить", "Pause"],
-  "tr.pagesKept": ["Готовые страницы сохраняются", "Finished pages are being saved"],
-  "tr.noTextLayer": ["В книге нет текстового слоя — нужен OCR", "This book has no text layer — it needs OCR"],
+  "tr.pagesKept": [
+    "{done} из {n} страница сохранена|{done} из {n} страницы сохранены|{done} из {n} страниц сохранены",
+    "{done} of {n} page saved|{done} of {n} pages saved",
+  ],
   "tr.startTitle": [
-    "Вся книга переводится офлайн, на вашем компьютере. Можно прервать в любой момент",
-    "The whole book is translated offline, on your computer. You can stop at any time",
+    "Вся книга переводится офлайн · прервать можно в любой момент",
+    "The whole book is translated offline · you can stop at any moment",
   ],
-  "tr.start": ["Перевести книгу", "Translate the book"],
-  "tr.resumeTitle": [
-    "Продолжить перевод (готово {done} из {total} страниц)",
-    "Resume translating ({done} of {total} pages done)",
+  "tr.start": [
+    "Перевести книгу · {n} страница|Перевести книгу · {n} страницы|Перевести книгу · {n} страниц",
+    "Translate the book · {n} page|Translate the book · {n} pages",
   ],
-  "tr.resume": ["Продолжить перевод · {pct}%", "Resume translating · {pct}%"],
-  "tr.complete": ["Книга переведена", "The book is translated"],
+  "tr.resumeTitle": ["Продолжить перевод · {done} из {total}", "Resume translating · {done} of {total}"],
   "tr.updateTitle": [
-    "Пересобрать структуру страниц и доперевести только изменившееся",
-    "Rebuild the page structure and re-translate only what changed",
+    "Пересобрать страницы и доперевести изменившееся",
+    "Rebuild the pages and translate only what changed",
   ],
   "tr.update": ["Обновить перевод", "Update the translation"],
   "tr.updateResume": ["Продолжить обновление · {pct}%", "Resume the update · {pct}%"],
-  "tr.redoWarn": ["Готовый перевод будет удалён", "The finished translation will be deleted"],
+  "tr.redoWarn": [
+    "Удалить перевод: {n} страница|Удалить перевод: {n} страницы|Удалить перевод: {n} страниц",
+    "Delete the translation: {n} page|Delete the translation: {n} pages",
+  ],
   "tr.redoConfirm": ["Удалить и перевести заново", "Delete and translate again"],
   "tr.redoTitle": [
-    "Удалить готовый перевод и перевести книгу заново",
-    "Delete the finished translation and translate the book from scratch",
+    "Удалить перевод и перевести книгу заново",
+    "Delete the translation and translate the book again",
   ],
   "tr.redo": ["Перевести заново", "Translate again"],
-  "tr.pdfPreparing": ["Подготовка PDF…", "Preparing the PDF…"],
-  "tr.pdfPreparingPct": ["Подготовка PDF… {pct}%", "Preparing the PDF… {pct}%"],
+  "tr.pdfPreparing": ["Готовлю PDF", "Preparing the PDF"],
   "tr.exportPdfTitle": [
-    "Сохранить перевод в PDF с иллюстрациями оригинала — файл появится в папке «Загрузки»",
-    "Save the translation as a PDF with the original illustrations — it lands in your Downloads folder",
+    "Сохранить перевод в PDF с картинками оригинала",
+    "Save the translation as a PDF with the original pictures",
   ],
-  "tr.exportPdf": ["Экспорт в PDF", "Export to PDF"],
-  "tr.exportPartial": ["Готово {done} из {total} страниц", "{done} of {total} pages done"],
-  "tr.exportHtmlTitle": [
-    "Сохранить перевод в HTML — файл появится в папке «Загрузки»",
-    "Save the translation as HTML — it lands in your Downloads folder",
+  "tr.exportPdf": ["Экспортировать в PDF", "Export to PDF"],
+  "tr.exportPartial": [
+    "{done} из {n} страница|{done} из {n} страницы|{done} из {n} страниц",
+    "{done} of {n} page|{done} of {n} pages",
   ],
-  "tr.exportHtml": ["Экспорт в HTML", "Export to HTML"],
-  "tr.exporting": ["Экспорт… {pct}%", "Exporting… {pct}%"],
-  "tr.savedToDownloads": ["Сохранено в Загрузки", "Saved to Downloads"],
-  "tr.exportFailed": ["Не удалось экспортировать перевод", "Could not export the translation"],
-  "tr.pdfFailed": ["Не удалось сохранить PDF", "Could not save the PDF"],
-  "tr.pdfUnsupported": [
-    "Экспорт в PDF на этой системе недоступен — попробуйте HTML",
-    "PDF export is not available on this system — try HTML instead",
-  ],
-  "tr.saved": ["Перевод сохранён", "Translation saved"],
+  "tr.exportHtmlTitle": ["Сохранить перевод в HTML", "Save the translation as HTML"],
+  "tr.exportHtml": ["Экспортировать в HTML", "Export to HTML"],
   "tr.glossaryTitle": [
-    "Термины книги и их переводы — используются при переводе",
-    "The book's terms and their translations — applied while translating",
+    "Термины книги и их переводы · применяются при переводе",
+    "The book's terms and their translations · applied while translating",
   ],
-  "tr.glossary": ["Глоссарий…", "Glossary…"],
-  "tr.needTranslated": ["Сначала переведите книгу — Перевод ▾", "Translate the book first — Translate ▾"],
-  "tr.modelStalled": [
-    "Модель недоступна — перевод приостановлен, готовые страницы сохранены",
-    "The model is unavailable — translation paused, finished pages are saved",
-  ],
-  "tr.modelWarming": [
-    "Модель запускается… Перевод начнётся автоматически",
-    "The model is starting… translation will begin on its own",
-  ],
+  "tr.glossary": ["Открыть глоссарий", "Open the glossary"],
   "tr.etaMin": [" · осталось ~{n} мин", " · ~{n} min left"],
   "tr.etaMinSub": [" · осталось <1 мин", " · <1 min left"],
   "tr.etaHour": [" · осталось ~{n} ч", " · ~{n} h left"],
   "tr.untitled": ["перевод", "translation"],
+  // (WP-N) One card holds the run: a state, its numbers, and two verbs. These
+  // are the four states it can be in, and the words on those verbs.
+  "tr.stateIdle": ["Перевод не начат", "Not started"],
+  "tr.stateRunning": ["Идёт", "Running"],
+  "tr.statePaused": ["Пауза", "Paused"],
+  "tr.stateDone": ["Книга переведена", "The book is translated"],
+  // (WP-N) Файл книги не переоткрылся под прогон: причина печатается строкой в
+  // карточке, глагол рядом — t("ui.retry"). Тоста для этого больше нет.
+  "tr.startFailed": ["Прогон не начался", "The run did not start"],
+  "tr.resumeShort": ["Продолжить", "Resume"],
+  "tr.checkModel": ["Проверить модель", "Check the model"],
+  // The three things a selection can do, spelled out once in the panel instead
+  // of hovering over the library as a hint bar.
+  "tr.selectionTitle": ["Что умеет выделение", "What a selection can do"],
+  "tr.selTranslate": ["Перевести выделенное", "Translate the selection"],
+  "tr.selPara": ["Перевести абзац", "Translate a paragraph"],
+  "tr.selParaKey": ["Alt + клик", "Alt + click"],
+  "tr.selToggle": ["Перевод и оригинал", "Translation and original"],
 
   // -- selection bar & popover --
-  "sel.originalTitle": ["Оригинал выделенного (O)", "Original of the selection (O)"],
-  "sel.translateTitle": ["Перевести выделенное (Enter)", "Translate the selection (Enter)"],
+  "sel.originalTitle": ["Показать оригинал · O", "Show the original · O"],
+  "sel.translateTitle": ["Перевести выделенное · Enter", "Translate the selection · Enter"],
   "sel.translate": ["Перевести", "Translate"],
-  "sel.askTitle": ["Спросить Claude об этом фрагменте", "Ask Claude about this fragment"],
-  "pop.failed": ["Не удалось перевести. Попробуйте ещё раз", "Translation failed. Please try again"],
-  "pop.altHint": ["Alt+клик по абзацу — перевод целиком", "Alt+click a paragraph to translate all of it"],
+  "sel.askTitle": ["Спросить о фрагменте", "Ask about this fragment"],
+  // (WP-N) the pill itself: three verbs, no explanations. The keys they answer
+  // to live in the tooltips above, not in the labels.
+  "sel.original": ["Оригинал", "Original"],
+  "sel.ask": ["Спросить", "Ask"],
+  // The popover says what it is doing in its footer and what went wrong in its
+  // body — cause on the left, the verb out of it on the right.
+  "pop.translating": ["Перевожу…", "Translating…"],
+  "pop.took": ["HY-MT1.5 · {sec} с", "HY-MT1.5 · {sec} s"],
+  "pop.modelGone": ["Модель недоступна", "Model unavailable"],
+  "pop.check": ["Проверить", "Check"],
+  "pop.failed": ["Не удалось перевести", "Translation failed"],
+  "pop.altHint": ["Alt+клик — перевести абзац", "Alt+click — translate the paragraph"],
 
   // -- glossary modal --
   "gl.title": ["Глоссарий", "Glossary"],
@@ -311,13 +327,13 @@ const S = {
     "attention = attention\none pair per line",
   ],
   "gl.replaceWarn": [
-    "Список будет заменён, ручные правки пропадут",
-    "The list will be replaced and manual edits lost",
+    "Заменить список · ручные правки пропадут",
+    "Replace the list · manual edits are lost",
   ],
   "gl.replace": ["Заменить", "Replace"],
   "gl.rebuildTitle": [
-    "Пересобрать глоссарий с нуля — текущий список будет заменён (с подтверждением)",
-    "Rebuild the glossary from scratch — the current list is replaced (you will be asked first)",
+    "Пересобрать глоссарий с нуля · текущий список будет заменён",
+    "Rebuild the glossary from scratch · the current list is replaced",
   ],
   "gl.buildTitle": [
     "Найти термины во всей книге и перевести их локальной моделью",
@@ -326,76 +342,92 @@ const S = {
   "gl.rebuild": ["Собрать заново", "Rebuild"],
   "gl.build": ["Собрать глоссарий", "Build the glossary"],
   "gl.mainModelNote": [
-    "Термины переведены основной моделью — качество может быть ниже",
-    "Terms were translated by the main model — quality may be lower",
+    "Термины переведены основной моделью · качество ниже",
+    "Terms translated by the main model · the quality is lower",
   ],
-  "gl.estimate": ["~2–3 мин, поиск терминов по всей книге", "~2–3 min, scanning the whole book for terms"],
-  "gl.added": ["Добавлено: {n}", "Added: {n}"],
-  "gl.skipped": [" · не переведено: {n}", " · not translated: {n}"],
-  "gl.mining": ["Поиск терминов… {done}/{total}", "Finding terms… {done}/{total}"],
-  "gl.loading": ["Загрузка модели… (до 30 с)", "Loading the model… (up to 30 s)"],
-  "gl.translating": ["Перевод терминов… {done}/{total}", "Translating terms… {done}/{total}"],
+  "gl.estimate": ["~2–3 мин на всю книгу", "~2–3 min for the whole book"],
+  "gl.added": [
+    "Добавлен {n} термин|Добавлено {n} термина|Добавлено {n} терминов",
+    "{n} term added|{n} terms added",
+  ],
+  "gl.skipped": [" · без перевода {n}", " · {n} untranslated"],
+  "gl.mining": ["Ищу термины · {done} из {total}", "Finding terms · {done} of {total}"],
+  "gl.loading": ["Загружаю модель · до 30 с", "Loading the model · up to 30 s"],
+  "gl.translating": ["Перевожу термины · {done} из {total}", "Translating terms · {done} of {total}"],
   "gl.stopTitle": [
-    "Остановить — уже переведённые термины будут добавлены",
-    "Stop — the terms already translated will be kept",
+    "Остановить · уже переведённые термины останутся",
+    "Stop · the terms already translated stay",
   ],
-  "gl.stop": ["Отменить", "Stop"],
-  "gl.noTerms": [
-    "В книге не нашлось характерных терминов",
-    "No characteristic terms were found in this book",
-  ],
-  "gl.failed": ["Не удалось собрать глоссарий. Попробуйте ещё раз", "Could not build the glossary. Please try again"],
+  "gl.stop": ["Остановить", "Stop"],
+  "gl.noTerms": ["Терминов не нашлось", "No terms found"],
+  "gl.failed": ["Глоссарий не собрался · Повторить", "The glossary did not build · Try again"],
   "gl.retranslateTitle": [
-    "Удалить сохранённый перевод книги и перевести заново с текущим глоссарием",
+    "Удалить сохранённый перевод и перевести заново с текущим глоссарием",
     "Delete the saved translation and translate again with the current glossary",
   ],
   "gl.retranslate": ["Перевести заново", "Translate again"],
-  "gl.auxProgress": ["Дополнительная модель: {detail}", "Extra model: {detail}"],
+  "gl.auxProgress": ["Модель терминов · {detail}", "Term model · {detail}"],
   "gl.auxPitch": [
-    "Перевод терминов точнее с дополнительной моделью — {size}, лицензия Apache-2.0",
-    "Term translation is sharper with an extra model — {size}, Apache-2.0 licensed",
+    "Термины точнее с моделью терминов · {size} · Apache-2.0",
+    "Terms are sharper with the term model · {size} · Apache-2.0",
   ],
   "gl.auxResume": ["Продолжить · {pct}%", "Resume · {pct}%"],
 
   // -- find bar --
   "find.placeholder": ["Найти в книге", "Find in this book"],
-  "find.nothing": ["Не найдено", "No matches"],
-  "find.prev": ["Предыдущее совпадение (Shift+Enter)", "Previous match (Shift+Enter)"],
-  "find.next": ["Следующее совпадение (Enter)", "Next match (Enter)"],
+  // One counter, always the same shape: nothing found is «0 из 0», not a
+  // sentence taking the numbers' place. (WP-N)
+  "find.count": ["{done} из {n}", "{done} of {n}"],
+  "find.prev": ["Предыдущее · Shift+Enter", "Previous · Shift+Enter"],
+  "find.next": ["Следующее · Enter", "Next · Enter"],
 
   // -- outline / go to page --
-  "out.pagePlaceholder": ["Страница 1–{last}", "Page 1–{last}"],
+  "out.pagePlaceholder": ["Страница или заголовок", "Page or heading"],
   "out.pageLabel": ["Номер страницы", "Page number"],
-  "out.noToc": ["В книге нет оглавления", "This book has no table of contents"],
+  "out.noToc": ["Оглавления нет · Перейти к странице", "No contents · Go to a page"],
 
   // -- command palette --
-  "pal.page": ["Страница {n}", "Page {n}"],
+  "pal.page": ["Перейти на страницу {n}", "Go to page {n}"],
   "pal.bookTag": ["книга", "book"],
-  "pal.findQ": ["Найти: «{q}»", "Find: “{q}”"],
-  "pal.placeholder": ["Команда, страница или книга…", "Command, page or book…"],
-  "pal.placeholderNoDoc": ["Команда или книга…", "Command or book…"],
+  "pal.findQ": ["Найти в книге · {q}", "Find in this book · {q}"],
+  "pal.placeholder": ["Команда, страница или книга", "Command, page or book"],
+  "pal.placeholderNoDoc": ["Команда или книга", "Command or book"],
+  // (WP-N) The empty palette is a cheat-sheet, and a cheat-sheet of twenty
+  // rows needs shelves. Four, in this order, always.
+  "pal.grpBook": ["Книга", "Book"],
+  "pal.grpView": ["Вид", "View"],
+  "pal.grpTr": ["Перевод", "Translation"],
+  "pal.grpJump": ["Переход", "Jump"],
 
   // -- command palette entries + context menu --
-  "cmd.toc": ["Оглавление", "Contents"],
+  "cmd.toc": ["Открыть оглавление", "Open the contents"],
   "cmd.find": ["Найти в книге", "Find in this book"],
   "cmd.showOriginal": ["Показать оригинал", "Show the original"],
   "cmd.showTranslation": ["Показать перевод", "Show the translation"],
-  "cmd.originalSel": ["Оригинал выделенного", "Original of the selection"],
+  "cmd.originalSel": ["Показать оригинал выделенного", "Show the original of the selection"],
   "cmd.pauseTr": ["Приостановить перевод", "Pause translating"],
   "cmd.translateBook": ["Перевести книгу", "Translate the book"],
   "cmd.resumeTr": ["Продолжить перевод · {pct}%", "Resume translating · {pct}%"],
   "cmd.zoomIn": ["Крупнее", "Zoom in"],
   "cmd.zoomOut": ["Мельче", "Zoom out"],
-  "cmd.col1": ["Одна страница в ряд", "One page per row"],
-  "cmd.col2": ["Две страницы в ряд", "Two pages per row"],
-  "cmd.colAuto": ["Автоподбор по ширине", "Fit as many as fit"],
+  "cmd.col1": ["Показать одну страницу в ряд", "Show one page per row"],
+  "cmd.col2": ["Показать две страницы в ряд", "Show two pages per row"],
+  "cmd.colAuto": ["Подобрать по ширине", "Fit as many as fit"],
   "cmd.histBack": ["Назад по переходам", "Back through jumps"],
   "cmd.histFwd": ["Вперёд по переходам", "Forward through jumps"],
-  "cmd.openFile": ["Открыть файл…", "Open a file…"],
+  "cmd.openFile": ["Открыть файл", "Open a file"],
   "cmd.lightTheme": ["Светлая тема", "Light theme"],
   "cmd.darkTheme": ["Тёмная тема", "Dark theme"],
   "cmd.keys": ["Клавиши", "Keyboard"],
-  "cmd.settings": ["Настройки…", "Settings…"],
+  "cmd.settings": ["Настройки", "Settings"],
+  // (WP-N) A button in the pill can be a noun — the icon and the place say the
+  // rest. In a list of twenty rows every command is a verb, so the palette
+  // renames the first two for itself; the third is the syntax of the page
+  // jump, which only the palette can teach.
+  "cmd.openLibrary": ["Открыть библиотеку", "Open the library"],
+  "cmd.fitWidth": ["Уместить по ширине", "Fit to width"],
+  "cmd.goToPage": ["Перейти на страницу", "Go to a page"],
+  // (WP-N) the palette gained what the «Translate ▾» menu used to hold
   "ctx.revealInFolder": ["Показать в папке", "Reveal in folder"],
   "ctx.addToGlossary": ["Добавить в глоссарий", "Add to the glossary"],
   "ctx.openInBrowser": ["Открыть в браузере", "Open in the browser"],
@@ -440,45 +472,35 @@ const S = {
   "set.light": ["Светлая", "Light"],
   "set.language": ["Язык", "Language"],
   "set.trFont": ["Размер текста перевода", "Translated text size"],
-  "set.trFontTitle": [
-    "Кегль текста в режиме «Перевод» при масштабе 100%",
-    "Type size in «Translation» mode at 100% zoom",
-  ],
+  "set.trFontTitle": ["Кегль перевода при масштабе 100%", "Type size of the translation at 100% zoom"],
   "set.reset": ["Сбросить", "Reset"],
   "set.libFolder": ["Папка библиотеки", "Library folder"],
   "set.noFolder": ["не выбрана", "not chosen"],
   "set.change": ["Сменить", "Change"],
   "set.models": ["Модели", "Models"],
-  "set.modelTr": ["Перевод", "Translation"],
-  "set.modelTrDesc": ["HY-MT1.5 · перевод книг", "HY-MT1.5 · book translation"],
+  "set.modelTr": ["Модель перевода", "Translation model"],
+  "set.modelTrDesc": ["HY-MT1.5", "HY-MT1.5"],
   "set.modelTrConfirm": [
-    "Файл модели будет удалён с диска — перевод перестанет работать до повторного скачивания",
-    "The model file will be deleted — translation stops working until you download it again",
+    "Удалить модель: {size} · перевод остановится",
+    "Delete the model: {size} · translation stops",
   ],
-  "set.modelTerms": ["Термины", "Terms"],
-  "set.modelTermsDesc": ["Qwen3.5 · глоссарий", "Qwen3.5 · glossary"],
-  "set.modelTermsConfirm": [
-    "Файл модели будет удалён с диска",
-    "The model file will be deleted from disk",
-  ],
+  "set.modelTerms": ["Модель терминов", "Term model"],
+  "set.modelTermsDesc": ["Qwen3.5", "Qwen3.5"],
+  "set.modelTermsConfirm": ["Удалить модель: {size}", "Delete the model: {size}"],
   "set.engine": ["Движок", "Engine"],
-  "set.engineReady": ["llama.cpp: найден", "llama.cpp: found"],
-  "set.engineMissing": ["llama.cpp: не найден", "llama.cpp: not found"],
+  "set.engineReady": ["llama.cpp · найден", "llama.cpp · found"],
+  "set.engineMissing": ["llama.cpp · не найден", "llama.cpp · not found"],
   "set.claude": ["Claude Code", "Claude Code"],
   "set.claudeReady": ["подключён", "connected"],
   "set.claudeMissing": ["не найден", "not found"],
-  "set.howToInstall": ["Как поставить", "How to install"],
-  "set.onDisk": ["{size} на диске", "{size} on disk"],
+  "set.onDisk": ["{size}", "{size}"],
   "set.notInstalled": ["не установлена", "not installed"],
   "set.downloaded": ["скачано {pct}%", "{pct}% downloaded"],
   "set.resume": ["Продолжить", "Resume"],
-  "set.deleteBusy": [
-    "Идёт скачивание — сначала отмените его",
-    "A download is running — cancel it first",
-  ],
+  "set.deleteBusy": ["Скачиваю модель · Отменить", "Downloading the model · Cancel it"],
   "set.deleteFail": [
-    "Не удалось удалить — файл занят другим процессом",
-    "Could not delete — another process is holding the file",
+    "Файл занят другим процессом · Повторить",
+    "Another process is holding the file · Try again",
   ],
   "set.storage": ["Хранилище", "Storage"],
   "set.translations": ["Переводы книг", "Book translations"],
@@ -486,30 +508,170 @@ const S = {
   "set.collapse": ["Свернуть", "Collapse"],
   "set.byBook": ["По книгам", "By book"],
   "set.clear": ["Очистить", "Clear"],
-  "set.busyTr": [
-    "Идёт перевод книги — сначала приостановите его",
-    "A book is being translated — pause it first",
+  "set.busyTr": ["Перевожу книгу · Приостановить", "Translating a book · Pause it"],
+  // Destructive lines name the volume — books and gigabytes both. (WP-N)
+  "set.clearAllWarn": [
+    "Удалить переводы: {n} книга, {size}|Удалить переводы: {n} книги, {size}|Удалить переводы: {n} книг, {size}",
+    "Delete the translations: {n} book, {size}|Delete the translations: {n} books, {size}",
   ],
-  "set.clearAllWarn": ["Все сохранённые переводы будут удалены", "Every saved translation will be deleted"],
   "set.clearAll": ["Удалить переводы", "Delete the translations"],
-  "set.clearOneWarn": ["Перевод книги будет удалён", "This book's translation will be deleted"],
+  "set.clearOneWarn": [
+    "Удалить перевод: {n} страница|Удалить перевод: {n} страницы|Удалить перевод: {n} страниц",
+    "Delete the translation: {n} page|Delete the translation: {n} pages",
+  ],
   "set.clearOne": ["Удалить перевод", "Delete the translation"],
   "set.exportTxtRow": ["Перевод открытой книги", "Translation of the open book"],
   "set.exportTxtTitle": [
-    "Сохранить перевод простым текстом — без картинок и вёрстки; папку и имя спросит диалог",
-    "Save the translation as plain text — no images, no layout; a dialog asks where",
+    "Сохранить перевод простым текстом, без картинок",
+    "Save the translation as plain text, no pictures",
   ],
-  "set.exportTxt": ["Экспорт в TXT…", "Export to TXT…"],
+  "set.exportTxt": ["Экспортировать в TXT", "Export to TXT"],
   "set.covers": ["Обложки библиотеки", "Library covers"],
-  "set.coversTitle": ["Создаются заново при открытии библиотеки", "Rebuilt when the library opens"],
+  "set.coversTitle": [
+    "Пересобрать обложки: {n} книга|Пересобрать обложки: {n} книги|Пересобрать обложки: {n} книг",
+    "Rebuild the covers: {n} book|Rebuild the covers: {n} books",
+  ],
   "set.setup": ["Настройка", "Setup"],
+
+  // -- граф знаний --
+  // Вторая половина библиотеки: узлы книг, людей и понятий, происхождение
+  // каждой книги (кто вообще имеет право её разбирать) и состояние сборки —
+  // числами, вслух. Отсюда же «Спросить» узнаёт, что в граф надо заглянуть
+  // раньше, чем в интернет.
+  "gr.view.grid": ["Сетка", "Grid"],
+  "gr.view.graph": ["Граф", "Graph"],
+  "gr.title": ["Граф знаний", "Knowledge graph"],
+  // (WP-N) Отказ — это состояние слева и глагол справа, в одной строке: сам
+  // граф сказать о себе больше нечего, а обещание «наполнится когда-нибудь»
+  // выхода читателю не давало.
+  "gr.empty": ["Граф пуст", "The graph is empty"],
+  "gr.buildAll": [
+    "Собрать граф: {n} книга|Собрать граф: {n} книги|Собрать граф: {n} книг",
+    "Build the graph: {n} book|Build the graph: {n} books",
+  ],
+  "gr.emptyOff": ["Автосборка выключена", "Auto-build is off"],
+  "gr.autoOn": ["Включить", "Turn on"],
+  "gr.search": ["Найти в графе", "Search the graph"],
+  // (WP-N) «Ничего не найдено» жило здесь для плашки поверх холста. Плашки
+  // больше нет: счёт стоит в самом поле поиска, и ноль в нём и есть весь ответ.
+  // Ключ снят на сборке — на него не ссылался никто.
+  // (WP-N) Размер графа — это две величины сразу, и грамматику ведёт первая:
+  // {n} — книги, которым узлы принадлежат, {m} — сами понятия.
+  "gr.stats": [
+    "{n} книга · {m} понятий|{n} книги · {m} понятий|{n} книг · {m} понятий",
+    "{n} book · {m} concepts|{n} books · {m} concepts",
+  ],
+  "gr.building": ["Собираю граф · {done} из {n}", "Building the graph · {done} of {n}"],
+  // Провал разбора одной книги: имя слева, глагол «Перестроить» — справа в той
+  // же строке. Прежде о нём не говорилось нигде, а счётчик сборки считал
+  // упавший прогон за идущий (WP-N).
+  "gr.failed": ["{title} не разобралась", "{title} could not be read"],
+  // Сколько понятий вообще нарисовано: потолок картинки, а не отбор — поэтому
+  // отдельной подписью, а не подсказкой над голой дробью (WP-N).
+  "gr.drawn": ["нарисовано {n} из {m}", "{n} of {m} drawn"],
+  "gr.queued": [
+    "в очереди {n} книга|в очереди {n} книги|в очереди {n} книг",
+    "{n} book queued|{n} books queued",
+  ],
+  "gr.kind.book": ["Книги", "Books"],
+  "gr.kind.person": ["Люди", "People"],
+  "gr.kind.org": ["Организации", "Organisations"],
+  "gr.kind.place": ["Места", "Places"],
+  "gr.kind.work": ["Труды", "Works"],
+  "gr.kind.topic": ["Темы", "Topics"],
+  "gr.kind.term": ["Термины", "Terms"],
+  // Происхождение книги решает, кто её читает, поэтому названо словами читателя,
+  // а не движка: «лицензионная» и «открытая», а не «local» и «remote».
+  "gr.prov.book": ["Лицензионная книга", "Licensed book"],
+  "gr.prov.article": ["Открытая статья", "Open article"],
+  "gr.prov.unknown": ["Происхождение неясно", "Origin unclear"],
+  "gr.prov.why": ["Показать доказательства", "Show the evidence"],
+  "gr.prov.change": ["Изменить", "Change"],
+  // Абзац из трёх предложений в карточке шириной с панель никто не читает, и
+  // он там же лишний: полное объяснение стоит в «Настройках» (gr.claudeHint),
+  // а карточке хватает одной мысли — кто читает лицензионную книгу (WP-N).
+  "gr.prov.hint": [
+    "Лицензионную книгу читает только локальная модель",
+    "A licensed book is read by the local model alone",
+  ],
+  // Состояние, а не обрубок предложения: строка стоит сама по себе, поэтому
+  // начинается с заглавной и называет движок именем (WP-N).
+  "gr.engine.local": ["Локальная модель", "Local model"],
+  "gr.engine.claude": ["Claude Code", "Claude Code"],
+  "gr.engine.none": ["Без модели", "No model"],
+  "gr.mentions": ["{n} упоминание|{n} упоминания|{n} упоминаний", "{n} mention|{n} mentions"],
+  "gr.inBooks": ["В книгах", "In books"],
+  "gr.related": ["Рядом", "Nearby"],
+  "gr.openBook": ["Открыть книгу", "Open the book"],
+  "gr.page": ["с. {n}", "p. {n}"],
+  // «Разобрать глубже» здесь когда-то было отдельной строкой, и это была вторая
+  // подпись под одним и тем же действием: карточка выбранной книги предлагает
+  // «Перестроить», а перестройка и есть повторный глубокий разбор — с уже
+  // исправленным происхождением. Второй глагол только заставлял бы читателя
+  // гадать, чем эти кнопки отличаются, поэтому его нет.
+  "gr.rebuild": ["Перестроить", "Rebuild"],
+  "gr.rebuildAll": ["Перестроить весь граф", "Rebuild the whole graph"],
+  "gr.stopAll": ["Остановить сборку", "Stop building"],
+  "gr.reset": ["Свести к центру", "Recentre"],
+  "gr.auto": ["Строить граф знаний автоматически", "Build the knowledge graph automatically"],
+  // Половину фразы («книга попадает в граф сразу») читатель и так видит по
+  // очереди в настройках; вторая половина — единственное место, где сказано,
+  // ЧЕМ книгу читают, и без неё галочка ниже выглядела бы беспричинной.
+  "gr.autoHint": [
+    "Новая книга попадает в граф, как только её найдёт библиотека. Разбирает её локальная модель — пока не включена строка ниже.",
+    "A new book enters the graph as soon as the library finds it. The local model reads it — unless the row below is on.",
+  ],
+  // Строка о том, что уходит с компьютера, поэтому названа глаголом читателя и
+  // говорит обе стороны сразу: что уходит и что не уходит никогда. «По умолчанию
+  // выключено» стоит последним — это ответ на вопрос, который читатель задаёт
+  // себе первым, увидев здесь чужое имя.
+  "gr.claude": [
+    "Разбирать открытые статьи через Claude Code",
+    "Read open articles through Claude Code",
+  ],
+  "gr.claudeHint": [
+    "Файл, опознанный как открытая статья, отправляется на прочтение в Claude Code: в граф идут её заголовок, авторы и добытые из неё понятия, а не текст страниц. Лицензионную книгу — и всё, чьё происхождение неясно, — читает локальная модель, и с компьютера они не уходят. По умолчанию выключено.",
+    "A file recognised as an open article is sent to Claude Code to be read: what reaches the graph is its title, its authors and the terms mined from it, never the text of its pages. A licensed book, and anything whose origin is unclear, is read by the local model and does not leave this computer. Off by default.",
+  ],
+  "gr.clear": ["Очистить граф", "Clear the graph"],
+  // Без модели граф не пустой, но и не умный. Состояние — строкой с глаголом
+  // рядом, перечисление — тихой припиской под ней: одна строка, одна мысль (WP-N).
+  "gr.noModel": ["Модель не установлена", "No model installed"],
+  "gr.noModelHint": [
+    "В графе — заголовки, метки и термины из текста",
+    "The graph holds titles, tags and terms mined from the text",
+  ],
+  "gr.filter": ["Показывать", "Show"],
+  "gr.selectHint": ["Выбрать узел в графе", "Pick a node in the graph"],
+  "ask.graphCtx": ["Из вашей библиотеки", "From your library"],
+  // Appended to ask.system whenever the graph has something to say. It is a
+  // rule about ORDER, not a licence to cite: the library first, own knowledge
+  // second, the web only if the question needs today's facts. Same hazard as
+  // ask.viz — no «|» anywhere in this string, or t() would cut the rule short
+  // at the first pipe and the model would never see the last sentence.
+  "ask.graph": [
+    "Порядок поиска. Сперва смотри в блок «Из вашей библиотеки» — это выжимка из графа знаний, собранного по книгам самого читателя. Если ответ есть там, отвечай по нему и называй книги, на которые опираешься. Если граф отвечает не до конца, договаривай из собственных знаний и прямо скажи, чего в библиотеке нет. В интернет ходи только тогда, когда ответу и правда нужны свежие факты.",
+    "Where to look, and in what order. Start with the «From your library» block: it is the reader's own knowledge graph, boiled down. If the answer is there, build on it and name the books you leaned on. If the graph only gets you part of the way, finish from your own knowledge and say plainly what the library does not cover. Go to the web only when the answer genuinely needs current facts.",
+  ],
+  "ask.graphUsed": ["По графу библиотеки", "From the library graph"],
+  // (WP-N) Подпись под ответом: кто ответил и за сколько. «Спросить» —
+  // единственное место, где приложение выходит в сеть, и эта строка делает
+  // границу видимой. Не фраза, а факт: имя модели · время, как у поповера
+  // перевода. Имя приходит из потока машинным идентификатором и очеловечивается
+  // на месте (modelName); когда его в потоке не было — имя самого CLI.
+  "ask.took": ["{model} · {sec} с", "{model} · {sec} s"],
+  "set.web": ["Разрешить поиск в интернете", "Allow web search"],
+  "set.webHint": [
+    "«Спросить» сперва смотрит в граф знаний, потом в собственные знания. С этой галочкой Claude Code сможет дополнительно искать в интернете — вопрос и найденные ссылки уйдут в сеть.",
+    "«Ask» looks in the knowledge graph first, then in its own knowledge. Tick this and Claude Code may search the web as well — the question, and the links it comes back with, go out over the network.",
+  ],
 
   // -- about --
   "about.title": ["О программе", "About"],
-  "about.thirdParty": ["Сторонние компоненты", "Third-party components"],
+  "about.thirdParty": ["Собрано на", "Built on"],
   "about.hyLicense": [
-    "Бесплатно, в том числе для коммерческого использования; не действует в ЕС, Великобритании и Южной Корее",
-    "Free, commercial use included; not available in the EU, the UK or South Korea",
+    "Бесплатно, в том числе коммерчески · не действует в ЕС, Великобритании и Южной Корее",
+    "Free, commercial use included · not valid in the EU, the UK or South Korea",
   ],
   "about.modelHy": ["Модель HY-MT1.5-7B · Tencent", "HY-MT1.5-7B model · Tencent"],
   "about.modelQwen": ["Модель Qwen3.5-4B · Alibaba", "Qwen3.5-4B model · Alibaba"],
@@ -517,39 +679,31 @@ const S = {
   // -- ask sidebar --
   "ask.appOnlyBadge": ["Доступно только в приложении", "Available only in the app"],
   "ask.empty": [
-    "Выделите фрагмент и нажмите «Спросить» — или задайте вопрос о книге здесь",
-    "Select a fragment and hit «Ask» — or just ask about the book here",
+    "Вопрос о книге. Выделенный фрагмент попадёт в вопрос",
+    "A question about the book. The selected fragment goes with it",
   ],
   "ask.quotePagePrefix": ["стр. {n} — ", "p. {n} — "],
   "ask.threads": ["Беседы по книге", "Conversations about this book"],
-  "ask.threadsN": ["Беседы по книге · {n}", "Conversations about this book · {n}"],
+  "ask.threadsN": ["Беседы · {n}", "Conversations · {n}"],
   "ask.threadsHeading": ["Беседы", "Conversations"],
-  "ask.threadsEmpty": [
-    "Здесь появятся беседы по этой книге",
-    "Conversations about this book will show up here",
-  ],
+  "ask.threadsEmpty": ["Бесед пока нет", "No conversations yet"],
   "ask.newThreadTitle": ["Новая беседа", "New conversation"],
   "ask.newThreadEmpty": [
     "Новая беседа — эта беседа уже пустая",
     "New conversation — this one is already empty",
   ],
-  "ask.closeKey": ["Закрыть (Ctrl+J)", "Close (Ctrl+J)"],
   "ask.deleteThread": ["Удалить беседу", "Delete this conversation"],
-  "ask.deleteThreadWarn": [
-    "Беседа и её память будут удалены",
-    "The conversation and its memory will be deleted",
-  ],
+  "ask.deleteThreadWarn": ["Удалить беседу и её память", "Delete the conversation and its memory"],
   "ask.hideSuggestions": ["Скрыть подсказки", "Hide the suggestions"],
   "ask.removeFragment": ["Убрать фрагмент", "Remove the fragment"],
   "ask.cmdNotFound": ["Команда не найдена", "No such command"],
-  "ask.placeholder": ["Вопрос по книге… «/» — команды", "A question about the book… «/» for commands"],
-  "ask.quickCommands": ["Быстрые команды (/)", "Quick commands (/)"],
+  "ask.placeholder": ["Вопрос о книге · / — команды", "A question about the book · / for commands"],
+  "ask.quickCommands": ["Быстрые команды · /", "Quick commands · /"],
   "ask.quickCommandsShort": ["Быстрые команды", "Quick commands"],
   "ask.stop": ["Остановить", "Stop"],
-  "ask.send": ["Отправить (Enter)", "Send (Enter)"],
-  "ask.stopped": ["(остановлено)", "(stopped)"],
+  "ask.send": ["Отправить · Enter", "Send · Enter"],
+  "ask.stopped": ["Остановлено", "Stopped"],
   "ask.pageShort": ["стр. {n}: ", "p. {n}: "],
-  "ask.title": ["Вопросы по книге", "Questions about this book"],
   "ask.newThread": ["Новая беседа", "New conversation"],
   "ask.emptyThread": ["пусто", "empty"],
   "ask.msgs": ["{n} сообщение|{n} сообщения|{n} сообщений", "{n} message|{n} messages"],
@@ -558,8 +712,6 @@ const S = {
   "ask.earlier": ["Раньше", "Earlier"],
   "ask.defaultQ": ["Объясни этот фрагмент", "Explain this fragment"],
   "ask.simpler": ["Объясни проще", "Explain it more simply"],
-  "ask.example": ["Приведи пример", "Give an example"],
-  "ask.linkTopic": ["Связь с темой", "Link to the topic"],
   "ask.linkTopicMsg": ["Как это связано с темой книги?", "How does this relate to the book's subject?"],
   "ask.cmdExplain": ["Объяснить выделенное", "Explain the selection"],
   "ask.cmdTerm": ["Определить термин", "Define the term"],
@@ -579,35 +731,49 @@ const S = {
     "Покажи содержание страницы {n} наглядно — графиком, схемой или таблицей, смотря что подходит. Если наглядно тут нечего показывать, так и скажи, без картинки.",
     "Show what is on page {n} visually — a chart, a diagram or a table, whichever fits. If there is nothing here worth a picture, say so plainly and draw none.",
   ],
-  "ask.needSeed": ["Сначала выделите фрагмент в книге", "Select a fragment in the book first"],
-  "ask.needAnswer": ["Сначала задайте вопрос", "Ask a question first"],
+  "ask.needSeed": ["Выделить фрагмент в книге", "Select a fragment in the book"],
+  "ask.needAnswer": ["Задать вопрос", "Ask a question"],
+  // (WP-N) the three chips above the field — one tap, no typing
+  "ask.chipChapter": ["О чём эта глава", "What this chapter is about"],
+  "ask.chipChapterMsg": [
+    "О чём эта глава? Ответь коротко, со ссылками на страницы",
+    "What is this chapter about? Answer briefly, citing pages",
+  ],
+  "ask.chipTerms": ["Термины", "Terms"],
+  "ask.chipTermsMsg": [
+    "Какие термины вводит эта страница и что они значат?",
+    "Which terms does this page introduce, and what do they mean?",
+  ],
+  "ask.chipShort": ["Кратко", "In short"],
+  "ask.chipShortMsg": [
+    "Перескажи страницу {n} в трёх предложениях",
+    "Summarize page {n} in three sentences",
+  ],
+  "ask.threadOn": ["Беседа · {when}", "Conversation · {when}"],
   "ask.panelWidth": ["Ширина панели", "Panel width"],
   "ask.panelWidthTitle": [
     "Ширина панели · двойной клик вернёт исходную",
     "Panel width · double-click restores the default",
   ],
   "ask.appOnly": [
-    "Вопросы к Claude доступны только в приложении Chitallo",
+    "Вопросы к Claude работают только в приложении Chitallo",
     "Asking Claude only works inside the Chitallo app",
   ],
-  "ask.emptyAnswer": ["(пустой ответ)", "(empty answer)"],
-  "ask.errUnknown": ["Ошибка: {what}", "Error: {what}"],
+  "ask.emptyAnswer": ["Пустой ответ", "Empty answer"],
+  "ask.errUnknown": ["Ошибка · {what}", "Error · {what}"],
   "ask.errUnknownWhat": ["неизвестная", "unknown"],
   "ask.cancelled": ["Запрос отменён", "Request cancelled"],
-  "ask.noAnswer": ["Ответ не получен", "No answer came back"],
-  "ask.exited": [
-    "Claude Code завершился без ответа ({detail})",
-    "Claude Code exited without answering ({detail})",
-  ],
-  "ask.notFound": [
-    "Claude Code не найден ({path}). Поставьте его — и «Спросить» заработает.",
-    "Claude Code not found ({path}). Install it and «Ask» starts working.",
-  ],
-  "ask.busy": [
-    "Уже выполняется другой запрос — дождитесь ответа или остановите его",
-    "Another request is already running — wait for it or stop it",
-  ],
-  "ask.launchFail": ["Не удалось запустить Claude: {detail}", "Could not start Claude: {detail}"],
+  // (WP-N) Отказ называет только причину: глагол под ним — кнопка повтора в
+  // строке действий сообщения, и второй раз то же слово текстом не пишется.
+  // У «не найден» команда установки стоит следующей строкой самого сообщения —
+  // она и есть ответ на «как поставить».
+  "ask.noAnswer": ["Ответ не пришёл", "No answer came back"],
+  "ask.exited": ["Claude Code вышел без ответа", "Claude Code exited without answering"],
+  "ask.notFound": ["Claude Code не найден", "Claude Code not found"],
+  // The path and the exit detail moved out of the sentence into the quiet line
+  // under it — there when you need it, silent when you do not. (WP-N)
+  "ask.busy": ["Отвечаю на другой вопрос · Остановить", "Answering another question · Stop it"],
+  "ask.launchFail": ["Claude не запустился · {detail}", "Claude did not start · {detail}"],
   // The prompt Claude itself receives — written in the reader's language so the
   // answers come back in it.
   "ask.system": [
@@ -647,27 +813,32 @@ const S = {
     "Читаю книгу «{title}», сейчас открыта страница {page}.",
     "I am reading the book “{title}”, currently on page {page}.",
   ],
+  // (WP-N) Где читатель СЕЙЧАС — уходит с каждым сообщением продолжающейся
+  // беседы, а не только с первым: между вопросами книгу листают, и модель,
+  // помнящая одну лишь стартовую страницу, отвечает про давно прочитанное.
+  "ask.readingHere": [
+    "Сейчас я на странице {page} из {total} книги «{title}».",
+    "I am now on page {page} of {total} of the book “{title}”.",
+  ],
+  // Текст самой открытой страницы — только для вопросов, которые про «здесь»
+  // (чипы-подсказки, команды «страница» и «наглядно»). Номер стоит в заголовке
+  // блока: в две колонки таких блоков два, и модель обязана видеть, где чей.
+  "ask.openPage": ["Текст открытой страницы {n}:", "Text of the open page {n}:"],
 
   // -- charts Claude draws inside an answer (```chart, see chart-block.tsx) --
   "chart.showTable": ["Показать таблицей", "Show as a table"],
   "chart.showChart": ["Показать графиком", "Show as a chart"],
-  "chart.drawing": ["Строится график", "Drawing the chart"],
+  "chart.drawing": ["Строю график", "Drawing the chart"],
   "chart.other": ["прочее", "other"],
-  "chart.broken": [
-    "Claude прислал график, который не удалось прочитать",
-    "Claude sent a chart that could not be read",
-  ],
+  "chart.broken": ["График не прочитался · Показать текстом", "The chart did not parse · Show as text"],
   "chart.dropped": [
     "не поместился ещё {n} ряд|не поместились ещё {n} ряда|не поместились ещё {n} рядов",
     "{n} more series did not fit|{n} more series did not fit",
   ],
 
   // -- diagrams Claude draws inside an answer (```mermaid, see mermaid-block.tsx) --
-  "diagram.drawing": ["Строится схема", "Drawing the diagram"],
-  "diagram.broken": [
-    "Claude прислал схему, которую не удалось прочитать",
-    "Claude sent a diagram that could not be read",
-  ],
+  "diagram.drawing": ["Строю схему", "Drawing the diagram"],
+  "diagram.broken": ["Схема не прочиталась · Показать текстом", "The diagram did not parse · Show as text"],
 
   // -- glossary terminologist (prompts the aux model sees) --
   "term.system": [
@@ -680,10 +851,7 @@ const S = {
 
   // -- export document (the generated HTML/PDF) --
   "exp.machineTr": ["Машинный перевод · Chitallo{partial}", "Machine translation · Chitallo{partial}"],
-  "exp.partial": [
-    " · готово {done} из {total} страниц",
-    " · {done} of {total} pages done",
-  ],
+  "exp.partial": [" · {done} из {total} страниц", " · {done} of {total} pages"],
   "exp.pageNotTr": ["страница {n} не переведена", "page {n} is not translated"],
   "exp.pagesNotTr": ["страницы {a}–{b} не переведены", "pages {a}–{b} are not translated"],
   "exp.refPage": ["страница {n} — оригинал без перевода", "page {n} — original, untranslated"],
