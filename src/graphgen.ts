@@ -12,32 +12,45 @@
 // writes the seed shard before starting the deep pass, or the book stays
 // invisible for as long as the model runs.
 //
-// The mining is glossarygen.ts's C-value extractor aimed at a different target.
-// It could not simply be imported: extractTerms's ExtractedTerm carries a
-// sample sentence but no page numbers, while a concept node is required to
-// carry the 1-based pages it was met on. The miner below is therefore modelled
-// line for line on it — the same clause-bounded n-grams, the same
-// nested-occurrence discounting, the same acronym and capitalised-unigram
-// rules — with per-page bookkeeping added and the two-pass form/sample
-// machinery dropped, because one pass can afford to track surface forms for
-// everything.
+// The mining is not here any more: it is terms.ts, and this module is one of
+// its two callers. It used to be a hand-copied twin of glossarygen's C-value
+// extractor — the same clause-bounded n-grams, the same nested-occurrence
+// discounting, the same acronym and capitalised-unigram rules, with per-page
+// bookkeeping added — and two hand-copied twins drift. They had already
+// drifted in the way that matters most, so the good one (this one) was the one
+// that survived the merge; what changed for this caller is that the miner is
+// now told which LANGUAGE it is reading, and picks its stoplists accordingly
+// instead of applying one merged English+Russian set to every book on earth.
 //
 // It used to read two dozen pages, and that was the single biggest defect this
 // feature had: on an 838-page book those pages are 2.9% of the text, and the
 // graph it produced held SEVEN concepts. It now reads the book (see
-// MINE_PAGES_MAX for the measurement that sets the ceiling), and where the
-// reader has already translated the book it merges in the glossary that
-// glossarygen mined from all of it — the same extractor, a pass that has
-// already been paid for, curated by hand as a side effect of another feature.
+// MINE_PAGES_MAX for the measurement that sets the ceiling), and it merges in
+// the reader's own term store for the book — the file the glossary feature
+// mines, translates and lets them edit by hand. That store is a record and not
+// a word list: a term arrives with a KIND and a DEFINITION, so a node the seed
+// pass could only leave as a bare «term» is typed and glossed before any model
+// has run, and the deep pass skips what is already known. What the deep pass
+// learns goes back the other way, stamped source «graph», which is what makes
+// the terminology and the graph one store rather than two.
 //
 // The deep pass routes on provenance, and the routing is the feature: a
 // licensed book (and anything the classifier could not decide — see below) is
 // read ONLY by the local aux model on this machine, while an openly licensed
-// article may be handed to Claude Code. Whichever model answers, it never sees
-// the book: it sees the title, the authors, the tags and the mined term list,
-// and it answers with one line per term. That is what keeps a whole library's
-// build affordable, and it is also what keeps the local path honest — a 4B
-// model can type a term it is shown, and cannot summarise a book it is not.
+// article may be handed to Claude Code. Neither model reads the book: both are
+// shown the title, the authors, the tags and the mined term list, and both
+// answer with one line per term. That is what keeps a whole library's build
+// affordable, and it is also what keeps the local path honest — a 4B model can
+// type a term it is shown, and cannot summarise a book it is not.
+//
+// The two payloads are NOT the same, and the difference is a promise this
+// project has published (README.md:60, i18n «gr.claudeHint»): the local model
+// is additionally shown the book's opening pages, because that text never
+// leaves this machine, and the Claude payload is the four fields above and
+// nothing else. Every piece of book-derived prose this module now handles — a
+// mined sample sentence, a glossary definition, a node's gloss — is on the
+// wrong side of that line and must stay off it. See deepenViaClaude, which is
+// where the boundary is actually drawn.
 //
 // Two rules are load-bearing and easy to "fix" by accident. First, the aux
 // model is started for the deep pass and stopped in a `finally`, always:
@@ -51,7 +64,10 @@
 
 import { invoke } from "@tauri-apps/api/core";
 import type { PDFDocumentProxy } from "pdfjs-dist";
-import { CITE_MARK } from "./glossarygen";
+import { bookKey } from "./bookid";
+import { detectBookLang, UND, type BookLang } from "./booklang";
+import { isTermKind, type TermRecord } from "./glossary";
+import { loadGlossary, saveGlossary } from "./glossarygen";
 import {
   conceptId,
   loadShard,
@@ -74,7 +90,16 @@ import { baseName, claudeStatus, engineStatus } from "./host";
 import { getLang } from "./i18n";
 import { clusterParagraphs, type Paragraph } from "./paragraphs";
 import { classify, type Meta } from "./provenance";
-import { auxComplete, hydrateGlossary, isAuxUp, parseGlossary, type ChatMessage } from "./translate";
+import {
+  createMiner,
+  isCitationPage,
+  sampleFloor,
+  stopLists,
+  MAX_N,
+  MAX_PAGES_PER_TERM,
+  type TermMiner,
+} from "./terms";
+import { auxComplete, isAuxUp, type ChatMessage } from "./translate";
 
 /// Which stretch of work a build is in. «seed» is the model-free pass, the
 /// other three belong to the deep one.
@@ -114,7 +139,30 @@ export type GenProgress = { phase: GenPhase; done: number; total: number };
 ///   • an author's bare surname in the running text merges onto the author node
 ///     the metadata gave, instead of standing beside it as a heavier second
 ///     person wired to no book.
-export const GRAPH_GEN = 2;
+///
+/// Generation 3 is the one term store, and it is a bump for the same reason:
+/// every item below leaves an already-written shard worse than a re-read of the
+/// same file, and a generation-2 shard for a book in any language but English
+/// is materially wrong rather than merely thinner.
+///   • the miner is told the book's LANGUAGE (detected once at seed time, from
+///     pages this pass reads anyway) and mines it with that language's
+///     stoplists. A Russian book was mined with one merged English+Russian set
+///     that had neither «книга» nor «всей», so its concepts ended on pronouns
+///     and document furniture; a book in a language we ship no list for was
+///     mined with no grammar at all, and a German one yielded «der Regel wird
+///     die». Generation 3 derives that language's function words from the book
+///     itself (terms.ts) instead;
+///   • the glossary merged into the shard was, in generation 2, mined by an
+///     ASCII-only tokenizer. For a non-English book that file is not a term
+///     list — it is the LATIN ISLANDS inside the book, its BERTs and HTTPs and
+///     transliterated author surnames — and every one of them went into the
+///     shard as a concept node wired to the book. Those nodes do not go away
+///     until the book is read again;
+///   • a glossary term now arrives with a KIND and a DEFINITION, so nodes that
+///     stood as bare «term» with no gloss are typed and glossed before any
+///     model runs. That changes what colour a node is drawn in and what the
+///     reader sees when they click it, not merely how many there are.
+export const GRAPH_GEN = 3;
 
 // ---- budgets ----------------------------------------------------------------
 // Every number here was chosen against the two costs this module trades off:
@@ -146,10 +194,12 @@ export const GRAPH_GEN = 2;
 //
 // The other cost is memory, and it is bounded rather than negligible: mining
 // all 838 pages holds 82 731 distinct n-grams, measured at about 75 MB of heap
-// alongside pdf.js's own page cache, all of it released when seedShard
-// returns. That is what a linear one-pass count costs; the alternative is
-// glossarygen's two-pass form/sample machinery, which would halve the memory
-// and double the six seconds.
+// alongside pdf.js's own page cache, all of it released when the miner goes out
+// of scope at the end of seedShard. That is what a linear one-pass count costs,
+// and it is the shape terms.ts settled on for both its callers — the
+// shortlist-plus-second-sweep alternative would halve the memory and double the
+// six seconds. This caller asks for `withPages` and not for `withSample`, which
+// is what keeps that 75 MB from also pinning a page of text per term.
 const MINE_PAGES_MAX = 1000;
 // Concept nodes one book contributes from mining. 60 was chosen when the miner
 // could only find 7; over a whole book the cap, not the floor, became the
@@ -164,11 +214,21 @@ const SEED_TERMS = 120;
 // this is headroom rather than a limit that normally binds. It bounds the deep
 // pass, which is what actually costs minutes: 180 terms is 15 typing chunks.
 const MAX_CONCEPTS = 180;
-const MAX_PAGES_PER_TERM = 8; // the schema's own cap (graphstore re-applies it)
-const MAX_N = 4; // longest n-gram, as in glossarygen
 const MAX_TAGS = 12;
-const MIN_CAP_FREQ = 4; // capitalised-in-running-text unigrams
-const CITE_PAGE_MIN = 8; // ≥8 citation markers on one page ⇒ references/index
+// Pages pooled for language detection, and the same number glossarygen uses so
+// that the two features cannot decide a book is in two different languages.
+// They are a spread of the mining sample rather than its head: a book's first
+// pages are a title page, a copyright block and a contents list, and booklang
+// answers «und» to all three by design — pooling pages from the whole book is
+// the defence against that. They cost nothing extra to read, because every one
+// of them is a page this pass was going to read anyway; see seedShard.
+const LANG_PAGES = 16;
+// Minable pages above which a concept must have been met on more than one of
+// them. Below it, «more than one page» would mean «almost all of them», which a
+// four-page article cannot satisfy without going empty. It is a threshold on
+// pages that SURVIVED the citation filter, so it is not known until the read
+// ends — see seedShard for what that costs.
+const MIN_SPREAD_PAGES = 4;
 const TYPE_CHUNK = 12; // terms per typing call
 const CONCURRENCY = 3; // worker count; the actual requests share auxPool's budget
 const CO_PAIRS = 200; // co-occurrence edges kept for one book
@@ -373,88 +433,32 @@ const TYPES = new Map<string, NodeKind>([
 
 // ---- stoplists --------------------------------------------------------------
 //
-// A trimmed twin of glossarygen's, and trimmed in one direction on purpose:
-// its lists are English-only, which is fine for a glossary whose whole job is
-// English-to-Russian, and wrong here — this graph indexes whatever the reader
-// owns, and a Russian book mined with an English stoplist yields a concept
-// list made of «который» and «может». Both alphabets therefore appear below.
-// The lists are shorter than glossarygen's because the deep pass types every
-// surviving term through a model, which throws out what statistics let past.
-
-const FUNC_STOP = new Set(
-  `a an the and or but nor so yet not no of in on at by for with about against between into through during
-  before after above below to from up down out off over under again further then once here there when where
-  why how all any both each few many much more most other some such only own same as than too very just ever
-  never also always often can could may might must shall should will would do does did done doing is are am
-  was were be been being have has had having i you he she it we they me him her us them my your his its our
-  their this that these those who whom whose which what if because until while unless since although though
-  however therefore thus hence moreover nevertheless otherwise instead indeed rather quite almost already
-  still yes etc via per among along across behind beyond despite except toward towards upon onto within
-  without whatever anything something nothing everything anyone someone everyone one two three four five six
-  seven eight nine ten first second third last next new old let et al vs versus based using given following
-  shown seen called known named use used uses see say said like need make made take taken show section
-  chapter figure table page pages example equation exercise note doi org www http https com html pp vol eds
-  arxiv fig
-  и а но или же ли бы не ни да как что чтобы если когда пока хотя потому поэтому итак также тоже уже ещё еще
-  очень более менее самый самая самое такой такая такое этот эта это эти тот та те то который которая которое
-  которые все весь вся всё каждый любой другой другая другие один одна одно два три в во на за под над при
-  без для до от из у к ко с со по о об про через между среди около после перед про есть был была было были
-  быть будет будут может можно нужно надо его её ее их им ими них нас вам вас мы вы они она оно он я ты мне
-  тебе себя свой своя свои наш ваш там тут здесь тогда затем потом только даже лишь именно скорее почти
-  впрочем однако например см рис табл гл стр таблица рисунок глава раздел страница пример уравнение`
-    .split(/\s+/)
-    .filter(Boolean),
-);
-
-// Consulted only by the capitalised-unigram rule, exactly as glossarygen's
-// COMMON_EN is: it stops ordinary words that happen to open a clause («This»,
-// «Однако», «Figure») from being read as proper nouns. Multiword candidates
-// and acronyms never touch it, so domain terms are unaffected.
-const COMMON = new Set(
-  `about after also although always american another answer any approach area around author available average
-  because before between both case chapter chart common company complete computer concept condition control
-  course current data date design detail different difficult early either english error example experiment
-  figure final first following form further general given great group human idea important information
-  instead introduction issue known large later level little local main major many method model modern more
-  most much next note number often only order other over paper part particular people perhaps person point
-  possible present previous problem process program purpose question rather reason recent research result
-  right same second section several significant similar simple since small some something special specific
-  standard state study such system table term test text than that their then there these thing this those
-  three through time today total under until upon usually value various very well what when where which while
-  whole with within without word work world would year
-  автор более большой быть важный ввод вместе внимание вопрос вот время всего второй выше глава год данные
-  дело другой если ещё зачем здесь значит идея именно иначе итог каждый какой книга когда конец который
-  кроме лишь лучше между менее много может можно например наиболее начало наш никогда новый однако около
-  описание опыт основной особенно ответ пример пункт после почему поэтому правило пример проблема просто
-  работа раздел разный результат решение рисунок ряд самый свой сейчас сила слово случай смысл собой более
-  способ сразу среди статья степень стороны таблица также такой текст тема теперь только точка требует уже
-  условие часть человек через число чтобы шаг`
-    .split(/\s+/)
-    .filter(Boolean),
-);
-
-// Common nouns that running text writes with a capital anyway, and which
-// therefore look exactly like a name to a test of the label's shape. This book
-// produced two of them: «University», mined out of the authors' affiliations,
-// and «Internet», which any book about the web capitalises in ordinary prose.
-// The 4B typed them «org» and «place», and no test of SHAPE can tell either
-// from «Amazon» — the two are typographically identical, so the difference has
-// to be written down. The list is deliberately short and deliberately generic:
-// a word belongs here only when it names a CATEGORY that happens to be spelled
-// with a capital, never when it could name one particular thing.
+// The three lists — function words, ordinary words, capitalised category nouns
+// — live in terms.ts now, keyed by language, and the miner is handed the set
+// for the language this book turned out to be written in. What is left here is
+// the vocabulary the three helpers below need, and those do NOT take the book's
+// language: they take the union of everything curated, deliberately.
 //
-// Kept apart from COMMON rather than folded into it, because COMMON also gates
-// what the miner accepts as a term at all: «Internet» in COMMON would stop the
-// graph carrying an Internet node, and a term shelved as a term is exactly what
-// we want it to be.
-const CAP_COMMON = new Set(
-  `internet web university college institute department faculty laboratory press journal
-  conference workshop proceedings appendix abstract references index glossary preface
-  интернет университет институт факультет кафедра лаборатория издательство журнал
-  конференция приложение введение заключение оглавление указатель`
-    .split(/\s+/)
-    .filter(Boolean),
-);
+// The reason is that they answer a different question. The miner asks «is this
+// a function word of the language I am reading», which is exactly a per-language
+// question. The proper-noun guard asks «is this label an ordinary word rather
+// than somebody's name», tagOk asks «is this piece a subject heading or a scrap
+// of the sentence around one», and neither has a language to speak of: a tag
+// arrives from a PDF's /Keywords field in whatever language the typesetter
+// used and from the model's TOPICS line in the INTERFACE language, which are
+// routinely two different languages and neither of them the book's. An answer
+// of «yes, that is an ordinary word in some language I know» is the right
+// answer to both, whichever language that turns out to be.
+//
+// So this is the union, and it is what the module has always used. Measured
+// against the sets it replaces: `common` and `capCommon` are the same words to
+// the letter, and `func` is those words plus the 89 Russian closed-class forms
+// and pieces of document furniture that terms.ts brought in from
+// graphstore.ts:875 (книга, странице, всей, которого, каждой…). That is the
+// safe direction for all three callers — one more word on the list is one more
+// label that cannot be mistaken for a name and one more scrap that cannot be
+// mistaken for a subject heading.
+const STOP = stopLists(UND);
 
 // ---- the proper-noun guard --------------------------------------------------
 //
@@ -503,7 +507,7 @@ function isNameWord(word: string): boolean {
   if (!/^\p{Lu}/u.test(w)) return false; // «recommender», «eCommerce»: no capital, no name
   if (w === w.toUpperCase()) return false; // an acronym, see above
   const low = w.toLowerCase();
-  return !FUNC_STOP.has(low) && !COMMON.has(low) && !CAP_COMMON.has(low);
+  return !STOP.func.has(low) && !STOP.common.has(low) && !STOP.capCommon.has(low);
 }
 
 /// Could this label be the name of an individual — a person, an organisation,
@@ -522,15 +526,14 @@ function guardKind(kind: NodeKind, label: string): NodeKind {
 
 // ---- text plumbing ----------------------------------------------------------
 
-// lookbehind: never start a token mid-word — "38th" must not yield "th"
-const TOKEN_RE = /(?<![\p{L}\p{N}])[\p{L}][\p{L}\p{N}]*(?:['’-][\p{L}\p{N}]+)*/gu;
-const CHUNK_SEP = /[,;:()[\]{}<>"“”«»|/\\]+/;
-const SENT_SPLIT = /(?<=[.!?…][")\]»”’]*)\s+(?=[A-ZА-ЯЁ0-9«"“([])/;
-
 // Yield to the event loop without setTimeout — a hidden tab's timer throttling
 // would otherwise clamp every yield to ~1s and make a background build crawl.
-// (Copied from glossarygen rather than imported: it is a private helper there,
-// and this module may not add exports to a file another agent owns.)
+//
+// glossarygen has the same four lines, and terms.ts — which both of them now
+// mine through — deliberately does not export one: the miner does no IO, takes
+// no signal and never yields, because the caller owns the read loop, the
+// progress bar and the abort. Deciding when to breathe is this module's job and
+// nobody else's, so the helper lives with the loop that uses it.
 function tick(): Promise<void> {
   return new Promise((res) => {
     const ch = new MessageChannel();
@@ -562,21 +565,6 @@ function sleep(ms: number, signal: AbortSignal): Promise<void> {
 const flat = (s: string): string => s.replace(/\s+/g, " ").trim();
 const str = (v: unknown): string => (typeof v === "string" ? v.trim() : "");
 
-/// Clause-bounded token runs, one array per clause, grouped by sentence.
-function clauses(text: string): string[][][] {
-  const out: string[][][] = [];
-  for (const piece of text.split(SENT_SPLIT)) {
-    const raw = piece.trim();
-    if (!raw) continue;
-    const sent = raw
-      .split(CHUNK_SEP)
-      .map((c) => c.match(TOKEN_RE) ?? [])
-      .filter((toks) => toks.length);
-    if (sent.length) out.push(sent);
-  }
-  return out;
-}
-
 async function pageParagraphs(doc: PDFDocumentProxy, n: number): Promise<Paragraph[]> {
   const page = await doc.getPage(n);
   const content = await page.getTextContent();
@@ -585,46 +573,12 @@ async function pageParagraphs(doc: PDFDocumentProxy, n: number): Promise<Paragra
 
 const paraText = (paras: readonly Paragraph[]): string => paras.map((p) => p.text).join("\n");
 
-// Reference lists and back-of-book indexes are dense with years, DOIs and
-// URLs, and mining them floods the concept list with venue names and author
-// surnames. Same net glossarygen uses, same threshold: running prose rarely
-// carries eight such markers on one page.
-const isCitationPage = (paras: readonly Paragraph[]): boolean =>
-  paras.reduce((acc, p) => acc + (p.text.match(CITE_MARK)?.length ?? 0), 0) >= CITE_PAGE_MIN;
-
-// ---- the sampler ------------------------------------------------------------
-
-type Stat = {
-  freq: number;
-  pages: number[]; // 1-based, ascending, deduped
-  nonInit: number; // occurrences NOT at a sentence start (case is trustworthy there)
-  capNonInit: number; // …of those, the surface starts with a capital
-  forms: Map<string, number>; // non-lowercase surface forms at non-initial positions
-  first: string; // first surface seen anywhere (fallback display)
-};
-
-// `key` is the entry in `stats` this came out of — the lowercased token join,
-// not the display label. seedShard needs it to tell one concept counted twice
-// from two concepts that happen to fold onto one id.
-type Mined = { key: string; term: string; freq: number; pages: number[] };
-
-/// How many times a candidate must occur before it is a candidate at all.
-///
-/// glossarygen wants 5 occurrences across a WHOLE book, and this miner reads a
-/// sample, so the floor has to be a density rather than a count: a sample of
-/// `sampled` pages out of `total` is entitled to the same rate, 5·sampled/total.
-/// The shipped constant was an absolute 3 over 24 pages, which is why every
-/// surviving weight in the reader's first graph sat between 3 and 6 — on 2.9%
-/// of a book almost nothing occurs three times, whatever it is.
-///
-/// Clamped below at 2 because rank() already demands two distinct pages, so a
-/// floor of 1 is incoherent; clamped above at 5 because reading MORE of a book
-/// must never make this miner stricter than the tool it copies. Worth ~2 terms
-/// on the measurement above — the sample size is worth a hundred — but it is
-/// what keeps a short book from going empty and a long one from filling with
-/// one worked example's vocabulary.
-const minFreq = (sampled: number, total: number): number =>
-  Math.min(5, Math.max(2, Math.round((5 * Math.min(sampled, total)) / Math.max(1, total))));
+// ---- the page sample --------------------------------------------------------
+//
+// This stays here rather than moving to terms.ts with the miner: the miner is
+// handed pages, it does not choose them, and this pass chooses them for three
+// different consumers at once — the provenance classifier, the language
+// detector and the miner — from one read of each page.
 
 /// At most `want` page numbers spread evenly across a book of `total` pages,
 /// first and last included. Even spacing rather than a contiguous slice: a
@@ -637,216 +591,109 @@ function samplePages(total: number, want: number): number[] {
   return [...new Set(out)];
 }
 
+/// A capital in the two alphabets an author line can be set in. The miner has
+/// its own copy of this (terms.ts) because it runs the test once per counted
+/// occurrence and cannot afford to import anything; this one is consulted by
+/// looksLikeAuthors, a few dozen times per book, and is kept because a byline is
+/// the one place in this module where «starts with a capital» is the whole test.
 const isCapital = (ch: number): boolean =>
   (ch >= 65 && ch <= 90) || (ch >= 0x410 && ch <= 0x42f) || ch === 0x401;
 
-function bump(stats: Map<string, Stat>, key: string, page: number, surface: string, nonInitial: boolean): void {
-  let st = stats.get(key);
-  if (!st) {
-    st = { freq: 0, pages: [], nonInit: 0, capNonInit: 0, forms: new Map(), first: surface };
-    stats.set(key, st);
-  }
-  st.freq++;
-  // pages arrive in ascending order, so one comparison is the whole dedup
-  if (st.pages[st.pages.length - 1] !== page) st.pages.push(page);
-  if (nonInitial) {
-    st.nonInit++;
-    if (surface !== key) st.forms.set(surface, (st.forms.get(surface) ?? 0) + 1);
-    if (isCapital(surface.charCodeAt(0))) st.capNonInit++;
-  }
-}
+// ---- the reader's term store ------------------------------------------------
 
-// One page's contribution to the counts. n=1..4 inside clause bounds, with
-// glossarygen's boundary rules: a term never starts or ends on a function
-// word, and a one-character token may never sit inside one (math-notation runs
-// like "iP P R iP" would otherwise mine themselves into the graph).
-function minePage(stats: Map<string, Stat>, page: number, text: string): void {
-  for (const sent of clauses(text)) {
-    let sentPos = 0; // token index within the sentence — 0 ⇒ sentence-initial
-    for (const toks of sent) {
-      const low = toks.map((w) => w.toLowerCase());
-      for (let a = 0; a < low.length; a++) {
-        const w0 = low[a];
-        // the opening word does not depend on n, so a bad one ends the run
-        if (w0.length < 2 || FUNC_STOP.has(w0)) continue;
-        for (let n = 1; n <= MAX_N && a + n <= low.length; n++) {
-          if (n > 2 && low[a + n - 2].length < 2) break;
-          const end = low[a + n - 1];
-          if (end.length < 2 || FUNC_STOP.has(end)) continue; // a longer gram may still end cleanly
-          const key = low.slice(a, a + n).join(" ");
-          if (key.length > 64) break;
-          bump(stats, key, page, toks.slice(a, a + n).join(" "), sentPos + a > 0);
-        }
-      }
-      sentPos += toks.length;
-    }
-  }
-}
-
-// Dominant surface form: the lowercased key unless some cased form outnumbers
-// plain lowercase in running text (BM25 not bm25, Boolean not boolean).
-function dominantForm(key: string, st: Stat): string {
-  if (!st.nonInit) return st.first || key;
-  let bestForm = "";
-  let bestCnt = 0;
-  let cased = 0;
-  for (const [f, c] of st.forms) {
-    cased += c;
-    if (c > bestCnt) ((bestCnt = c), (bestForm = f));
-  }
-  return bestCnt > st.nonInit - cased ? bestForm : key;
-}
-
-/// Rank the counted n-grams and keep the top `cap`. C-value nested discounting
-/// (longest first; an accepted longer term's own-use frequency is subtracted
-/// from its subgrams) for multiword candidates, acronym and
-/// capitalised-in-running-text rules for unigrams — glossarygen's acceptance,
-/// with its two-letter-surname guard kept, because a citation-heavy book makes
-/// «Li» and «Ma» clear every other test.
+/// The reader's own term store for this book, if there is one — and it is not a
+/// word list any more, it is a RECORD each: a surface form in the book's own
+/// language, plus whatever the glossary's passes or the reader's own hand have
+/// attached to it since. Two of those fields are exactly what a bare concept
+/// node lacks — a KIND out of the same six-word vocabulary the graph draws in,
+/// and a one-sentence DEFINITION — so seedShard can colour and gloss a node
+/// with no model running at all, and the deep pass can skip what is already
+/// known instead of paying a minute a chunk to learn it twice.
 ///
-/// `minPages` is the one rule that is NOT glossarygen's, and it is here
-/// because the sample is. A floor of 5 over a whole book is what stops a
-/// phrase that happens to repeat inside one table or one worked example from
-/// being read as a concept; on a sample the floor drops (see minFreq), which
-/// lets exactly that junk back in — a page that says «value systems change»
-/// three times hands the graph a four-word node spanning a verb. A concept the
-/// book is actually about turns up in more than one place, so a candidate met
-/// on a single page is dropped. The rule is relaxed for a document too short
-/// to have a spread worth measuring.
-function rank(stats: Map<string, Stat>, cap: number, minPages: number, floor: number): Mined[] {
-  type Cand = { key: string; n: number; freq: number };
-  const cands: Cand[] = [];
-  for (const [key, st] of stats) {
-    if (st.freq < floor || st.pages.length < minPages) continue;
-    cands.push({ key, n: key.split(" ").length, freq: st.freq });
-  }
-  cands.sort((a, b) => b.n - a.n);
-  const candSet = new Set(cands.map((c) => c.key));
-  const nested = new Map<string, number>();
-  for (const c of cands) {
-    if (c.n === 1) continue;
-    const contrib = c.freq - (nested.get(c.key) ?? 0);
-    if (contrib <= 0) continue;
-    const toks = c.key.split(" ");
-    const seen = new Set<string>();
-    for (let len = 1; len < c.n; len++)
-      for (let a = 0; a + len <= c.n; a++) {
-        const sub = toks.slice(a, a + len).join(" ");
-        if (seen.has(sub) || !candSet.has(sub)) continue;
-        seen.add(sub);
-        nested.set(sub, (nested.get(sub) ?? 0) + contrib);
-      }
-  }
-
-  type Scored = { key: string; disp: string; freq: number; score: number };
-  const accepted: Scored[] = [];
-  for (const c of cands) {
-    const st = stats.get(c.key)!;
-    const adj = c.freq - (nested.get(c.key) ?? 0);
-    const disp = dominantForm(c.key, st);
-    if (c.n >= 2) {
-      if (adj >= floor) accepted.push({ key: c.key, disp, freq: c.freq, score: adj * Math.log2(c.n) });
-      continue;
-    }
-    const isAcr =
-      disp.length >= 2 && disp === disp.toUpperCase() && /\p{Lu}/u.test(disp) && !/^[IVXLCDM]+$/.test(disp);
-    if (isAcr && adj >= floor) {
-      accepted.push({ key: c.key, disp, freq: c.freq, score: adj });
-      continue;
-    }
-    // A two-letter capitalised token in running text is an author surname (Li,
-    // Yu, Xu, Ma), never a domain term — glossarygen learned that the hard way
-    // and the same trap is here. Genuine two-letter terms are acronyms and
-    // were accepted just above.
-    if (
-      disp.length >= 3 &&
-      /^\p{Lu}[^\p{Lu}]/u.test(disp) &&
-      st.capNonInit >= MIN_CAP_FREQ &&
-      st.capNonInit > st.nonInit - st.capNonInit &&
-      !COMMON.has(c.key)
-    )
-      accepted.push({ key: c.key, disp, freq: c.freq, score: adj });
-  }
-
-  // Conjunction split, straight from glossarygen: «precision and recall» is
-  // two terms joined by prose, not one — but only when both halves stand on
-  // their own in the text. Purely structural, no domain knowledge involved.
-  const CONJ = new Set(["and", "or", "и", "или"]);
-  const have = new Set(accepted.map((c) => c.key));
-  const split: Scored[] = [];
-  for (const c of accepted) {
-    const toks = c.key.split(" ");
-    const ci = toks.findIndex((w) => CONJ.has(w));
-    const oneConj = ci > 0 && ci < toks.length - 1 && !toks.some((w, i) => i !== ci && CONJ.has(w));
-    const halves = oneConj ? [toks.slice(0, ci).join(" "), toks.slice(ci + 1).join(" ")] : [];
-    const standsAlone = (h: string): boolean => {
-      const st = stats.get(h);
-      return !!st && st.freq >= floor && st.pages.length >= minPages;
-    };
-    if (!halves.length || !halves.every(standsAlone)) {
-      split.push(c);
-      continue;
-    }
-    for (const h of halves) {
-      if (have.has(h)) continue; // the half is already a term in its own right
-      have.add(h);
-      const st = stats.get(h)!;
-      split.push({ key: h, disp: dominantForm(h, st), freq: st.freq, score: c.score });
-    }
-  }
-
-  split.sort((a, b) => b.score - a.score);
-  return split.slice(0, cap).map((c) => ({
-    key: c.key,
-    term: c.disp,
-    freq: c.freq,
-    pages: (stats.get(c.key)?.pages ?? []).slice(0, MAX_PAGES_PER_TERM),
-  }));
-}
-
-/// The mining key an arbitrary phrase would have had if minePage had counted
-/// it: the same tokens, lowercased and joined. This is what lets a glossary
-/// term be looked up in `stats` instead of scanned for a second time.
-/// (TOKEN_RE carries /g; String.match resets lastIndex, so it stays reusable.)
-function mineKey(term: string): string {
-  const toks = term.match(TOKEN_RE);
-  return toks ? toks.map((w) => w.toLowerCase()).join(" ") : "";
-}
-
-/// The source side of the reader's glossary for this book, if the file exists.
-/// hydrateGlossary is translate.ts's own reader — it owns the appdata path, the
-/// session cache and the fallback to a pre-binding file name, and none of that
-/// may be re-implemented here: two spellings of «where the glossary lives»
-/// would drift apart the first time either side changed.
+/// loadGlossary is glossarygen's own reader, and none of what it does may be
+/// re-implemented here: it owns the appdata path, the session cache, the
+/// fallback to a pre-binding file name and the sidecar that carries the
+/// bookkeeping. Two spellings of «where the glossary lives» would drift apart
+/// the first time either side changed.
 ///
 /// It is keyed by bookPath rather than by the content key this shard is named
 /// with, and resolves the one to the other through bookid's session map. That
 /// map is filled by whoever read the file's bytes — graphrun's openGraphDoc
-/// calls setBookKey before seedShard for exactly this reason — so the lookup
+/// calls setBookKey before seedShard for exactly this reason, and its
+/// deepen-only branch, which never opens the file at all, binds the shard's own
+/// name before calling deepen for the same one — so the lookup
 /// lands on <appDataDir>/glossaries/<contentKey>.txt, the same file the
-/// translation side writes. Nothing breaks if it has not been filled: the
-/// fallback finds a legacy path-named glossary or nothing at all.
+/// translation side writes. Nothing breaks on the READ side if it has not been
+/// filled: the fallback finds a legacy path-named glossary or nothing at all.
+/// The write side is stricter, and says why at feedTermStore.
 ///
 /// Never throws. A book with no glossary, a profile with no glossaries folder
 /// and a plain-browser run all mean the same thing to a seed pass — no free
 /// terms this time — and none of them is a failed build.
-async function glossaryTerms(bookPath: string): Promise<string[]> {
-  const text = await hydrateGlossary(bookPath).catch(() => "");
-  const out: string[] = [];
+async function glossaryRecords(bookPath: string): Promise<TermRecord[]> {
+  const loaded = await loadGlossary(bookPath).catch(() => null);
+  const out: TermRecord[] = [];
   const seen = new Set<string>();
-  for (const e of parseGlossary(text)) {
-    const src = flat(e.src);
+  for (const rec of loaded?.records ?? []) {
+    const term = flat(rec.term);
     // The same shape tests the miner applies to its own labels: a line that is
     // a sentence, or has no letters in it, is a broken glossary line.
-    if (src.length < 2 || src.length > 64 || !/\p{L}/u.test(src)) continue;
-    if (src.split(/\s+/).length > MAX_N + 2) continue;
-    const k = normId(src);
+    if (term.length < 2 || term.length > 64 || !/\p{L}/u.test(term)) continue;
+    if (term.split(/\s+/).length > MAX_N + 2) continue;
+    const k = normId(term);
     if (!k || seen.has(k)) continue;
     seen.add(k);
-    out.push(src);
+    out.push({ ...rec, term });
   }
   return out;
 }
+
+/// Which concepts the reader's term store has already TYPED — keyed the way a
+/// node is keyed, so the deep pass can ask about a node rather than about a
+/// spelling.
+///
+/// It exists because a node cannot answer the question by itself. «term» is
+/// both what the store says about most entries in a technical book AND the
+/// seed's default for a concept nobody has typed, so `n.kind === "term"` is two
+/// different states wearing one word. The store can tell them apart — a record
+/// either carries a kind or it does not — and it is one cached read away
+/// (loadGlossary's text comes out of translate.ts's session cache; only the
+/// sidecar is read from disk).
+///
+/// conceptId on both sides rather than the node's id, because that is what
+/// welded the store's term onto the node in the first place (addConcept keys by
+/// conceptId, which folds the head token, so «inverted indexes» in the file and
+/// «inverted index» in the running text are one concept). A person node keyed
+/// by normId — an author whose surname the miner also found — therefore never
+/// matches here and is asked about again. That is the harmless direction: it
+/// costs one slot in a typing batch, and applyDeep pins an author's kind
+/// anyway, whereas a false match would pin a node to a kind nobody chose.
+async function typedConcepts(bookPath: string): Promise<Set<string>> {
+  const out = new Set<string>();
+  for (const rec of await glossaryRecords(bookPath)) {
+    if (!rec.kind) continue;
+    const id = conceptId(rec.term);
+    if (id) out.add(id);
+  }
+  return out;
+}
+
+/// A glossary definition as a node's gloss, or "" when it cannot be one.
+///
+/// The model gates further down this file (cleanGloss and its neighbours)
+/// deliberately do NOT apply here. They judge a reply that has just come back
+/// from a model in this process; this line came off the reader's own file, which
+/// glossarygen's passes have already gated and which the reader may then have
+/// rewritten by hand. Re-judging it here would throw away the better of the two
+/// texts, and the alphabet test in particular would reject a definition written
+/// while the interface was set to the other language. What is left worth
+/// checking is the shape of the field the panel draws on one line: a definition
+/// longer than a gloss is dropped whole rather than cut, because half a sentence
+/// under a node is worse than no sentence at all.
+const glossOf = (definition: string | undefined): string => {
+  const g = flat(definition ?? "");
+  return g && g.length <= GLOSS_MAX ? g : "";
+};
 
 // ---- metadata reading -------------------------------------------------------
 
@@ -1138,7 +985,7 @@ function usableSurname(sn: string): boolean {
   if (!id) return false;
   // normId splits a double-barrelled surname on its hyphen, so every part is
   // tested: «Baeza-Yates» passes, a hypothetical «Data-Smith» would not.
-  return !id.split(" ").some((w) => FUNC_STOP.has(w) || COMMON.has(w) || CAP_COMMON.has(w));
+  return !id.split(" ").some((w) => STOP.func.has(w) || STOP.common.has(w) || STOP.capCommon.has(w));
 }
 
 /// The bare surname this mined label is a mention of, or "" when the label is
@@ -1223,7 +1070,7 @@ function tagOk(raw: string): string | null {
   const solid = s.replace(/\s/g, "").length;
   if (!letters || letters / solid < TAG_MIN_LETTERS) return null; // a bare number or a code
   // Function words only — a fragment of the sentence around the real keywords.
-  if (words.every((w) => FUNC_STOP.has(w.toLowerCase().replace(/[^\p{L}\p{N}]/gu, "")))) return null;
+  if (words.every((w) => STOP.func.has(w.toLowerCase().replace(/[^\p{L}\p{N}]/gu, "")))) return null;
   return s;
 }
 
@@ -1254,8 +1101,21 @@ function splitTags(raw: string): string[] {
 // small session cache here. A cold cache — deepen() run against a shard built
 // before the app restarted — is not an error: topicsFor() falls back to what
 // the shard itself carries, and the model gets a thinner but honest brief.
+//
+// The book's detected LANGUAGE rides along for the same reason, and this time
+// the reason is not a preference. A Shard cannot carry it at all: graphstore's
+// parseShard rebuilds every shard it reads field by field from a fixed list, so
+// a `lang` written here would be silently dropped the next time the file was
+// read — a field that is true in memory and absent on disk is worse than no
+// field. Teaching parseShard about it is graphstore's change to make, not this
+// module's, and it is emphatically NOT worth bumping graphstore's `version`
+// for: that bump blanks every shard in the reader's library until each book has
+// been read again. So the seed remembers it, and the one consumer — the write
+// back into the term store, which stamps the language on the glossary's sidecar
+// — simply says nothing about the language when the cache is cold, which
+// glossarygen already reads as «keep whatever the sidecar said».
 
-type SeedContext = { front: string; toc: string };
+type SeedContext = { front: string; toc: string; lang: BookLang };
 const CONTEXT_CACHE = 32;
 const contexts = new Map<string, SeedContext>();
 
@@ -1327,7 +1187,96 @@ export async function seedShard(
   const sample = samplePages(total, MINE_PAGES_MAX);
   const sampleSet = new Set(sample);
   const wanted = [...new Set([...front, ...(back ? [back] : []), ...sample])].sort((a, b) => a - b);
-  const floor = minFreq(sample.length, total);
+  const floor = sampleFloor(sample.length, total);
+
+  // ---- what language is this book in ----------------------------------------
+  //
+  // It has to be answered BEFORE the first page is counted, because the answer
+  // picks the stoplists the miner counts with, and it has to be answered from a
+  // SPREAD of the book rather than from its opening: a title page, a copyright
+  // block and a contents list are what pages 1 to 3 are, and booklang answers
+  // «und» to all three by design.
+  //
+  // Both of those are satisfied without reading a single page twice. The
+  // detection pages are chosen out of the mining sample — indices into it, so
+  // they are pages this pass was always going to read — and their paragraphs
+  // are carried forward into the loop below instead of being dropped and
+  // extracted again. glossarygen re-reads its own detection pages, and can
+  // afford to: it has no page-ordering constraint and reads every page anyway.
+  // Here the pages must reach the miner in ascending order, so the carrier is
+  // both the cheaper answer and the only one that keeps the order.
+  //
+  // What is held is bounded by LANG_PAGES, not by the book: sixteen pages of
+  // paragraphs, a few tens of kilobytes, each dropped the moment the loop
+  // reaches it. Weigh that against the 75 MB of n-grams the miner itself holds.
+  //
+  // The bar is raised before this loop, at zero of the whole read, rather than
+  // after it: for a short book these sixteen pages ARE most of the read, and a
+  // pass that shows nothing until it is nearly done looks like a pass that has
+  // hung.
+  onProgress({ phase: "seed", done: 0, total: wanted.length });
+  const carried = new Map<number, Paragraph[]>();
+  const detectSamples: string[] = [];
+  const detectPages = samplePages(sample.length, LANG_PAGES);
+  for (let i = 0; i < detectPages.length; i++) {
+    if (signal.aborted) abortErr();
+    const n = sample[detectPages[i] - 1];
+    const ps = await pageParagraphs(pdf, n).catch(() => []);
+    carried.set(n, ps);
+    // Detection is fed the same pages the miner will be fed — a bibliography is
+    // thin in the book's own language and would only dilute the vote.
+    if (ps.length && !isCitationPage(ps)) detectSamples.push(paraText(ps));
+    if (i % 8 === 7) await tick(); // same breathing room the main loop takes
+  }
+  // UND — «I will not guess» — is a normal answer and not a failure. Almost
+  // always it means a language booklang does not vote on (Swedish, Turkish,
+  // Czech), because a book in one it does vote on answers off sixteen pooled
+  // pages; the rest is a scan with a broken text layer or a book of formulas,
+  // neither of which the miner can do anything with anyway. terms.ts reads UND
+  // as «use every curated word there is, AND derive this book's own function
+  // words from the book», which is the only thing a miner can do for a grammar
+  // it was never taught.
+  //
+  // The confidence figure is deliberately not kept. Nothing here would do
+  // anything different with it: a miner cannot half-apply a stoplist, and a
+  // second-guessing threshold on top of booklang's own floors would only be a
+  // worse copy of them.
+  //
+  // The cost of that derived list, measured over 60 pages of this project's own
+  // English prose (472 KB, floor 5, cap 120): with the language known it is the
+  // old miner term for term, in the same order, and so is UND with the
+  // derivation off; with the derivation on, 13 of the 120 move — «book»,
+  // «model» and «shard» are each on more than 60 % of these pages, so the rule
+  // reads them as grammar and «whole book» and «local model» drop out. That is
+  // the trade, and it is the right way round: it is paid only by a book we
+  // could not name, and it buys every book in a language we ship no list for.
+  const lang = detectBookLang(detectSamples).lang;
+
+  // ---- the miner ------------------------------------------------------------
+  //
+  // Everything the miner needs is known except one number: the page-spread rule
+  // counts pages that SURVIVED the citation filter, which is only settled when
+  // the read ends, and MineOptions is fixed when the miner is built. So the
+  // first MIN_SPREAD_PAGES minable pages are held as text — four pages, a few
+  // kilobytes — and the miner is built the instant the fourth arrives, which is
+  // the instant the answer stops being able to change. A book that never gets
+  // there is built with the relaxed rule after the loop. Held pages are replayed
+  // in the order they were read, so the miner still sees ascending page numbers,
+  // which is the whole of its page dedup.
+  //
+  // The alternative — deciding the rule from the page COUNT, as glossarygen
+  // does — is wrong here for the same reason the rule exists: this pass reads a
+  // sample and drops citation pages out of it, so a hundred-page document can
+  // easily have three minable pages, and that is exactly the document the
+  // relaxed rule is for.
+  let miner: TermMiner | null = null;
+  const held: { page: number; text: string }[] = [];
+  const buildMiner = (minPages: number): TermMiner => {
+    const m = createMiner({ lang, cap: SEED_TERMS, minFreq: floor, minPages, withPages: true });
+    for (const p of held) m.addPage(p.page, p.text);
+    held.length = 0;
+    return m;
+  };
 
   // Only the classifier's own pages are RETAINED. The miner consumes each page
   // as it is read and drops it: a whole 838-page book's paragraphs held at once
@@ -1335,28 +1284,39 @@ export async function seedShard(
   // each page exactly once, and this pass now runs over books of that size.
   const paras = new Map<number, Paragraph[]>();
   const keep = new Set([...front, ...(back ? [back] : [])]);
-  const stats = new Map<string, Stat>();
   let mined = 0;
-
-  onProgress({ phase: "seed", done: 0, total: wanted.length });
   let read = 0;
   for (const n of wanted) {
     if (signal.aborted) abortErr();
     // A page whose text layer is broken is one page missing from the sample,
     // never a failed build: the reader would rather have most of a book in the
-    // graph than an error where the book should be.
-    const ps = await pageParagraphs(pdf, n).catch(() => []);
+    // graph than an error where the book should be. `has`, not `??`: a carried
+    // page whose text layer was broken is an empty array, and `??` would send
+    // us back to pdf.js to be told so a second time.
+    const ps = carried.has(n) ? carried.get(n)! : await pageParagraphs(pdf, n).catch(() => []);
+    carried.delete(n);
     if (keep.has(n)) paras.set(n, ps);
     // A page that reads as a reference list or a back-of-book index is skipped
     // whole rather than filtered term by term. `wanted` is ascending, which is
-    // the whole of bump()'s page dedup.
+    // the whole of the miner's page dedup.
     if (sampleSet.has(n) && ps.length && !isCitationPage(ps)) {
-      minePage(stats, n, paraText(ps));
+      const text = paraText(ps);
       mined++;
+      if (miner) miner.addPage(n, text);
+      else {
+        held.push({ page: n, text });
+        if (mined >= MIN_SPREAD_PAGES) miner = buildMiner(2);
+      }
     }
     onProgress({ phase: "seed", done: ++read, total: wanted.length });
     if (read % 8 === 0) await tick();
   }
+  // A concept has to turn up on more than one of the pages actually read —
+  // unless so few of them survived the citation filter that «more than one
+  // page» would mean «almost all of them», which a four-page article cannot
+  // satisfy without going empty.
+  const counts = miner ?? buildMiner(1);
+  const terms = counts.finish();
 
   const info = (await pdf
     .getMetadata()
@@ -1405,10 +1365,17 @@ export async function seedShard(
 
   // Authors first, so a mined term that happens to spell an author's name
   // lands on the person node instead of shadowing it with a «term».
+  //
+  // Their ids are kept, because whom a book is BY is the metadata's claim and
+  // the strongest evidence in this pass. Nothing weaker may re-type one — not
+  // the glossary's kind below, and not the model's answer in applyDeep, which
+  // pins the same set for the same reason.
+  const authorIds = new Set<string>();
   for (const name of authors) {
     const id = `n:${normId(name)}`;
     if (!normId(name) || nodes.has(id)) continue;
     nodes.set(id, { id, kind: "person", label: name, books: [key], weight: 1 });
+    authorIds.add(id);
     edges.push({ a: bookId, b: id, rel: "by", weight: 1 });
   }
 
@@ -1440,9 +1407,44 @@ export async function seedShard(
   // author's name, and a glossary term the miner also found are all the same
   // case: one concept, so the frequencies add and the page lists merge —
   // assigning would silently drop whichever half was seen first.
+  //
+  // `kind` and `gloss` are what the reader's term store knows and the miner
+  // does not, and they are OPTIONAL because the miner's own terms arrive
+  // without them. What they are allowed to do is written down in `known` below.
   let concepts = 0;
   const counted = new Set<string>();
-  const addConcept = (label: string, freq: number, pages: number[], statKey: string): void => {
+
+  /// Apply what the term store said about a term to the node that carries it.
+  ///
+  /// The kind goes through guardKind exactly like a model's answer, and for the
+  /// same reason: it CAME from a model — glossarygen's enrichment pass types
+  /// terms with the same 4B model and the same six-word vocabulary — and a 4B
+  /// model cannot hold that vocabulary steady. A glossary line that says
+  /// «recommender systems :: work» would otherwise put a wrongly coloured node
+  /// in a picture the reader is looking at, which is the whole reason the guard
+  /// exists.
+  ///
+  /// An author is untouchable. The metadata said this is a person and a
+  /// glossary line does not outrank it; applyDeep pins the same nodes against
+  /// the model for the same reason.
+  ///
+  /// A gloss already on the node is never overwritten, so the first term store
+  /// line to reach an id owns it — which matters only when two spellings fold
+  /// onto one node, and is the same rule mergeRecords uses at the other end.
+  const known = (n: GraphNode, kind: NodeKind | undefined, gloss: string): void => {
+    if (authorIds.has(n.id)) return;
+    if (kind) n.kind = guardKind(kind, n.label);
+    if (gloss && !n.gloss) n.gloss = gloss;
+  };
+
+  const addConcept = (
+    label: string,
+    freq: number,
+    pages: number[],
+    statKey: string,
+    kind?: NodeKind,
+    gloss = "",
+  ): void => {
     // conceptId, not normId: graphstore's contract is that a term's node id is
     // the FOLDED key, so «IR systems» and «IR system» — both of which a
     // whole-book mine finds, and both of which this book's glossary lists —
@@ -1487,19 +1489,30 @@ export async function seedShard(
     if (existing) {
       const seen = [...new Set([...(existing.pages?.[key] ?? []), ...pages])].sort((a, b) => a - b);
       existing.pages = { [key]: seen.slice(0, MAX_PAGES_PER_TERM) };
+      // BEFORE the early return below, and that ordering is the point. A
+      // glossary term the miner also found is the common case — once both have
+      // read the whole book it is most of them — and that is precisely the term
+      // whose count arrives twice, so a `known` call after the return would
+      // silently never type the terms it exists for.
+      known(existing, kind, gloss);
       if (!fresh) return;
       existing.weight += freq;
     } else {
       if (concepts >= MAX_CONCEPTS) return;
       concepts++;
-      nodes.set(id, {
+      const node: GraphNode = {
         id,
-        kind: "term", // the deep pass types it; until then everything is a term
+        // The deep pass types it; until then everything the miner found is a
+        // term. A term store line that says otherwise is applied on the next
+        // line — see `known` for what it is and is not allowed to change.
+        kind: "term",
         label,
         books: [key],
         weight: freq,
         pages: { [key]: pages },
-      });
+      };
+      known(node, kind, gloss);
+      nodes.set(id, node);
     }
     // `existing.id`, not `id`: the node found may be an author's person node,
     // whose id is the unfolded one. An edge to `id` would then point at a node
@@ -1508,33 +1521,37 @@ export async function seedShard(
     edges.push({ a: bookId, b: existing?.id ?? id, rel: "mentions", weight: freq });
   };
 
-  // A concept has to turn up on more than one of the pages actually read —
-  // unless so few of them survived the citation filter that «more than one
-  // page» would mean «almost all of them», which a four-page article cannot
-  // satisfy without going empty.
-  for (const m of rank(stats, SEED_TERMS, mined >= 4 ? 2 : 1, floor)) addConcept(m.term, m.freq, m.pages, m.key);
+  // What the book itself said, ranked. `pages` is present because the miner was
+  // asked for it; the `?? []` is the type saying so rather than a real case.
+  for (const m of terms) addConcept(m.term, m.freq, m.pages ?? [], m.key);
 
-  // The reader's own glossary for this book, if there is one — free quality.
-  // The expensive pass has ALREADY RUN for another feature: glossarygen read
-  // every page of this book, mined it with the same C-value extractor at
-  // glossarygen's own thresholds, and the reader then curated the result by
-  // hand while translating. Reading that file is one 6 KB read and it hands
-  // this graph a term list nothing here could afford to compute twice.
+  // The reader's own term store for this book, if there is one — free quality.
+  // The expensive pass has ALREADY RUN for another feature: the glossary read
+  // every page of this book with the very miner used above, at its own
+  // thresholds, and the reader then curated the result by hand while
+  // translating. Reading that file is one 6 KB read and it hands this graph a
+  // term list nothing here could afford to compute twice.
   //
-  // Two things make the merge cheap as well as free. The source side is the
+  // Three things make the merge cheap as well as free. The term side is the
   // book's own language, exactly like a mined label, so the two lists fold
-  // together on normId with no translation involved. And a glossary term's
-  // weight and pages do not need a second scan of the book: the miner counted
-  // every n-gram it met, so a glossary term is almost always already in
-  // `stats` — it simply lost to the cap or the floor — and its true frequency
-  // and page numbers are waiting there under its own key. Only a term longer
-  // than MAX_N tokens, or one that straddles a clause boundary, misses; that
-  // node joins the graph wired to the book alone, which is still a node the
-  // reader can search for and a term the deep pass will gloss.
-  for (const term of await glossaryTerms(bookPath)) {
-    const statKey = mineKey(term);
-    const st = stats.get(statKey);
-    addConcept(term, st?.freq ?? 1, st ? st.pages.slice(0, MAX_PAGES_PER_TERM) : [], statKey);
+  // together on normId with no translation involved. A glossary term's weight
+  // and pages do not need a second scan of the book: the miner counted every
+  // n-gram it met, so a glossary term is almost always already in the counts —
+  // it simply lost to the cap or the floor — and its true frequency and page
+  // numbers are waiting there under its own key. Only a term longer than MAX_N
+  // tokens, or one that straddles a clause boundary, misses; that node joins the
+  // graph wired to the book alone, which is still a node the reader can search
+  // for and a term the deep pass will gloss.
+  //
+  // And the third is new, and it is what makes this one store rather than two
+  // features that happen to read the same file: the record carries a KIND and a
+  // DEFINITION. A node the seed could previously only leave as an untyped,
+  // unglossed «term» arrives coloured and explained, before any model has run
+  // — which is also the state the reader is left in when they have no aux model
+  // at all, and it is the honest one to leave them in.
+  for (const rec of await glossaryRecords(bookPath)) {
+    const { key: statKey, freq, pages } = counts.lookup(rec.term);
+    addConcept(rec.term, freq || 1, pages, statKey, rec.kind, glossOf(rec.definition));
   }
 
   // The book node itself is synthesised by graphstore's merge from these very
@@ -1545,6 +1562,7 @@ export async function seedShard(
   rememberContext(key, {
     front: frontText.length > FRONT_CHARS ? `${frontText.slice(0, FRONT_CHARS)}…` : frontText,
     toc: await outlineHeadings(pdf).catch(() => ""),
+    lang,
   });
 
   // A verdict the reader corrected by hand outranks the classifier for ever.
@@ -1659,7 +1677,7 @@ async function waitHealthy(deadline: number, signal: AbortSignal): Promise<boole
 
 // Bring the on-demand aux server (Qwen3.5-4B on 11545) up. Resolves false when
 // it cannot come up; the caller then keeps the seed shard. Modelled on
-// TranslatePopover's ensureAux, which is private to that component — the same
+// GlossaryPanel's ensureAux, which is private to that component — the same
 // status vocabulary, the same 90s ceiling so a build never hangs on a load.
 async function startAux(signal: AbortSignal): Promise<boolean> {
   const deadline = Date.now() + AUX_START_MS;
@@ -1942,6 +1960,19 @@ async function claudeCall(prompt: string, system: string, signal: AbortSignal): 
 // the model has to name what the terms denote, not read the paper, and a
 // build that shipped page text would cost a hundred times as much for an
 // answer of the same shape.
+//
+// That is not merely an economy, it is the promise this project published:
+// README.md:60 and i18n's «gr.claudeHint» tell the reader in both languages
+// that what reaches Claude is the title, the authors, the keywords and the
+// mined term LABELS, «never the text of its pages». Four things now in this
+// module are book-derived prose and are therefore on the far side of that line:
+// a Brief's `front` (trimmed page text — which is why claudeUser reads four of
+// the Brief's five fields and topicsUser, which runs on this machine, reads
+// all five), a mined term's sample sentence, a glossary DEFINITION, and a
+// node's `gloss`. None of them may be added to `terms` or to the payload
+// below. `terms` is `conceptsOf(shard).map(n => n.label)` and must stay a list
+// of labels; if a future change wants to send the model more context, the
+// context it may send is metadata, not text out of the file.
 async function deepenViaClaude(
   shard: Shard,
   terms: readonly string[],
@@ -1962,11 +1993,19 @@ async function deepenViaClaude(
     return null;
   }
   onProgress({ phase: "types", done: 0, total: 1 });
-  if (replyRejected(raw, terms.length, 260, true)) return null;
+  // The separator is demanded only when terms were asked about. With an empty
+  // ask — every concept already typed by the reader's term store — the whole
+  // legitimate answer is the two head lines, and «no :: in the reply» would
+  // reject it for having done exactly what it was asked.
+  if (replyRejected(raw, terms.length, 260, terms.length > 0)) return null;
   const typed = parseTyped(raw, terms);
-  if (!typed.size) return null; // nothing usable came back — let the local model try
+  // Nothing usable came back — let the local model try. Guarded on `terms`
+  // because an empty ask has an empty answer by construction: when the term
+  // store had already typed every concept, this call was only ever for the
+  // head, and it succeeded.
+  if (!typed.size && terms.length) return null;
   onProgress({ phase: "types", done: 1, total: 1 });
-  return applyDeep(shard, parseHead(raw), typed, "claude");
+  return applyDeep(shard, parseHead(raw), typed, "claude", terms.length);
 }
 
 // ---- assembling the deep shard ----------------------------------------------
@@ -2045,7 +2084,25 @@ function coOccurrence(key: string, ordered: readonly GraphNode[]): GraphEdge[] {
 /// but leaves the stage at «seed» so a later scan tries again. That pair —
 /// engine «local», stage «seed» — is exactly the honest sentence: the local
 /// model answered, and this book has not been deepened yet.
-function applyDeep(shard: Shard, head: Head, typed: Map<string, Typed>, engine: "local" | "claude"): Shard {
+///
+/// `asked` is how many terms this pass actually put to the model, and it exists
+/// because deepen() now skips the terms the reader's own term store had already
+/// typed and glossed. When it skipped ALL of them, `typed` comes back empty for
+/// a reason that has nothing to do with failure — there was nothing left to ask
+/// — and «at least one term came back typed» would be the wrong test: it would
+/// leave a fully explained book at stage «seed» for ever, re-read on every scan
+/// and never given the tags and summary the topics call just produced. So the
+/// rule is «nothing was left to ask, or something came back», which distinguishes
+/// the two cases the empty map covers. It cannot be relaxed to «the store had
+/// typed some of them»: a type pass that asked about fifty terms and lost the
+/// server must still leave the stage at «seed», which is the defect above.
+function applyDeep(
+  shard: Shard,
+  head: Head,
+  typed: Map<string, Typed>,
+  engine: "local" | "claude",
+  asked: number,
+): Shard {
   // Whom this book is BY. Those nodes are people on the metadata's authority,
   // which is better evidence than a 4B model reading a term list, so the model
   // may add a gloss to one but never re-type it. Without the pin, the author
@@ -2056,7 +2113,19 @@ function applyDeep(shard: Shard, head: Head, typed: Map<string, Typed>, engine: 
     const hit = typed.get(n.label);
     if (!hit) return n;
     const next: GraphNode = { ...n, kind: authored.has(n.id) ? n.kind : hit.kind };
-    if (hit.gloss) next.gloss = hit.gloss;
+    // A gloss already on the node is the reader's own sentence and outranks the
+    // model's — the same rule seedShard's `known` states at the other end of the
+    // merge, and the same one glossOf gives its reason for. At stage «seed» a
+    // gloss can have come from nowhere else, and deepen now asks about nodes
+    // that HAVE one (a store record with a definition and no kind still needs
+    // typing), so without this line the pass would answer the question it was
+    // asked — what kind is this — by also overwriting the answer it already had.
+    // The known cost is the mirror of the one feedTermStore states below: the
+    // node keeps the reader's sentence, so its gloss is unchanged, so nothing is
+    // written back and the sidecar does not learn the kind either. The graph is
+    // right, the store stays as the reader left it, and «Определить термины»
+    // remains the pass that fills a missing kind in.
+    if (hit.gloss && !n.gloss) next.gloss = hit.gloss;
     return next;
   });
   const ordered = nodes
@@ -2068,7 +2137,7 @@ function applyDeep(shard: Shard, head: Head, typed: Map<string, Typed>, engine: 
   const kept = shard.edges.filter((e) => e.rel !== "shares");
 
   const tags = splitTags([...shard.tags, ...head.tags].join("\n"));
-  const deepened = typed.size > 0;
+  const deepened = typed.size > 0 || asked === 0;
   return {
     ...shard,
     // Both passes belong to the same extractor, so the deep write stamps the
@@ -2088,6 +2157,127 @@ function applyDeep(shard: Shard, head: Head, typed: Map<string, Typed>, engine: 
   };
 }
 
+// ---- back into the term store -----------------------------------------------
+
+/// Write what the deep pass just learned into the reader's glossary for this
+/// book, stamped source «graph».
+///
+/// This is the return leg of the merge seedShard does, and having both is what
+/// makes the terminology and the graph ONE store rather than two features that
+/// read the same file. The graph is where a model is asked what a term denotes;
+/// there is no reason for the glossary panel to ask a second time, and every
+/// reason for the two to agree about the same word.
+///
+/// Three rules, and each of them is about not writing junk into a file the
+/// reader edits by hand.
+///
+///   • A record needs a GLOSS. A kind on its own would append a bare line to
+///     the .txt for every term in the book — a hundred and eighty lines of
+///     nothing — and the reader would have to delete them. The known cost: a
+///     term already in the file, whose kind the model just corrected but which
+///     it did not gloss, keeps the old kind in the sidecar.
+///   • An author is never written. Those nodes are people on the metadata's
+///     authority and they are not terminology.
+///   • A gloss the shard already had is not written back, because that gloss
+///     came OUT of this file (seedShard's merge) and handing it back would be
+///     the two features talking to themselves.
+///
+/// Two more rules are about writing into the RIGHT file and not overwriting
+/// what the reader decided; both are stated where they are enforced, below.
+/// The short of it: a write whose book is not identified by content key does
+/// not happen at all, and the book's language is filled in only when nobody —
+/// no pass, and above all not the reader — has said anything about it yet.
+///
+/// `pages` rides along; `freq` deliberately does not. A node's weight is a sum
+/// over every surface form that folded onto it, and for a node that absorbed an
+/// author's surname it also includes the metadata's own count — it is not the
+/// frequency of a term, and the sidecar's `freq` field is.
+///
+/// Never throws and never blocks the build's result: a glossary that could not
+/// be written is one feature not improving another, not a failed graph.
+async function feedTermStore(next: Shard, seed: Shard): Promise<void> {
+  const before = new Map(seed.nodes.map((n) => [n.id, n.gloss ?? ""]));
+  const authored = new Set(next.edges.filter((e) => e.rel === "by").map((e) => e.b));
+  const out: TermRecord[] = [];
+  for (const n of next.nodes) {
+    if (authored.has(n.id) || !n.gloss || before.get(n.id) === n.gloss) continue;
+    const rec: TermRecord = { term: n.label, definition: n.gloss, source: "graph" };
+    // isTermKind rather than a cast: NodeKind carries «book», TermKind does
+    // not, and the day somebody adds a kind to graphstore this stays honest.
+    if (isTermKind(n.kind)) rec.kind = n.kind;
+    const pages = n.pages?.[next.key];
+    if (pages?.length) rec.pages = pages;
+    out.push(rec);
+  }
+  if (!out.length) return;
+
+  // WHOSE glossary is this — checked here, at the write, rather than assumed.
+  //
+  // Every per-book file in this app is named by the book's CONTENT key, and the
+  // only thing that knows the content key of a path is bookid's session map,
+  // filled by whoever read the bytes. A shard is named by that same key, so
+  // `bookKey(bookPath) === next.key` is the one available proof that the file
+  // this write is about to open belongs to the book this shard describes.
+  //
+  // Unproven means write NOTHING, and the alternative is what makes that worth
+  // a guard rather than a shrug. With the map empty — a book the reader never
+  // opened this session, which is every book a background rescan deepens —
+  // translate.ts falls back to a hash of the PATH, so the write lands on a file
+  // no book will ever read again, and on its way it fills the glossary session
+  // cache (keyed by bookPath, never invalidated) with that stray list. The
+  // reader then opens the book, the Terms tab shows the cache instead of their
+  // file, and the first blur writes it back under the RIGHT name — over the
+  // hand-curated list that translate.ts calls «work no pass can give back».
+  // Losing a machine-written gloss is a pass that did not help; losing that file
+  // is the reader's evening.
+  //
+  // graphrun binds the key before both roads into this pass, so the guard is
+  // expected to hold; it is here because the cost of it not holding is not
+  // proportionate to the cost of checking.
+  if (bookKey(next.bookPath) !== next.key) {
+    console.warn("graph: not writing the deep pass back — this book's glossary is unidentified", next.bookPath);
+    return;
+  }
+
+  // The language, and the precedence rule this write obeys:
+  //
+  //   the reader's own choice  >  a pass the reader ran  >  this pass  >  UND
+  //
+  // A DETECTOR NEVER OUTRANKS A PERSON. The Terms tab lets the reader correct
+  // the detected language by hand and its passes then store that correction, so
+  // whatever the sidecar already says was either chosen by the reader or shown
+  // to them and left standing. This pass runs in the background on a book they
+  // may not even have open; it has no standing to argue with either.
+  //
+  // So the seed's detection is written in exactly one case — the sidecar has no
+  // language at all — and never as UND. The bug this replaces passed the
+  // detection straight through: `lang: contexts.get(key)?.lang`, which after a
+  // full build in this session is always a real string and often the literal
+  // "und" (seedShard's detector answers UND by design for a book booklang does
+  // not vote on). glossarygen resolves `opts.lang ?? prev.lang`, and `??` does
+  // not fall through on a string, so "und" won — a background graph build
+  // erased the language the reader had picked by hand, the Terms tab fell back
+  // to «unknown» on the next open, and the next mine ran with the derived
+  // stoplist instead of the curated one they had asked for. GlossaryPanel
+  // refuses to write UND for precisely this reason and says so; the graph now
+  // refuses for the same one, and refuses to overwrite as well.
+  //
+  // The extra read is the sidecar's, and it is the price of the rule: saveGlossary
+  // resolves `opts.lang ?? prev.lang` internally and there is no way to say
+  // «fill it only if it is empty» from out here without first knowing what is in
+  // it. It costs one small JSON read at the end of a pass that just spent
+  // minutes in a model.
+  const detected = contexts.get(next.key)?.lang ?? UND;
+  const stored = await loadGlossary(next.bookPath).then(
+    (g) => g.meta.lang,
+    () => UND,
+  );
+  const lang = detected !== UND && stored === UND ? detected : undefined;
+  await saveGlossary(next.bookPath, out, { lang }).catch((e) => {
+    console.warn("graph: could not write the deep pass back to the glossary", e);
+  });
+}
+
 // ---- the deep pass ----------------------------------------------------------
 
 /// Ask a model what the mined terms actually are, what the book is about, and
@@ -2095,6 +2285,14 @@ function applyDeep(shard: Shard, head: Head, typed: Map<string, Typed>, engine: 
 /// one it was given when no model could answer — a missing model is a graph
 /// that stays at stage «seed» and can be deepened later, never a failed build.
 /// Only an abort throws.
+///
+/// It does NOT write the shard — graphstore is the writer and graphrun the
+/// caller that decides — but it does write ONE file of its own: the reader's
+/// glossary for this book, with what it just learned (see feedTermStore). That
+/// is deliberate and it is the only IO here. The shard is the caller's to
+/// commit or discard; the term store is a store in its own right, and a term
+/// this pass explained is explained whatever the caller then does with the
+/// graph.
 export async function deepen(
   shard: Shard,
   onProgress: (p: GenProgress) => void,
@@ -2111,10 +2309,63 @@ export async function deepen(
   // once it does, it is one of the heaviest things in the graph: the reader who
   // clicks it deserves the same one-line gloss every other heavy node has. Its
   // KIND is not at risk — applyDeep pins the kind of anything the book is `by`.
-  const terms = conceptsOf(shard)
-    .filter((n) => n.kind === "term" || (n.kind === "person" && (n.pages?.[shard.key]?.length ?? 0) > 0))
+  //
+  // A node that already carries a gloss is skipped, and this is where the term
+  // store pays for itself in minutes rather than in quality. A gloss on a shard
+  // at stage «seed» can only have come from one place — the reader's own
+  // glossary, through seedShard's merge — so the node is already typed and
+  // already explained, and asking about it again buys a second opinion nobody
+  // wants at TYPE_CHUNK terms a call. On the reader's 838-page book the seed
+  // holds 124 concepts and their glossary explains 118 of them: eleven typing
+  // calls become one.
+  //
+  // It is bought by the pass that FILLED the glossary's fields in, not by the
+  // file existing. A glossary that has only been mined carries terms and pages
+  // and no definitions, so no node gets a gloss, nothing is skipped, and this
+  // pass costs exactly what it costs today. That is the right way round — the
+  // work is done once, wherever the reader chose to do it.
+  //
+  // «Already explained» is NOT the same question as «already typed», and the
+  // filter asks the second one, because the first one silently threw away the
+  // reader's work. A glossary line carries a definition and a kind in two
+  // different places — the definition is the third field of the .txt the reader
+  // edits by hand, the kind lives only in the sidecar — and the two doors into
+  // the file fill exactly one of them: «Добавить в глоссарий» writes
+  // `{ term, source: "user" }` and no kind at all (App.tsx), and the reader then
+  // types the definition in the Terms tab. Filtering on `!n.gloss` skipped every
+  // one of those nodes, and since the seed's default kind is also «term» and
+  // graphrun never revisits a shard at stage «deep», a term the reader had
+  // defined by hand was pinned to «term» for ever — a person drawn in `muted`
+  // instead of `--chart-2` and missing from the «Люди» filter chip
+  // (GraphView.tsx), which is the one part of this the reader can actually see.
+  // Nothing here could tell the two states apart from the node alone; the store
+  // can, so the store is asked (typedConcepts above).
+  //
+  // The saving above survives intact, because it never came from the gloss: a
+  // store that explained 118 of 124 concepts has typed those same 118 records —
+  // enrichTerms fills kind and definition in one reply and glossarygen writes
+  // both — so the same eleven typing calls still become one. What is bought back
+  // is the handful of records that carry a definition and no kind, which is
+  // precisely the population that came from the reader's own hand rather than
+  // from a pass.
+  //
+  // The two lists are kept apart, and the early return below is on the FIRST
+  // of them. «Nothing to ask» and «nothing to deepen» are different states: a
+  // book whose term store already explained every concept still wants its tags
+  // and its summary, and still has to reach stage «deep» or graphrun will queue
+  // it again on every scan for ever. Only a shard with no concepts at all — a
+  // PDF whose text layer yielded nothing — has nothing for a model to do.
+  const concepts = conceptsOf(shard).filter(
+    (n) => n.kind === "term" || (n.kind === "person" && (n.pages?.[shard.key]?.length ?? 0) > 0),
+  );
+  if (!concepts.length) return shard;
+  // Read after the early return, never before it: a PDF whose text layer
+  // yielded nothing must not pay for a glossary read to be told there is
+  // nothing to ask about.
+  const typedByStore = await typedConcepts(shard.bookPath);
+  const terms = concepts
+    .filter((n) => !n.gloss || !typedByStore.has(conceptId(n.label)))
     .map((n) => n.label);
-  if (!terms.length) return shard;
 
   // The switch is read HERE, at the moment of use, and never cached in a
   // module constant: a reader who turns the Claude pass on in Settings must
@@ -2130,6 +2381,7 @@ export async function deepen(
   if (shard.prov === "article" && claudeDeepen()) {
     const viaClaude = await deepenViaClaude(shard, terms, onProgress, signal);
     if (viaClaude) {
+      await feedTermStore(viaClaude, shard);
       onProgress({ phase: "done", done: 1, total: 1 });
       return viaClaude;
     }
@@ -2147,6 +2399,7 @@ export async function deepen(
   // the provenance classifier that sits in front of it.
   const local = await deepenLocally(shard, terms, onProgress, signal);
   if (!local) return shard;
+  await feedTermStore(local, shard);
   onProgress({ phase: "done", done: 1, total: 1 });
   return local;
 }
@@ -2172,14 +2425,21 @@ async function deepenLocally(
     // Gate again after the long pause. The topics call can take a minute on a
     // cold model, and a llama-server that died meanwhile should fail here
     // rather than once per chunk, twenty chunks in a row.
-    const typed = (await isAuxUp()) ? await typePass(shard, terms, onProgress, signal) : new Map<string, Typed>();
+    // `terms.length` first, so a book whose term store had already typed every
+    // concept does not spend a health probe and a zero-chunk pass to be told
+    // there is nothing to ask. Its deep pass is the topics call and nothing
+    // else, which is exactly right.
+    const typed =
+      terms.length && (await isAuxUp())
+        ? await typePass(shard, terms, onProgress, signal)
+        : new Map<string, Typed>();
     // A pass that learnt NOTHING must not be written at all: returning the
     // shard here — even correctly stamped «seed» — would still cost a second
     // write and a repaint to say exactly what the seed already said. Returning
     // null leaves the seed shard on disk untouched, engine «none», retryable
     // on the next scan. applyDeep decides the stage for everything else.
     if (!typed.size && !head.tags.length && !head.summary) return null;
-    return applyDeep(shard, head, typed, "local");
+    return applyDeep(shard, head, typed, "local", terms.length);
   } finally {
     // Always give the VRAM back — finished, cancelled or failed alike. Two
     // resident models plus page rasters do not fit comfortably in 16 GB, and a

@@ -40,7 +40,7 @@
 import { readFile } from "@tauri-apps/plugin-fs";
 import { getDocument } from "pdfjs-dist";
 import type { PDFDocumentProxy } from "pdfjs-dist";
-import { contentKey, setBookKey } from "./bookid";
+import { bookKey, contentKey, setBookKey } from "./bookid";
 import { canDeepen, deepen, GRAPH_GEN, seedShard } from "./graphgen";
 import type { GenPhase, GenProgress } from "./graphgen";
 import { deleteShard, shardFor, writeShard } from "./graphstore";
@@ -435,6 +435,35 @@ async function build(job: Job, state: RunState): Promise<void> {
       // and let a later scan pick it up once deepening becomes possible.
       if (!(await canDeepen(existing.prov))) return;
       state.info.title = existing.title || state.info.title;
+      // Bind the book's content identity before deepening it, because this is
+      // the one road to a deep pass that never opens the file — and openGraphDoc
+      // is the only place in this module that calls setBookKey.
+      //
+      // That mattered for nothing while the deep pass only produced a shard:
+      // shards are addressed by the key, and this branch already holds the
+      // shard. It matters now that the pass WRITES — graphgen feeds what it
+      // learned back into the reader's glossary for the book — because every
+      // per-book file in this app is addressed through bookid, and with the map
+      // empty translate.ts falls back to a hash of the PATH. The write would
+      // land on a file belonging to no book, and would leave that stray list in
+      // the glossary session cache, which is keyed by path and never
+      // invalidated: the reader opens the book afterwards and their Terms tab
+      // shows the stray list, savedRef and all, and the next blur writes it over
+      // the hand-curated file. A background rescan deepens books the reader has
+      // NOT opened — that is what the queue is for — so this was the common
+      // case, not the exotic one.
+      //
+      // The shard already knows the answer and it costs neither a read nor a
+      // hash to use it: a shard's key IS contentKey() over the bytes
+      // openGraphDoc read, handed to seedShard and stored under that name.
+      //
+      // Only when nothing has bound this path yet. A key computed from the
+      // bytes is evidence; a key remembered from an older shard is a claim
+      // about a file that may have been edited since, and it must never be
+      // allowed to replace the real one — bindBook and openGraphDoc write the
+      // truth, and this line defers to both. graphgen re-checks the same
+      // equality at its write and stays silent when it does not hold.
+      if (bookKey(path) === null) setBookKey(path, existing.key);
       await runDeepen(existing, state, signal);
       return;
     }

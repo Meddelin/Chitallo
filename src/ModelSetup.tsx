@@ -10,7 +10,7 @@ import { fmtGb, fmtMbps, fmtNum, t } from "./i18n";
 // ---- model onboarding + the single status vocabulary (WP-B) -----------------
 //
 // Every surface that talks about the translation model (menu status row,
-// popover, glossary modal, library card) reads the SAME status source and the
+// popover, «Термины» tab, library card) reads the SAME status source and the
 // SAME download store from here, so one state never has three names.
 //
 // Status source: Tauri `translation_status` — "noengine" | "none" |

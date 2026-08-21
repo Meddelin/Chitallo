@@ -14,15 +14,16 @@ import FindBar from "./FindBar";
 import Outline, { resolveDest } from "./Outline";
 import { Palette, ShortcutsOverlay } from "./Palette";
 import type { PaletteCommand } from "./Palette";
-import { GlossaryModal, SelectionBar, TranslatePopover } from "./TranslatePopover";
+import { SelectionBar, TranslatePopover } from "./TranslatePopover";
 import type { Anchor } from "./TranslatePopover";
 import { ContextMenu } from "./ContextMenu";
 import type { CtxItem } from "./ContextMenu";
 import { AskSidebar } from "./AskSidebar";
-import { useAskWidth } from "./askwidth";
+import { askWMax, useAskWidth } from "./askwidth";
 import type { AskSeed } from "./AskSidebar";
 import { Panel } from "./Panel";
 import type { PanelTab } from "./Panel";
+import { GlossaryPanel } from "./GlossaryPanel";
 import { TranslatePanel } from "./TranslatePanel";
 import type { TrExportError, TrState } from "./TranslatePanel";
 import { FIG_CONTAIN, buildFrags, growParagraph, interArea, medianLineH, paraText } from "./paragraphs";
@@ -31,10 +32,12 @@ import type { Rect } from "./crops";
 import { CROP_DPR, CROP_K, blankProbe, blitCrop, cropCanvas, cropSrc, cropViewport, cropWindow, inkProbe, isBlankCrop, releaseCanvas, snapToInk } from "./crops";
 import type { CropWindow } from "./crops";
 import { splitCitations } from "./cite";
+import { OUT_MATCH, outDice, outNorm } from "./textsim";
 import * as booktranslate from "./booktranslate";
 import type { TrParagraph } from "./booktranslate";
-import { hydrateGlossary, loadGlossaryText, parseGlossary, saveGlossaryText } from "./translate";
+import { hydrateGlossary, loadGlossaryText } from "./translate";
 import * as glossarygen from "./glossarygen";
+import { parseGlossaryLine, parseGlossaryText, termKey } from "./glossary";
 import { ModelSetupModal, fetchModelStatus, restartModel, statusUp, useDownload } from "./ModelSetup";
 import { AboutModal } from "./About";
 import { SettingsModal, TR_FONT_DEFAULT, TR_FONT_MAX, TR_FONT_MIN } from "./Settings";
@@ -46,7 +49,7 @@ import { PanelRightIcon } from "lucide-react";
 import "./App.css";
 import { baseName, host, isMac, joinPath, macKeys } from "./host";
 import { copyToClipboard } from "./clipboard";
-import { fmtNum, t, useLang } from "./i18n";
+import { fmtNum, getLang, t, useLang } from "./i18n";
 import { Onboarding, needsOnboarding, resetOnboarding } from "./Onboarding";
 
 pdfjs.GlobalWorkerOptions.workerSrc = workerUrl;
@@ -54,6 +57,17 @@ pdfjs.GlobalWorkerOptions.workerSrc = workerUrl;
 /// Shortcut hints are written the Windows/Linux way and rewritten to the
 /// macOS glyphs here — the same rule i18n's `t()` applies to catalogue strings.
 const K = (s: string) => (isMac() ? macKeys(s) : s);
+
+// (WP-N) Минимум ширины панели, который просит её ЗАГОЛОВОК. С четвёртой
+// вкладкой строка имён стала самым широким, что в панели есть: голый ряд
+// «Оглавление · Спросить · Термины · Перевод» просит 361 px, а с ярлыками у
+// «Спросить» и «Перевода» — 409 px (арифметика и замеры Golos Text — в шапке
+// Panel.tsx). ASK_W_MIN = 320 из askwidth.ts на это не хватает и хватить не
+// может: на четыре подписи там остаётся 271 px при нулевых отступах. Панель
+// обязана быть шире собственной шапки, поэтому минимум поднят здесь — там, где
+// App отдаёт ширину панели, а не в общем модуле ширины: карточка графа тянется
+// той же ручкой, но шапки из четырёх вкладок у неё нет.
+const PANEL_W_MIN = 412;
 
 const DEFAULT_SCALE = 1.25;
 const PAGE_GAP = 16;
@@ -398,7 +412,12 @@ function buildTrPage(
 ) {
   const root = document.createElement("div");
   root.className = "trPage";
-  root.lang = "ru"; // enables hyphens:auto for the justified Russian text
+  // Язык переведённой страницы — язык ИНТЕРФЕЙСА, а не «ru»: на него и
+  // переводят (i18n.targetLanguage → translate.ts), а от этого атрибута
+  // зависит hyphens:auto — по русским правилам переноса английский текст
+  // рвётся не там, где надо. Захардкоженное "ru" было незаметно ровно до тех
+  // пор, пока читатель не переключил интерфейс на английский.
+  root.lang = getLang();
   const crops: Crop[] = [];
   const maxW = baseW * scale * (1 - 2 * PAGE_PAD_X); // text column width — crop display cap
 
@@ -549,11 +568,12 @@ function drawCrops(off: HTMLCanvasElement, win: CropWindow, crops: Crop[], flowe
 // original heading text and its translation, so the row can be matched by TEXT
 // and relabelled.
 //
-// Matching is a Sørensen–Dice coefficient over character bigrams of the
-// normalized strings — robust to the page number the engine sometimes welds
-// onto a heading («1.4 Content Organization 5»), to hyphenation, and to
-// punctuation the outline and the page disagree about.
-const OUT_MATCH = 0.75;
+// A row is matched to a paragraph by Sørensen–Dice similarity over character
+// bigrams. That primitive, its normaliser and the OUT_MATCH threshold this book
+// calibrated live in textsim.ts — the glossary's near-duplicate folding needs
+// exactly the same script-agnostic comparison, and the calibration travelled
+// with the number.
+
 // Chapter openers set their title in display type that wraps, and the clusterer
 // keeps each line as its own paragraph, so «2 Neural Information Retrieval»
 // lives on the page as «Neural Information» + «Retrieval». Runs of consecutive
@@ -561,40 +581,6 @@ const OUT_MATCH = 0.75;
 const OUT_RUN = 3; // paragraphs per run, at most
 const OUT_HEAD_RATIO = 1.15; // fh/bodyFh over which a paragraph may start a run
 const OUT_FH_TOL = 0.06; // same-size tolerance inside a run
-
-// Calibrated on the user's book (838 pages, 548 outline rows, 4 514 stored
-// translations): 527 rows relabel (96.2%), 21 fall back. The fallbacks are
-// honest ones — 18 run-in headings that are not standalone paragraphs at all
-// («Distinctness», «Step 4: Ranking» — the bold lead-in of a body paragraph),
-// «Bibliography» which lands on a refPage that is deliberately left untranslated,
-// and one title the clusterer truncated. The threshold sits in a real gap: the
-// best wrong match measured 0.718 («What is a knowledge graph» pulled toward the
-// chapter title «Knowledge Graphs» on the same page), the weakest right one 0.800
-// («III VERTICALS» → «ВЕРТИКАЛЫ»).
-const outNorm = (s: string) =>
-  s
-    .toLowerCase()
-    .replace(/[­‐-―−]/g, "-")
-    .replace(/[^\p{L}\p{N}]+/gu, " ")
-    .trim();
-
-function outDice(a: string, b: string): number {
-  if (!a || !b) return 0;
-  if (a === b) return 1;
-  if (a.length < 2 || b.length < 2) return 0;
-  const A = new Map<string, number>();
-  for (let i = 0; i + 1 < a.length; i++) A.set(a.slice(i, i + 2), (A.get(a.slice(i, i + 2)) ?? 0) + 1);
-  let inter = 0;
-  for (let i = 0; i + 1 < b.length; i++) {
-    const g = b.slice(i, i + 2);
-    const v = A.get(g);
-    if (v) {
-      inter++;
-      A.set(g, v - 1);
-    }
-  }
-  return (2 * inter) / (a.length - 1 + b.length - 1);
-}
 
 /** Translation of the heading `title` names on `paras`, or null when unsure. */
 function matchHeadingTr(paras: TrParagraph[] | undefined, bodyFh: number, title: string): string | null {
@@ -974,18 +960,29 @@ export default function App() {
   const [pop, setPop] = useState<TrRequest | null>(null);
   // Chitallo's right-click menu (см. ContextMenu.tsx): items are built per event
   const [ctxMenu, setCtxMenu] = useState<{ at: Anchor; items: CtxItem[]; keyboard?: boolean } | null>(null);
-  const [glossOpen, setGlossOpen] = useState(false);
-  // ---- правая панель: «Оглавление · Спросить · Перевод» (WP-N) ----
+  // ---- термины книги (вкладка «Термины») ----
+  // Записей в файле: число справа в строке «Открыть глоссарий» и подсказка
+  // вкладки. Считает их сама вкладка — она и так разбирает текст поля на
+  // каждое изменение, а у App нет ни этого текста, ни момента, когда прогон
+  // дописал файл (AskSidebar сообщает число сообщений ровно так же).
+  const [glossaryTerms, setGlossaryTerms] = useState(0);
+  // ---- правая панель: «Оглавление · Спросить · Термины · Перевод» (WP-N) ----
   // open state is per SESSION (sessionStorage), not per book; the thread
   // itself is per book (AskSidebar persists it in localStorage). Ключ прежний —
   // сайдбар «Спросить» стал одной из вкладок, а не отдельной поверхностью.
   const [panelOpen, setPanelOpen] = useState(() => sessionStorage.getItem("pdfer:ask:open") === "1");
   const [panelTab, setPanelTab] = useState<PanelTab>(() => {
     const s = sessionStorage.getItem("pdfer:panel:tab");
-    return s === "outline" || s === "translate" ? s : "ask";
+    return s === "outline" || s === "glossary" || s === "translate" ? s : "ask";
   });
   // width is a workspace preference (pdfer:askw) — the panel owns the drag
   const [askW, setAskW] = useAskWidth();
+  // Ширина, которую панель получает и которой её тянут. Минимум поднят до
+  // PANEL_W_MIN, но НЕ выше askWMax(): книге всегда остаётся её READ_MIN, и на
+  // узком окне панель честно опускается ниже — тогда строка вкладок
+  // переносится на вторую строку (Panel.tsx), а не обрезается.
+  const panelW = Math.min(Math.max(askW, PANEL_W_MIN), askWMax());
+  const setPanelW = useCallback((w: number) => setAskW(Math.max(w, PANEL_W_MIN)), [setAskW]);
   const [askSeed, setAskSeed] = useState<AskSeed | null>(null);
   const askSeedIdRef = useRef(0);
   // сообщений в открытой беседе — число на ярлыке вкладки «Спросить»
@@ -1081,8 +1078,6 @@ export default function App() {
   ctxRef.current = ctxMenu;
   const popRef = useRef(pop);
   popRef.current = pop;
-  const glossRef = useRef(glossOpen);
-  glossRef.current = glossOpen;
   const findRef = useRef(findOpen);
   findRef.current = findOpen;
   const paletteRef = useRef(paletteOpen);
@@ -1642,10 +1637,9 @@ export default function App() {
     if (s !== "starting" && !statusUp(s)) setSetupOpen(true);
   }, []);
 
-  // «Перевести заново» (glossary modal): drop the store, restart from page 1
+  // «Перевести заново» (вкладка «Перевод»): drop the store, restart from page 1
   const retranslate = useCallback(async () => {
     if (!path) return;
-    setGlossOpen(false);
     await booktranslate.stopRun(path); // let a running pipeline settle before deleting
     await booktranslate.deleteBookTranslation(path).catch(() => {});
     if (pathRef.current !== path) return;
@@ -1961,7 +1955,6 @@ export default function App() {
     setBaseSize(null);
     setSelBar(null);
     setPop(null);
-    setGlossOpen(false);
     setZoomOpen(false);
     setFitMode(null);
     setFindOpen(false);
@@ -2141,23 +2134,63 @@ export default function App() {
     const onResize = () => { clearTimeout(t); t = window.setTimeout(measure, 150); };
     window.addEventListener("resize", onResize);
     return () => { clearTimeout(t); window.removeEventListener("resize", onResize); };
-  }, [doc, panelOpen, askW]);
+  }, [doc, panelOpen, panelW]);
 
-  // «Добавить в глоссарий»: the term lands in the book's list with the «?»
-  // placeholder the auto-builder uses — visible in the modal, never fed into a
-  // prompt until a translation is typed (parseGlossary) — and the modal opens
-  // on it. Re-adding an existing term is a no-op, it just reopens the list.
-  const addToGlossary = useCallback((term: string) => {
-    const p = pathRef.current;
-    const t = term.replace(/\s+/g, " ").trim();
-    if (!p || !t) return;
-    const cur = loadGlossaryText(p);
-    const dup = cur
-      .split(/\r?\n/)
-      .some((l) => l.split(/=|->|→|—/)[0].trim().toLowerCase() === t.toLowerCase());
-    if (!dup) saveGlossaryText(p, `${cur.trimEnd() ? `${cur.trimEnd()}\n` : ""}${t} = ?`);
-    setGlossOpen(true);
-  }, []);
+  // «Добавить в глоссарий»: термин ложится в список книги ГОЛОЙ СТРОКОЙ, и
+  // вкладка «Термины» открывается на нём.
+  //
+  // Раньше сюда писалось `${term} = ?`: строка без разделителя считалась
+  // мусором, поэтому термину придумывали пустой перевод, а этот же «?» потом
+  // приходилось отдельно не пускать в промпт. Теперь голый термин — полная и
+  // законная запись (glossary.ts), и заглушка не нужна вовсе.
+  //
+  // Проверка на повтор идёт через ОБЩИЙ разборщик. Здесь жила третья, ни к
+  // чему не привязанная запись грамматики (split по /=|->|→|—/), и она
+  // расходилась с обоими настоящими: «std::vector» она резала не там, а «C++»
+  // и «C#» считала разными терминами — termKey сворачивает их в один ключ, и
+  // именно этим ключом запись живёт в сайдкаре.
+  //
+  // Через разборщик идёт И ВХОДЯЩАЯ сторона, и это не педантизм. Строка
+  // уходит в файл, а из файла её читает тот же разборщик — и режет по первому
+  // разделителю, включая унаследованное «—», которое в русском тексте просто
+  // тире. Выделение «Инвертированный индекс — структура данных» ложилось в
+  // файл, читалось обратно как термин «Инвертированный индекс», и ключ,
+  // посчитанный от ВСЕЙ фразы, с ним не совпадал: проверка на повтор не
+  // срабатывала никогда (одинаковая строка дописывалась на каждое добавление),
+  // а запись сайдкара уходила на ключ, которого в файле нет, — то есть
+  // source: "user" не получался вовсе. Поэтому выделение СНАЧАЛА разбирается,
+  // и дальше живёт разобранная запись: она же идёт в файл, она же даёт ключ.
+  // Из выделенного при этом не теряется ничего — хвост фразы становится полем
+  // записи, видимым и правимым во вкладке. Строка, в которой разборщик термина
+  // не видит вовсе (выделили «###» или одну пунктуацию), не пишется: вкладка
+  // просто откроется.
+  //
+  // Пишем через saveGlossary, а не сырым saveGlossaryText: так у строки
+  // появляется source: "user", а это ровно то, что запрещает третьему проходу
+  // когда-либо свести её в чужой синоним. О самой записи вкладка узнаёт от
+  // хранилища (translate.subscribeGlossary), а не от App: пишущих в файл
+  // больше двух (ещё глубокий проход графа), и отдельный канал «App сказал
+  // панели перечитать» учит думать, что их двое.
+  const addToGlossary = useCallback(
+    (term: string) => {
+      const p = pathRef.current;
+      const flat = term.replace(/\s+/g, " ").trim();
+      if (!p) return;
+      const rec = flat ? parseGlossaryLine(flat) : null;
+      if (rec) {
+        const key = termKey(rec.term);
+        const dup = parseGlossaryText(loadGlossaryText(p)).some((r) => termKey(r.term) === key);
+        // Повторное добавление — не действие, а просто открытие списка: писать
+        // заново значило бы переписать сайдкар и переклеить чужой source.
+        if (!dup)
+          void glossarygen
+            .saveGlossary(p, [{ ...rec, source: "user" }])
+            .catch((e) => console.error("glossary add failed", e));
+      }
+      openPanel("glossary");
+    },
+    [openPanel],
+  );
 
   // копирование молчит в обе стороны (§4.5, Voice): успех обратимого действия
   // не сообщается, а отказ буфера читателю нечем исправить
@@ -2244,9 +2277,10 @@ export default function App() {
       if (bar) {
         if (bar.orig) items.push({ id: "orig", label: t("tb.original"), hint: "O", run: () => peekOriginal() });
         // «Translate» and «Add to the glossary» are missing over a translation
-        // on purpose: the selected text is already in the reader's language,
-        // and a glossary entry is source=target (the same honest choice the
-        // selection bar makes)
+        // on purpose: the selected text is already in the reader's language, so
+        // the term would be entered in the wrong one — the glossary's records
+        // are keyed on the surface form the BOOK uses (the same honest choice
+        // the selection bar makes)
         else items.push({ id: "tr", label: t("sel.translate"), hint: "⏎", run: translateSelection });
         items.push({ id: "ask", label: t("tb.ask"), run: askFromSelection });
       }
@@ -2254,8 +2288,8 @@ export default function App() {
         items.push({ id: "copy", label: t("ui.copy"), hint: "Ctrl+C", run: () => copyText(selText) });
         if (inReader && path)
           items.push({ id: "find", label: t("cmd.find"), hint: "Ctrl+F", run: () => findSeeded(selText) });
-        // a term, not a paragraph: the glossary is word pairs, and half a page
-        // of prose is meaningless in it
+        // a term, not a paragraph: the glossary is a list of the book's terms,
+        // and half a page of prose is meaningless in it
         if (bar && !bar.orig && selText.length <= 60 && selText.split(" ").length <= 6)
           items.push({ id: "gloss", label: t("ctx.addToGlossary"), run: () => addToGlossary(selText) });
       }
@@ -2422,7 +2456,7 @@ export default function App() {
       }
       else if (e.key === "Escape") {
         // Esc peels UI layers before closing the book:
-        // контекстное меню → палитра → шорткаты → «О Chitallo» → настройки → масштаб → модель → глоссарий → перевод → поиск → панель (только при фокусе в ней) → выделение
+        // контекстное меню → палитра → шорткаты → «О Chitallo» → настройки → масштаб → модель → перевод → поиск → панель (только при фокусе в ней) → выделение
         // (Esc typed INSIDE the find/page/palette inputs is handled there and never reaches this chain)
         // Контекстное меню снимает себя само (capture на document в
         // ContextMenu.tsx) — иначе Esc из поля поиска до сюда не дошёл бы;
@@ -2435,7 +2469,6 @@ export default function App() {
         else if (settingsRef.current) setSettingsOpen(false);
         else if (zoomOpenRef.current) setZoomOpen(false);
         else if (setupRef.current) setSetupOpen(false);
-        else if (glossRef.current) setGlossOpen(false);
         else if (popRef.current) setPop(null);
         else if (findRef.current) setFindOpen(false);
         else if (panelOpenRef.current && ae?.closest("[data-asksb]")) {
@@ -2523,14 +2556,6 @@ export default function App() {
         : trInfo.done < trInfo.total
           ? "paused"
           : "done";
-  // терминов в глоссарии книги — число справа в строке «Открыть глоссарий».
-  // Правят его в модалке, поэтому пересчёт привязан к её закрытию и к книге.
-  const glossaryTerms = useMemo(
-    () => (path ? parseGlossary(loadGlossaryText(path)).length : 0),
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-    [path, glossOpen, trVersion],
-  );
-
   // Ctrl+K commands — every action already in the UI, one name each, with its
   // key as the hint (the palette doubles as the cheat-sheet). Built only while
   // the palette is open; a ~20-element array per render is free.
@@ -2612,7 +2637,7 @@ export default function App() {
           },
         );
       paletteCommands.push(
-        { id: "gloss", label: t("tr.glossary"), keywords: "термины glossary terms", run: () => setGlossOpen(true) },
+        { id: "gloss", label: t("tr.glossary"), keywords: "термины glossary terms", run: () => openPanel("glossary") },
         { id: "ask", label: t("tb.ask"), hint: K("Ctrl+J"), keywords: "вопрос чат claude ask chat", run: toggleAsk },
         { id: "zin", label: t("cmd.zoomIn"), hint: K("Ctrl +"), keywords: "масштаб zoom", run: () => zoomTo(scaleRef.current + 0.125) },
         { id: "zout", label: t("cmd.zoomOut"), hint: K("Ctrl −"), keywords: "масштаб zoom", run: () => zoomTo(scaleRef.current - 0.125) },
@@ -2655,7 +2680,7 @@ export default function App() {
         <div
           className="toolbar fixed top-3 -translate-x-1/2 z-10 flex items-center gap-1 rounded-full bg-white/85 dark:bg-neutral-800/85 backdrop-blur px-3 py-1.5 shadow-lg text-sm text-neutral-700 dark:text-neutral-200 select-none transition-[left] duration-150"
           // stay centered over the READING area: shift by half the panel width
-          style={{ left: panelOpen ? `calc(50% - ${askW / 2}px)` : "50%" }}
+          style={{ left: panelOpen ? `calc(50% - ${panelW / 2}px)` : "50%" }}
         >
           {/* run progress — 2px band along the pill's bottom edge; the pill's
               composition stays constant so it never resizes mid-run (WP-H).
@@ -2810,7 +2835,7 @@ export default function App() {
           curPage={curPage}
           focusNonce={findNonce}
           seed={findSeed}
-          leftShift={panelOpen ? askW / 2 : 0}
+          leftShift={panelOpen ? panelW / 2 : 0}
           onClose={() => setFindOpen(false)}
         />
       )}
@@ -2865,9 +2890,10 @@ export default function App() {
             tab={panelTab}
             onTab={selectTab}
             onClose={() => setPanel(false)}
-            width={askW}
-            onWidth={setAskW}
+            width={panelW}
+            onWidth={setPanelW}
             askCount={askCount}
+            glossCount={glossaryTerms}
             trPct={trInfo ? bandPct : null}
             trAttention={trState === "paused" || anyStall}
             outline={
@@ -2893,6 +2919,13 @@ export default function App() {
                 onCount={setAskCount}
               />
             }
+            glossary={
+              <GlossaryPanel
+                bookPath={path}
+                doc={doc}
+                onCount={setGlossaryTerms}
+              />
+            }
             translate={
               <TranslatePanel
                 state={trState}
@@ -2916,7 +2949,7 @@ export default function App() {
                 onUpdate={() => void startTr(true)}
                 onRetranslate={() => void retranslate()}
                 onCheckModel={checkModel}
-                onGlossary={() => setGlossOpen(true)}
+                onGlossary={() => openPanel("glossary")}
                 onExportPdf={() => void exportPdf()}
                 onExportHtml={() => void exportTr()}
                 onModelSetup={() => setSetupOpen(true)}
@@ -2940,7 +2973,7 @@ export default function App() {
           // selection inside them — Chromium fires no selectionchange for that,
           // so without this key the bar would hang over dead nodes with a stale
           // payload while the book translates under the reader.
-          layoutKey={`${scale}|${nColsEff}|${viewMode}|${trFont}|${panelOpen ? askW : 0}|${trVersion}`}
+          layoutKey={`${scale}|${nColsEff}|${viewMode}|${trFont}|${panelOpen ? panelW : 0}|${trVersion}`}
           onGone={() => setSelBar(null)}
           // tr-selections swap «Перевести» for «Оригинал» — translating the
           // translation back is nonsense (choice documented in SelectionBar)
@@ -2964,18 +2997,6 @@ export default function App() {
             setPop(null);
             setSetupOpen(true);
           }}
-        />
-      )}
-      {glossOpen && path && (
-        <GlossaryModal
-          bookPath={path}
-          doc={doc}
-          onClose={() => setGlossOpen(false)}
-          onSetup={() => {
-            setGlossOpen(false);
-            setSetupOpen(true);
-          }}
-          onRetranslate={trInfo !== null ? retranslate : undefined}
         />
       )}
       {setup && <Onboarding onDone={() => setSetup(false)} />}
@@ -3028,8 +3049,8 @@ export default function App() {
           // is capped against that same reading area, not the viewport: the panel
           // is draggable, and a viewport-wide cap let a long message run under it.
           style={{
-            left: doc && panelOpen ? `calc(50% - ${askW / 2}px)` : "50%",
-            maxWidth: `calc(min(40rem, 100vw - ${doc && panelOpen ? askW : 0}px - 2rem))`,
+            left: doc && panelOpen ? `calc(50% - ${panelW / 2}px)` : "50%",
+            maxWidth: `calc(min(40rem, 100vw - ${doc && panelOpen ? panelW : 0}px - 2rem))`,
           }}
         >
           {notice.msg}

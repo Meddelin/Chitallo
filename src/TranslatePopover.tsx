@@ -1,25 +1,25 @@
+// Перевод выделенного: мини-панель у конца выделения и попап с ответом.
+//
+// Здесь же жила GlossaryModal — глоссарий открывался из перевода, потому что
+// был его частью. Он ею быть перестал: тело модалки переехало в
+// GlossaryPanel.tsx, во вкладку «Термины», и этот файл снова про одно —
+// перевести кусок текста, на который читатель показал. Глоссарий он по-прежнему
+// ЧИТАЕТ (parseGlossary ниже кладёт пары в промпт) — как один из потребителей
+// хранилища, а не как его хозяин.
+
 import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
-import type { PDFDocumentProxy } from "pdfjs-dist";
-import { invoke } from "@tauri-apps/api/core";
-import { extractTerms, mergeGlossary, translateTerms } from "./glossarygen";
-import { isAuxUp, loadGlossaryText, parseGlossary, saveGlossaryText, translateStream } from "./translate";
+import { loadGlossaryText, parseGlossary, translateStream } from "./translate";
 import {
   Spinner,
-  cancelDownload,
   dlBusy,
-  dlErrorFix,
-  dlPct,
   dlProgressLine,
   fetchModelStatus,
-  modelFileReady,
   restartModel,
   sizeLabel,
-  startDownload,
   statusUp,
   useDownload,
 } from "./ModelSetup";
 import { copyToClipboard } from "./clipboard";
-import { baseName } from "./host";
 import { fmtNum, t } from "./i18n";
 import { IconClose } from "./icons";
 
@@ -37,6 +37,24 @@ const LINK_HOVER = "transition-colors hover:text-neutral-800 dark:hover:text-neu
 const ALT_HINT_KEY = "pdfer:hint:altclick";
 
 const PAD = 8;
+
+// Один таймер с отменой на весь файл: попапу он нужен, чтобы переспросить
+// состояние модели, пока та поднимается. Свой в каждом модуле — так в этом
+// проекте живут все четыре (booktranslate.ts:656, glossarygen.ts:409,
+// graphgen.ts:550, здесь); экспортировать его отсюда значило бы сделать
+// попап зависимостью тех, кто с ним никак не связан.
+const sleep = (ms: number, signal?: AbortSignal) =>
+  new Promise<void>((res, rej) => {
+    const onAbort = () => {
+      clearTimeout(timer);
+      rej(new DOMException("aborted", "AbortError"));
+    };
+    const timer = setTimeout(() => {
+      signal?.removeEventListener("abort", onAbort);
+      res();
+    }, ms);
+    signal?.addEventListener("abort", onAbort);
+  });
 
 // The anchor rule, in one place: the bar hangs off the END of the selection —
 // «Перевести»/«Оригинал» belong to the text the user just finished dragging
@@ -433,364 +451,6 @@ export function TranslatePopover({
           {showAltHint && <div className={status ? "mt-0.5" : ""}>{t("pop.altHint")}</div>}
         </div>
       )}
-    </div>
-  );
-}
-
-// ---- glossary modal ---------------------------------------------------------
-
-type GenState =
-  | { phase: "extract"; done: number; total: number }
-  | { phase: "modelwait" }
-  | { phase: "auxstart" }
-  | { phase: "translate"; done: number; total: number }
-  | { phase: "done"; added: number; skipped: number; auxUsed: boolean }
-  // action: the error is fixable right here — «Скачать модель» / «Перезапустить»
-  | { phase: "error"; msg: string; action?: "setup" | "restart" };
-
-const sleep = (ms: number, signal?: AbortSignal) =>
-  new Promise<void>((res, rej) => {
-    const onAbort = () => {
-      clearTimeout(t);
-      rej(new DOMException("aborted", "AbortError"));
-    };
-    const t = setTimeout(() => {
-      signal?.removeEventListener("abort", onAbort);
-      res();
-    }, ms);
-    signal?.addEventListener("abort", onAbort);
-  });
-
-// Bring the on-demand terminologist model (Qwen3.5-4B on 11545) up for the
-// glossary run. Resolves true when the aux server answers; false → the caller
-// falls back to the HY-MT ladder. Outside Tauri the invoke throws — an HTTP
-// health probe of the same server stands in (same pattern as the status row).
-// Model load takes ~10-30s; give up after 90s so the run never hangs.
-async function ensureAux(signal: AbortSignal): Promise<boolean> {
-  let s: string;
-  try {
-    s = await invoke<string>("aux_model_start");
-  } catch {
-    return isAuxUp();
-  }
-  const deadline = Date.now() + 90_000;
-  while (Date.now() < deadline) {
-    if (s === "up" || s === "external") return true;
-    if (s === "dead" || s === "none") return false;
-    await sleep(1500, signal); // "starting"
-    try {
-      s = await invoke<string>("aux_model_status");
-    } catch {
-      return isAuxUp();
-    }
-  }
-  return false;
-}
-
-// glossary modal hierarchy (WP-J): ONE primary action — the same filled-button
-// idiom as ModelSetup's PRIMARY_BTN, compact; every other control is a quiet
-// link, and «Перевести заново» is a quiet secondary so it can never be read
-// as the modal's main verb.
-const GEN_BTN =
-  "inline-flex items-center gap-2 rounded-lg bg-neutral-900 px-3 py-1.5 text-[13px] font-medium text-white dark:bg-neutral-100 dark:text-neutral-900";
-const QUIET_LINK = "transition-colors hover:text-neutral-700 dark:hover:text-neutral-200 underline underline-offset-2";
-// the app-wide destructive-confirm idiom (WP-Q, #11/#12): consequence text +
-// red button naming the action + «Отмена» — same classes as App.tsx
-// («Перевести заново») and Settings.tsx (model/store deletes)
-const RED_BTN = "-mx-1 px-1 rounded-md text-red-600 dark:text-red-400 transition-colors hover:bg-red-500/10";
-// (WP-N) буква в букву PLAIN_BTN из Settings.tsx и AskSidebar.tsx: одна и та
-// же тихая кнопка в трёх файлах не имеет права наводиться по-разному
-const PLAIN_BTN =
-  "-mx-1 px-1 rounded-md transition-colors hover:bg-neutral-900/5 dark:hover:bg-neutral-100/10";
-
-export function GlossaryModal({
-  bookPath,
-  doc,
-  onClose,
-  onSetup,
-  onRetranslate,
-}: {
-  bookPath: string;
-  // the open book — «Собрать глоссарий» mines terms from all its pages
-  doc: PDFDocumentProxy | null;
-  onClose: () => void;
-  // opens the model setup flow (license + download) — for the «нет модели» error
-  onSetup?: () => void;
-  // present only when a stored whole-book translation exists: deletes it and
-  // restarts the pipeline with the current glossary
-  onRetranslate?: () => void;
-}) {
-  const [text, setText] = useState(() => loadGlossaryText(bookPath));
-  const textRef = useRef(text);
-  textRef.current = text;
-  const [gen, setGen] = useState<GenState | null>(null);
-  // inline confirm for «Собрать заново» (a rebuild replaces the whole list)
-  const [confirmRebuild, setConfirmRebuild] = useState(false);
-  const genCtrl = useRef<AbortController | null>(null);
-  const closedRef = useRef(false);
-  // optional terminologist model (Qwen): offered here, downloaded on demand
-  const auxDl = useDownload("aux");
-  const [auxReady, setAuxReady] = useState<boolean | null>(null);
-  useEffect(() => {
-    modelFileReady("aux").then(setAuxReady);
-  }, []);
-  const showAuxOffer = !!doc && auxReady === false && auxDl.status !== "done";
-
-  // autosave on close/unmount; a running generation is aborted, its partial
-  // result is merged into storage by runGen's tail (closedRef branch).
-  // closedRef is re-armed in the effect BODY: StrictMode's dev double-mount
-  // runs this cleanup once on a still-open modal, and the ref survives the
-  // remount — without the reset every later runGen would take the "modal
-  // closed" branch and never show its result.
-  useEffect(() => {
-    closedRef.current = false;
-    return () => {
-      closedRef.current = true;
-      genCtrl.current?.abort();
-      saveGlossaryText(bookPath, textRef.current);
-    };
-  }, [bookPath]);
-
-  // «Собрать глоссарий»: statistical term extraction over the whole book, then
-  // the local model translates only the term list (with sentence context).
-  // MERGE semantics — every existing line survives (broken "term = ?" artifacts
-  // excepted), only new terms appended — so re-clicks are idempotent and cancel
-  // keeps everything translated so far. «Собрать заново» reuses the same run
-  // with fresh=true: the merge base is empty, so the RESULT replaces the list —
-  // the textarea itself is never cleared up front, and an early failure (no
-  // model, no terms) costs the user nothing.
-  const runGen = useCallback(async (fresh = false) => {
-    if (!doc || genCtrl.current) return;
-    const ctrl = new AbortController();
-    genCtrl.current = ctrl;
-    const devCap = import.meta.env.DEV
-      ? Number((window as unknown as { __pdferGlossCap?: unknown }).__pdferGlossCap)
-      : NaN;
-    // model gate — the shared vocabulary (#5/#6/#8): "starting" is waited out,
-    // none/dead surface an action instead of a dead-end message. Checked BEFORE
-    // the minutes-long extraction (WP-J: no model must fail in a second, not
-    // after the mining) and re-checked after it — the model can die meanwhile.
-    const modelGate = async (): Promise<boolean> => {
-      let ms = await fetchModelStatus();
-      while (ms === "starting") {
-        setGen({ phase: "modelwait" });
-        await sleep(2000, ctrl.signal);
-        ms = await fetchModelStatus();
-      }
-      if (statusUp(ms)) return true;
-      setGen(
-        ms === "dead"
-          ? { phase: "error", msg: t("model.dead"), action: "restart" }
-          : { phase: "error", msg: t("model.neededShort", { size: sizeLabel("main") }), action: "setup" },
-      );
-      return false;
-    };
-    try {
-      if (!(await modelGate())) return;
-      setGen({ phase: "extract", done: 0, total: doc.numPages });
-      const terms = await extractTerms(doc, {
-        cap: Number.isFinite(devCap) && devCap > 0 ? devCap : undefined,
-        signal: ctrl.signal,
-        onProgress: (done, total) => setGen({ phase: "extract", done, total }),
-      });
-      if (!terms.length) return setGen({ phase: "error", msg: t("gl.noTerms") });
-      if (!(await modelGate())) return;
-      // terminologist model: started on demand for this run, stopped in finally
-      setGen({ phase: "auxstart" });
-      const useAux = await ensureAux(ctrl.signal);
-      setGen({ phase: "translate", done: 0, total: terms.length });
-      const { pairs, skipped } = await translateTerms(terms, {
-        signal: ctrl.signal,
-        useAux,
-        onProgress: (done, total) => setGen({ phase: "translate", done, total }),
-      });
-      // fresh (confirmed rebuild): empty base — the result replaces the list
-      const base = fresh ? "" : closedRef.current ? loadGlossaryText(bookPath) : textRef.current;
-      const { text: merged, added } = mergeGlossary(base, pairs);
-      if (closedRef.current) {
-        saveGlossaryText(bookPath, merged); // modal closed mid-run — don't lose the work
-      } else {
-        setText(merged);
-        setGen({ phase: "done", added, skipped, auxUsed: useAux });
-      }
-    } catch {
-      if (!ctrl.signal.aborted) setGen({ phase: "error", msg: t("gl.failed") });
-      else if (!closedRef.current) setGen(null); // cancelled before the translate phase
-    } finally {
-      genCtrl.current = null;
-      // always free the aux model's VRAM — done, cancelled or failed alike
-      // (no-op outside Tauri or when nothing was started; externals untouched)
-      invoke("aux_model_stop").catch(() => {});
-    }
-  }, [doc, bookPath]);
-
-  return (
-    <div
-      className="modal-backdrop fixed inset-0 z-40 flex items-center justify-center bg-black/30"
-      onMouseDown={(e) => {
-        if (e.target === e.currentTarget) onClose();
-      }}
-    >
-      <div className="modal-panel rounded-xl bg-white dark:bg-neutral-800 shadow-2xl p-4 w-[min(30rem,90vw)] text-sm text-neutral-800 dark:text-neutral-100">
-        {/* 14px medium title: the modal has a name; the filename is context */}
-        <div className="flex items-center gap-2 mb-2.5 select-none">
-          <span className="font-medium">{t("gl.title")}</span>
-          <span className="min-w-0 flex-1 truncate text-xs text-neutral-400 dark:text-neutral-500">
-            {baseName(bookPath)}
-          </span>
-          <button
-            className="px-0.5 text-neutral-500 dark:text-neutral-400 transition-colors hover:text-neutral-800 dark:hover:text-neutral-100"
-            onClick={onClose}
-            title={t("ui.close")}
-          >
-            <IconClose />
-          </button>
-        </div>
-        <textarea
-          autoFocus
-          // (WP-N) Поле — не кнопка: акцентного кольца на нём быть не должно.
-          // Синий в системе один и означает выбранное; каретка уже говорит, где
-          // курсор, а рамка тихо темнеет — так же, как в поиске библиотеки и
-          // графа, единственных других коробчатых полях приложения.
-          className="w-full h-64 resize-y rounded-lg border border-neutral-200 bg-neutral-100 p-2.5 font-mono text-[13px] leading-relaxed outline-none transition-colors focus:border-neutral-300 dark:border-transparent dark:bg-neutral-900 dark:focus:border-neutral-600"
-          placeholder={t("gl.placeholder")}
-          value={text}
-          onChange={(e) => setText(e.target.value)}
-        />
-        {(doc || onRetranslate) && (
-          <div className="mt-2.5 flex flex-wrap items-center gap-x-2.5 gap-y-1.5 text-xs text-neutral-500 dark:text-neutral-400 select-none">
-            {doc &&
-              (gen === null || gen.phase === "done" || gen.phase === "error" ? (
-                confirmRebuild ? (
-                  // rebuild replaces the whole list — inline confirm (#12):
-                  // consequence + a button naming the action, never «да/нет»
-                  <>
-                    <span>{t("gl.replaceWarn")}</span>
-                    <button
-                      className={RED_BTN}
-                      onClick={() => {
-                        setConfirmRebuild(false);
-                        runGen(true); // fresh run — the result replaces the list
-                      }}
-                    >
-                      {t("gl.replace")}
-                    </button>
-                    <button className={PLAIN_BTN} onClick={() => setConfirmRebuild(false)}>
-                      {t("ui.cancel")}
-                    </button>
-                  </>
-                ) : (
-                  <>
-                    <button
-                      className={`${GEN_BTN} transition-colors hover:bg-neutral-700 dark:hover:bg-white`}
-                      title={text.trim() ? t("gl.rebuildTitle") : t("gl.buildTitle")}
-                      onClick={() => (text.trim() ? setConfirmRebuild(true) : runGen())}
-                    >
-                      {/* non-empty list ⇒ true rebuild (confirm + replace); empty ⇒ first run */}
-                      {text.trim() ? t("gl.rebuild") : t("gl.build")}
-                    </button>
-                    <span
-                      title={
-                        gen?.phase === "done" && !gen.auxUsed ? t("gl.mainModelNote") : undefined
-                      }
-                    >
-                      {gen === null
-                        ? t("gl.estimate")
-                        : gen.phase === "done"
-                          ? t("gl.added", { n: gen.added }) + (gen.skipped ? t("gl.skipped", { n: gen.skipped }) : "")
-                          : gen.msg}
-                    </span>
-                    {gen?.phase === "error" && gen.action === "setup" && onSetup && (
-                      <button className={QUIET_LINK} onClick={onSetup}>
-                        {t("model.downloadShort")}
-                      </button>
-                    )}
-                    {gen?.phase === "error" && gen.action === "restart" && (
-                      <button
-                        className={QUIET_LINK}
-                        onClick={() => {
-                          void restartModel();
-                          setGen(null);
-                        }}
-                      >
-                        {t("ui.restart")}
-                      </button>
-                    )}
-                  </>
-                )
-              ) : (
-                // the running state lives INSIDE the primary button — the modal
-                // keeps one clear main action whether idle or working; a click
-                // is a no-op (runGen's re-entry guard), cancel is explicit
-                <>
-                  <span className={`${GEN_BTN} cursor-default`} aria-busy="true">
-                    <Spinner />
-                    <span className="tabular-nums">
-                      {gen.phase === "extract"
-                        ? t("gl.mining", { done: gen.done, total: gen.total })
-                        : gen.phase === "modelwait"
-                          ? t("model.startingShort")
-                          : gen.phase === "auxstart"
-                            ? t("gl.loading")
-                            : t("gl.translating", { done: gen.done, total: gen.total })}
-                    </span>
-                  </span>
-                  <button
-                    className={QUIET_LINK}
-                    onClick={() => genCtrl.current?.abort()}
-                    title={t("gl.stopTitle")}
-                  >
-                    {t("gl.stop")}
-                  </button>
-                </>
-              ))}
-            <span className="flex-1" />
-            {onRetranslate && (
-              <button
-                className="rounded-lg px-2.5 py-1.5 text-[13px] text-neutral-500 transition-colors hover:bg-neutral-900/5 hover:text-neutral-700 dark:text-neutral-400 dark:hover:bg-neutral-100/10 dark:hover:text-neutral-200"
-                title={t("gl.retranslateTitle")}
-                onClick={() => {
-                  // the pipeline snapshots the glossary at start — save the
-                  // edits now, before the modal's unmount autosave would
-                  saveGlossaryText(bookPath, textRef.current);
-                  onRetranslate();
-                }}
-              >
-                {t("gl.retranslate")}
-              </button>
-            )}
-          </div>
-        )}
-        {/* optional Qwen terminologist (user-initiated, licence named); without
-            it, term translation falls back to the main model */}
-        {showAuxOffer && (
-          <div className="mt-1.5 flex items-center gap-2 text-xs text-neutral-500 dark:text-neutral-400 select-none">
-            {dlBusy(auxDl) ? (
-              <>
-                <span className="tabular-nums">{t("gl.auxProgress", { detail: dlProgressLine(auxDl) })}</span>
-                <button className={QUIET_LINK} onClick={() => cancelDownload("aux")}>
-                  {t("ui.cancel")}
-                </button>
-              </>
-            ) : (
-              <>
-                {/* the verb of a failed download lives on the button beside
-                    it, so the line itself says only what happened (WP-N) */}
-                <span>
-                  {auxDl.status === "error"
-                    ? dlErrorFix(auxDl.error).cause
-                    : t("gl.auxPitch", { size: sizeLabel("aux") })}
-                </span>
-                <button className={QUIET_LINK} onClick={() => startDownload("aux")}>
-                  {auxDl.received > 0 && (auxDl.status === "cancelled" || auxDl.status === "error")
-                    ? t("gl.auxResume", { pct: dlPct(auxDl) })
-                    : t("ui.download")}
-                </button>
-              </>
-            )}
-          </div>
-        )}
-      </div>
     </div>
   );
 }
