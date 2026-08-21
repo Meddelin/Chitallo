@@ -3,7 +3,7 @@ use std::fs::{File, OpenOptions};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -574,6 +574,7 @@ fn run_ask(
     prompt: String,
     session_id: Option<String>,
     system_prompt: Option<String>,
+    tools: Option<String>,
     on_event: tauri::ipc::Channel<String>,
 ) -> Result<(), String> {
     let state = app.state::<AskState>();
@@ -595,13 +596,21 @@ fn run_ask(
 
         let exe = claude_exe_path();
         let mut cmd = Command::new(&exe);
+        // The empty string is the default and stays the default: «Спросить»
+        // answers out of the book, so the CLI is given no tool to reach the
+        // machine with. Anything else in here got there because the reader
+        // typed it into Settings and can read it back — a deliberate,
+        // visible choice. The flag itself is never dropped: an absent
+        // --allowedTools means "whatever Claude Code decides", which is not
+        // the same promise as an empty allow-list.
+        let allowed = tools.as_deref().unwrap_or("");
         cmd.arg("-p")
             .arg("--output-format")
             .arg("stream-json")
             .arg("--verbose")
             .arg("--include-partial-messages")
             .arg("--allowedTools")
-            .arg("");
+            .arg(allowed);
         if let Some(sp) = system_prompt.as_deref() {
             if !sp.is_empty() {
                 cmd.arg("--append-system-prompt").arg(sp);
@@ -736,7 +745,8 @@ fn run_ask(
 /// Ask Claude (headless CLI) with streaming NDJSON forwarded over `on_event`.
 /// Resolves when the process exits (every stream already got a terminal
 /// result line by then). Errors: "busy: ...", "claude_not_found: <path>",
-/// "spawn_failed: <err>".
+/// "spawn_failed: <err>". `tools` is the value for --allowedTools and defaults
+/// to the empty string when absent.
 #[tauri::command]
 async fn ask_claude(
     app: tauri::AppHandle,
@@ -744,9 +754,10 @@ async fn ask_claude(
     session_id: Option<String>,
     system_prompt: Option<String>,
     on_event: tauri::ipc::Channel<String>,
+    tools: Option<String>,
 ) -> Result<(), String> {
     tauri::async_runtime::spawn_blocking(move || {
-        run_ask(app, prompt, session_id, system_prompt, on_event)
+        run_ask(app, prompt, session_id, system_prompt, tools, on_event)
     })
     .await
     .map_err(|e| format!("ask task failed: {e}"))?
@@ -769,6 +780,275 @@ fn kill_ask_child(app: &tauri::AppHandle) {
     let taken = state.inner.lock().unwrap().child.take();
     if let Some(mut child) = taken {
         eprintln!("[ask] app exit -> killing claude pid {}", child.id());
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+}
+
+// ---------------------------------------------------------------------------
+// One-shot Claude calls for the knowledge graph.
+//
+// This is the same machinery as the ask path with its own child slot, and the
+// separate slot is the entire point. A graph build walks the whole library:
+// forty articles is forty prompts, each of them minutes long. If those calls
+// shared AskState, the reader's own question would be answered "busy" by a
+// background job they never asked to wait for — so nothing below ever reads or
+// locks AskState, and the two can run at the same time.
+//
+// No session and no --resume either. Each shard is built from one prompt about
+// one book, so remembering the previous conversation would buy nothing and risk
+// the worst possible failure here: the last book's concepts leaking into this
+// book's shard. Streaming is dropped for the same reason — the caller wants a
+// finished answer to parse, and a graph build has nobody watching it type.
+// ---------------------------------------------------------------------------
+
+/// How long one graph call may run before the queue behind it matters more
+/// than its answer. A single-book prompt lands in well under a minute; three
+/// minutes means the child is wedged rather than slow (a stalled network read,
+/// a CLI waiting on something that will never arrive). Because the queue is
+/// serial, one wedged child would hold up every book behind it, so the number
+/// is deliberately generous for a real answer and still short enough that a
+/// library of forty cannot be stopped by one of them.
+const GRAPH_TIMEOUT: Duration = Duration::from_secs(180);
+
+/// How often the wait loop looks at the child. Polling instead of a blocking
+/// `wait()` is what makes the deadline enforceable at all — and it is also what
+/// keeps `graph_claude_cancel` able to take the child, since the loop lets go
+/// of the lock between looks.
+const GRAPH_POLL: Duration = Duration::from_millis(50);
+
+#[derive(Default)]
+struct GraphAskInner {
+    /// The running claude child of a graph call, if one is in flight.
+    child: Option<Child>,
+    /// Generation counter, mirroring AskInner for the same reason: a call whose
+    /// child was cancelled must never reap the child of the call that replaced
+    /// it in the slot.
+    generation: u64,
+}
+
+#[derive(Default)]
+struct GraphAskState {
+    inner: Mutex<GraphAskInner>,
+}
+
+/// How the wait loop below ended. Named rather than a tuple of flags because
+/// three of the four outcomes are failures that read differently to the caller.
+enum GraphEnd {
+    Exited(ExitStatus),
+    /// The slot stopped being ours: cancelled by hand, or by app teardown.
+    Cancelled,
+    TimedOut,
+    WaitFailed(String),
+}
+
+/// Blocking body of graph_claude: spawn claude.exe, pipe the prompt via stdin,
+/// collect stdout whole, and enforce GRAPH_TIMEOUT on the way.
+fn run_graph_claude(
+    app: tauri::AppHandle,
+    prompt: String,
+    system_prompt: Option<String>,
+) -> Result<String, String> {
+    let state = app.state::<GraphAskState>();
+
+    // Spawn under the lock: busy-check + store are atomic w.r.t. cancel.
+    let (my_gen, stdin, stdout, stderr) = {
+        let mut inner = state.inner.lock().unwrap();
+        if let Some(c) = inner.child.as_mut() {
+            match c.try_wait() {
+                Ok(Some(_)) => {
+                    // Stale dead child (should not normally happen): reap it.
+                    if let Some(mut old) = inner.child.take() {
+                        let _ = old.wait();
+                    }
+                }
+                _ => return Err("busy".into()),
+            }
+        }
+
+        let exe = claude_exe_path();
+        let mut cmd = Command::new(&exe);
+        // Plain text, empty allow-list: the answer is parsed by graphgen.ts and
+        // written to a shard by the frontend, so the CLI has no business
+        // touching the disk on its own.
+        cmd.arg("-p")
+            .arg("--output-format")
+            .arg("text")
+            .arg("--allowedTools")
+            .arg("");
+        if let Some(sp) = system_prompt.as_deref() {
+            if !sp.is_empty() {
+                cmd.arg("--append-system-prompt").arg(sp);
+            }
+        }
+        // The same cwd as every other claude call: a graph run must not scatter
+        // CLI state into a directory the ask path does not know about.
+        if let Some(dir) = ask_cwd(&app) {
+            cmd.current_dir(dir);
+        }
+        cmd.stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        platform::quiet(&mut cmd);
+
+        let mut child = cmd.spawn().map_err(|e| {
+            if e.kind() == std::io::ErrorKind::NotFound {
+                format!("claude_not_found: {}", exe.display())
+            } else {
+                format!("spawn_failed: {e}")
+            }
+        })?;
+        eprintln!("[graph] spawned claude pid {}", child.id());
+        let stdin = child.stdin.take();
+        let stdout = child.stdout.take();
+        let stderr = child.stderr.take();
+        inner.generation += 1;
+        let my_gen = inner.generation;
+        inner.child = Some(child);
+        (my_gen, stdin, stdout, stderr)
+    };
+
+    // Write the prompt on its own thread (a page of book text is far larger
+    // than a pipe buffer, and writing it inline would deadlock against a child
+    // that has not started reading), then close stdin to start the turn.
+    if let Some(mut si) = stdin {
+        std::thread::spawn(move || {
+            let _ = si.write_all(prompt.as_bytes());
+            // drop closes the pipe
+        });
+    }
+
+    // Both pipes are drained on their own threads: either one filling up would
+    // block the child forever, and a blocked child cannot be told apart from a
+    // wedged one.
+    let stdout_thread = stdout.map(|mut so| {
+        std::thread::spawn(move || {
+            let mut buf = String::new();
+            let _ = so.read_to_string(&mut buf);
+            buf
+        })
+    });
+    let stderr_thread = stderr.map(|mut se| {
+        std::thread::spawn(move || {
+            let mut buf = String::new();
+            let _ = se.read_to_string(&mut buf);
+            buf
+        })
+    });
+
+    let deadline = Instant::now() + GRAPH_TIMEOUT;
+    let end = loop {
+        {
+            let mut inner = state.inner.lock().unwrap();
+            // Only reap what is still OURS (same generation): if the slot was
+            // emptied or refilled meanwhile, that child belongs to someone else.
+            if inner.generation != my_gen || inner.child.is_none() {
+                break GraphEnd::Cancelled;
+            }
+            match inner.child.as_mut().map(|c| c.try_wait()) {
+                Some(Ok(Some(st))) => {
+                    if let Some(mut done) = inner.child.take() {
+                        let _ = done.wait();
+                    }
+                    break GraphEnd::Exited(st);
+                }
+                Some(Err(e)) => {
+                    let _ = inner.child.take();
+                    break GraphEnd::WaitFailed(e.to_string());
+                }
+                _ => {}
+            }
+            if Instant::now() >= deadline {
+                if let Some(mut wedged) = inner.child.take() {
+                    eprintln!("[graph] timeout -> killing claude pid {}", wedged.id());
+                    let _ = wedged.kill();
+                    let _ = wedged.wait();
+                }
+                break GraphEnd::TimedOut;
+            }
+        }
+        std::thread::sleep(GRAPH_POLL);
+    };
+
+    // Killing the child closes both pipes, so these joins cannot outlive it.
+    let out = stdout_thread.and_then(|t| t.join().ok()).unwrap_or_default();
+    let err = stderr_thread.and_then(|t| t.join().ok()).unwrap_or_default();
+
+    match end {
+        GraphEnd::Exited(st) if st.success() => Ok(out.trim().to_string()),
+        GraphEnd::Exited(st) => {
+            // Raw machine detail only, exactly as the ask path does it: the
+            // sentence the reader sees is worded in the frontend, in the
+            // interface language. The stderr tail is what makes a broken
+            // install debuggable, so it is carried, bounded.
+            let tail: String = {
+                let t = err.trim();
+                let chars: Vec<char> = t.chars().collect();
+                if chars.len() > 600 {
+                    chars[chars.len() - 600..].iter().collect()
+                } else {
+                    t.to_string()
+                }
+            };
+            if tail.is_empty() {
+                Err(format!("claude_failed: {st}"))
+            } else {
+                Err(format!("claude_failed: {st}: {tail}"))
+            }
+        }
+        GraphEnd::TimedOut => Err("timeout".into()),
+        GraphEnd::Cancelled => Err("cancelled".into()),
+        GraphEnd::WaitFailed(e) => Err(format!("wait_failed: {e}")),
+    }
+}
+
+/// One-shot Claude call for the graph builder: no session, no streaming, and no
+/// state shared with «Спросить», so a background build over a whole library can
+/// never make the reader's own question answer "busy". Resolves with the
+/// trimmed stdout. Errors are raw machine detail — "busy", "timeout",
+/// "cancelled", "claude_not_found: <path>", "spawn_failed: <err>",
+/// "claude_failed: <status>: <stderr tail>" — worded by the frontend.
+#[tauri::command]
+async fn graph_claude(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, GraphAskState>,
+    prompt: String,
+    system_prompt: Option<String>,
+) -> Result<String, String> {
+    // Cheap refusal before the thread hop. The check that actually decides is
+    // the one inside run_graph_claude, taken under the same lock as the spawn;
+    // this one only spares the queue a pointless blocking task when it already
+    // has a call in flight.
+    {
+        let mut inner = state.inner.lock().unwrap();
+        if let Some(c) = inner.child.as_mut() {
+            if matches!(c.try_wait(), Ok(None)) {
+                return Err("busy".into());
+            }
+        }
+    }
+    tauri::async_runtime::spawn_blocking(move || run_graph_claude(app, prompt, system_prompt))
+        .await
+        .map_err(|e| format!("graph task failed: {e}"))?
+}
+
+/// Kill the in-flight graph call, if any. The pending graph_claude then
+/// resolves with Err("cancelled").
+#[tauri::command]
+fn graph_claude_cancel(state: tauri::State<'_, GraphAskState>) {
+    let taken = state.inner.lock().unwrap().child.take();
+    if let Some(mut child) = taken {
+        eprintln!("[graph] cancel -> killing claude pid {}", child.id());
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+}
+
+fn kill_graph_child(app: &tauri::AppHandle) {
+    let state = app.state::<GraphAskState>();
+    let taken = state.inner.lock().unwrap().child.take();
+    if let Some(mut child) = taken {
+        eprintln!("[graph] app exit -> killing claude pid {}", child.id());
         let _ = child.kill();
         let _ = child.wait();
     }
@@ -1242,6 +1522,7 @@ fn kill_children(app: &tauri::AppHandle) {
     kill_spawned::<TranslationState>(app);
     kill_spawned::<AuxState>(app);
     kill_ask_child(app);
+    kill_graph_child(app);
 }
 
 /// Why the titlebar X cannot be left to Tauri's default path.
@@ -1347,6 +1628,7 @@ pub fn run() {
         .manage(TranslationState::default())
         .manage(AuxState::default())
         .manage(AskState::default())
+        .manage(GraphAskState::default())
         .manage(DownloadsState::default())
         .invoke_handler(tauri::generate_handler![
             host_info,
@@ -1363,6 +1645,8 @@ pub fn run() {
             delete_model,
             ask_claude,
             ask_claude_cancel,
+            graph_claude,
+            graph_claude_cancel,
             print::print_html_to_pdf
         ])
         .setup(|app| {

@@ -32,19 +32,41 @@ English — you pick it on first launch and can change it in Settings.
 - **Command palette** (Ctrl+K) — commands, «page N», book switching, search;
   the shortcut overlay is `?`
 - **Library** with covers, reading progress and a live folder watch
+- **Knowledge graph** — a second view of the library: every book gives up its
+  concepts, books that share one are joined, and «Ask» looks there before it
+  looks anywhere else
 - **Export** — the finished translation to PDF (with the original's
   illustrations) or HTML, one click, straight to Downloads
 - **«Ask»** (Ctrl+J) — questions about the book you are reading, through Claude
   Code. An answer is prose unless a picture earns its place: it may carry typeset
   LaTeX, a chart drawn from the book's own numbers (with a table view), or a
-  diagram. Optional, and the only feature that uses the network.
+  diagram. Optional, and one of the only two things that use the network — see
+  Privacy.
 
 ## Privacy
 
 Books, translations and glossaries stay on your computer: the model is
-downloaded once and runs locally. The single exception is the optional «Ask»
-feature — your question and a fragment of the open book are sent to Claude, on
-an explicit action.
+downloaded once and runs locally. Three things go out, all through Claude Code
+and all on an explicit action.
+
+«Ask» sends your question, a fragment of the open book, and a short pointer list
+from the knowledge graph — names of concepts, titles of the books they appear in,
+the page numbers and a few neighbouring titles — so the answer starts from your
+own library. The one-line description of a concept goes only when the concept
+also stands in an open article, or in the book already in front of you.
+
+«Read open articles through Claude Code» asks what the terms of an openly
+published article denote. It sends the title, the authors, the keywords and
+subject from the file's metadata, and the terms already mined from the text by
+statistics — not the pages, and not the file. It is off by default, and a
+licensed book, or one the classifier could not place, is read here by the local
+model instead.
+
+«Allow web search» is the one switch that reaches past Anthropic. With it on,
+Claude Code may run a search or open a page while answering, so your question —
+and whatever it takes to look it up — reaches a search engine and the sites it
+returns. Off by default; with it off «Ask» is given no tools at all, and the
+graph is read either way before anything else is.
 
 ## Install
 
