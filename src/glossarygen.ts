@@ -12,29 +12,69 @@
 //   • src/booklang.ts  — what language the book is in.
 //   • this file        — passes, IO, prompts, compatibility.
 //
-// The three passes, in the order they are meant to run:
+// The five passes, in the order they are meant to run:
 //
-//   1. mineGlossary   model-free. It ALWAYS runs and it always writes. This is
-//                     the honest answer to "no aux model installed": the terms,
-//                     their pages and their frequencies land on disk now, and
-//                     the other fields get filled the day a model exists. The
-//                     UI must say that out loud rather than pretend a pass ran.
-//   2. enrichTerms    batched against the aux model, ~12 terms a call, asking
-//                     for `term :: kind :: category :: definition`. Translation
-//                     is a separate, optional field of this pass — see below.
-//   3. validateTerms  clusters near-duplicates locally, asks the model per
-//                     cluster whether they are one concept and which spelling
-//                     is canonical, and checks definitions against their terms.
-//                     A definition that fails is CLEARED; the term survives.
+//   1.  mineGlossary   model-free. It ALWAYS runs and it always writes. This is
+//                      the honest answer to "no aux model installed": the terms,
+//                      their pages and their frequencies land on disk now, and
+//                      the other fields get filled the day a model exists. The
+//                      UI must say that out loud rather than pretend a pass ran.
+//   1.5 profileBook    ONE model call that reads the book's title, its outline,
+//                      its opening and sixteen prose excerpts and writes a six-
+//                      line brief about the book to a sibling .profile.json.
+//                      Every later prompt is prefixed with that brief instead of
+//                      a bag of the book's most frequent strings.
+//   1.7 proposeTerms   the model NAMES the book's terms from sampled pages,
+//                      under that brief; TermMiner.lookup then attaches the
+//                      counts. The miner stays the recall net; it stops being
+//                      the selector — and one batched yes/no pass gives the
+//                      model a VETO over the ranked tail the miner still
+//                      contributes, so a frequent string reaches the reader's
+//                      file only if the model that has read the book agrees it
+//                      is a term of it (see vetoMinedTail). The veto needs the
+//                      book PROFILE and runs only when there is one: its
+//                      brief may not be built from the same frequency ranking
+//                      it is judging — see profileBrief.
+//   2.  enrichTerms    batched against the aux model, ~12 terms a call, asking
+//                      for `term :: kind :: category :: definition`. Translation
+//                      is a separate, optional field of this pass — see below.
+//   3.  validateTerms  clusters near-duplicates locally, asks the model per
+//                      cluster whether they are one concept and which spelling
+//                      is canonical, and checks definitions against their terms.
+//                      A definition that fails is CLEARED; the term survives.
 //
-// Only pass 1 touches the disk. The other two are functions over records, so a
-// whole run is:
+// Why 1.5 and 1.7 exist at all, in one paragraph, because it is the whole point
+// of them: frequency cannot tell a term of the book from a running example in
+// it. The reader's own second book yielded, by raw C-value rank, «dark of the
+// moon» (a sample search query used 56 times as a worked example) beside
+// «SDBN :: сокращение от специфического алгоритма или структуры данных» — pure
+// I-don't-know filler — and «Information Retrieval = Информационное
+// извлечение», the literal word-for-word rendering of a term whose established
+// Russian name is «информационный поиск». A model handed nothing but a list of
+// frequent strings cannot separate those either; a model told what the book is,
+// whom it is for and what it argues can. So the brief comes first and every
+// prompt below carries it — and the frequent strings the miner still puts
+// forward are shown to that same model for a yes or a no before they are
+// allowed into the file, because a selector that was demoted and then left
+// writing unchecked is not demoted at all.
+//
+// Only passes 1, 1.5 and 1.7 touch the disk. The other two are functions over
+// records, so a whole run is:
 //
 //   const m = await mineGlossary(doc, bookPath, { signal, onProgress });
-//   const e = await enrichTerms(m.records, { bookPath, lang: m.lang, target, signal });
-//   const v = await validateTerms(e.records, { signal });
+//   await profileBook(doc, bookPath, { lang: m.lang, signal, onProgress });
+//   await proposeTerms(doc, bookPath, { lang: m.lang, signal, lookup: m.lookup });
+//   const g = await loadGlossary(bookPath);
+//   const brief = bookBrief(await loadProfile(bookPath), g.records);
+//   const e = await enrichTerms(g.records, { bookPath, lang: m.lang, target, brief, signal });
+//   const v = await validateTerms(e.records, { brief, signal });
 //   await saveGlossary(bookPath, v.records, {
 //     lang: m.lang, target, remove: v.foldedKeys, clearDefs: v.clearedKeys });
+//
+// `brief` is rendered ONCE by the caller and handed down, rather than read from
+// disk by each pass. That keeps passes 2 and 3 what they have always been —
+// pure functions over records that open nothing — which is the property their
+// own option docs make a point of.
 //
 // `bookPath` on pass 2 is not an IO argument — the pass reads no file. It is
 // the key into this session's sample store, which is the one thing a record
@@ -85,13 +125,12 @@ import {
 } from "./glossary";
 import { conceptId } from "./graphstore";
 import { joinPath } from "./host";
-import { getLang, targetLanguage, type Lang } from "./i18n";
+import { getLang, type Lang } from "./i18n";
 import { clusterParagraphs, hash, type Paragraph } from "./paragraphs";
 import { createMiner, isCitationPage, type MinedTerm } from "./terms";
 import { OUT_MATCH, outDice, outNorm } from "./textsim";
 import {
   auxComplete,
-  completeRaw,
   hydrateGlossary,
   isAuxUp,
   saveGlossaryText,
@@ -115,6 +154,17 @@ export { CITE_MARK } from "./terms";
 /// unchanged.
 export type SampledRecord = TermRecord & { sample?: string };
 
+/// What the miner counted for an arbitrary phrase — TermMiner.lookup's shape,
+/// spelled here so a caller can hold one without importing terms.ts.
+///
+/// `freq: 0` means UNVERIFIED, never "not a term". terms.ts:105-113 states it
+/// plainly: a phrase longer than MAX_N=4 tokens, or one that straddles a clause
+/// boundary, was never counted under any key and answers 0. That is exactly the
+/// shape of the good multiword term a model names and the miner structurally
+/// cannot count, so proposeTerms keeps such a record and simply gives it no
+/// freq and no pages rather than dropping it.
+export type TermLookup = (term: string) => { key: string; freq: number; pages: number[] };
+
 export type MineResult = {
   /// The COMPLETE record list of the file as it now stands — what was already
   /// there plus what this run added, with the sidecar's bookkeeping applied and
@@ -128,6 +178,15 @@ export type MineResult = {
   confidence: number;
   added: number;
   updated: number;
+  /// The live miner's counts, for as long as this session keeps them.
+  ///
+  /// SESSION-ONLY and never persisted: whole-book mining of an 838-page book is
+  /// some 82 000 n-grams at roughly 75 MB (graphgen.ts:196), which is a thing to
+  /// hand across a click, not a thing to write down. It exists so that the panel
+  /// can run «Найти термины» and then «Прочитать книгу» and have the book read
+  /// ONCE — proposeTerms wants exactly this function and would otherwise mine
+  /// the whole book a second time to get it.
+  lookup: TermLookup;
 };
 
 export type EnrichResult = {
@@ -197,10 +256,37 @@ const DETECT_PAGES = 16; // pages sampled for language detection, see mineGlossa
 const CONCURRENCY = 3; // worker count only; the requests share auxPool's ≤3 budget
 const ENRICH_CHUNK = 12; // terms per enrichment call — graphgen's TYPE_CHUNK, same reason
 const DEF_CHUNK = 12; // term/definition pairs per validation call
+const TAIL_CHUNK = 12; // mined terms per veto call — see vetoMinedTail
 const MAX_CLUSTER = 8; // spellings of one concept the model is asked about at once
 const CLUSTER_TICK = 64; // rows between event-loop yields in the O(n²) clustering
 const AUX_TRIES = 3; // attempts per model call — graphgen.ts:181, same arithmetic
 const AUX_RETRY_MS = 2000; // pause before a retry, so a loading server can finish
+
+// ---- pass 1.5 and 1.7's own budgets ----------------------------------------
+
+const PROFILE_FRONT = 1500; // characters of opening prose, graphgen's FRONT_CHARS
+const PROFILE_TOC = 600; // characters of flattened outline, graphgen's TOC_CHARS
+const PROFILE_FRONT_PAGES = 5; // pages the opening is taken from
+const PROFILE_PAGES = 16; // spread pages one excerpt each is taken from
+// One excerpt is the LONGEST PROSE paragraph of its page, not the head of the
+// page. The head of a page is disproportionately the running head, the folio
+// and a section heading — furniture, in clusterParagraphs' own vocabulary —
+// and a profile built from furniture describes the typesetting rather than the
+// book. 350 characters is about two sentences of body prose, which is what
+// carries the register and the vocabulary the brief is meant to name.
+const PROFILE_EXCERPT = 350;
+
+const PROPOSE_PAGES = 40; // spread pages the model is asked to name terms from
+const PROPOSE_CHUNK_PAGES = 3; // pages per call — ~3000 characters of excerpt
+const PROPOSE_PAGE_CHARS = 1000; // characters kept per page inside a chunk
+const PROPOSE_CAP = 80; // proposals kept in full before the miner fills the rest
+const PROPOSE_TERM_CHARS = 64; // a longer line is a sentence, not a term
+const PROPOSE_TERM_WORDS = 6; // …and so is a longer one by word count
+// How many characters of a proposal's tokens have to occur, in order, in the
+// chunk the model was shown. See occursIn: the point is to fold inflection
+// before comparing, because the nominative singular the prompt asks for almost
+// never occurs verbatim in Russian running text.
+const PROPOSE_STEM = 5;
 
 // A definition is one sentence on one row of a panel. graphgen caps its node
 // glosses at 160 characters; this is 200, for one stated reason and no measured
@@ -214,24 +300,53 @@ const DEF_MAX = 200;
 // answering the definition question twice.
 const CAT_MAX = 48;
 const CAT_WORDS = 4;
-// Characters of the first-occurrence sentence that go into an enrichment batch.
-// The miner clamps a sample to 300; twelve of those would be 3.6 KB of prompt
-// against an 8192-token slot shared by three workers (the aux server is
-// spawned with -c 8192, src-tauri/src/lib.rs:85). 160 characters is roughly 70
-// tokens of Russian, so a full batch spends ~850 tokens on context and leaves
-// the budget to the answer.
+// Characters of the first-occurrence sentence that go into a batch — the
+// enrichment's, and now the mined tail's veto too (vetoMinedTail).
+//
+// The miner clamps a sample to 300; twelve of those would be 3.6 KB of prompt.
+// 160 characters is roughly 70 tokens of Russian, so a full batch spends ~850
+// tokens on context and leaves the budget to the answer.
+//
+// The slot this is measured against was re-derived when the servers gained
+// `--parallel`: `-c` is the TOTAL arena and llama-server divides it by the
+// slot count (measured on this machine — `--parallel 8 -c 24576` prints
+// `n_ctx_slot = 3072`), so the aux server's `--parallel 4` over `-c 16384`
+// gives 4096 cells a slot, not the flat 8192 this comment used to name. That
+// is a whole request's budget, prompt and generation together, and ~850 tokens
+// of context against it is the same comfortable fraction the old arithmetic
+// claimed. See `AuxState::CTX_PER_SLOT` in src-tauri/src/lib.rs for the
+// authoritative pair.
 const SAMPLE_IN_PROMPT = 160;
+// Terms already settled that the translation ladder shows the model, newest
+// last. Twelve pairs is about 300 characters — the same order as one sample
+// sentence — and it is enough for the model to see the book's conventions
+// without the prompt turning into a second glossary.
+const DECIDED_IN_PROMPT = 12;
 
 // Token budgets. One enrichment line is the term (≤64 chars), a kind word, a
 // category (≤48) and a definition (≤200) plus the separators: about 290
-// characters, and Qwen3.5 tokenises Russian at roughly 2.2 characters a token,
-// so ~130 tokens. 180 leaves the slack that stops a truncation from looking
-// like a refusal; the ceiling is what a whole batch can legitimately need.
-const enrichBudget = (n: number): number => Math.min(2600, 220 + n * 180);
-// A verdict line is a term and one word.
+// characters, and Gemma tokenises Russian at roughly 2.2 characters a token, so
+// ~130 tokens. The per-line figure went from 180 to 200 and the ceiling from
+// 2600 to 3000 with the profile: a definition that has to say what the concept
+// is IN THIS BOOK and what role it plays in it is a longer sentence than one
+// that may recite a dictionary, and the slack is what stops a truncation from
+// looking exactly like a refusal (translate.ts:355 turns a cut answer into "").
+const enrichBudget = (n: number): number => Math.min(3000, 220 + n * 200);
+// A verdict line is a term and one word. Two passes ask for that shape — the
+// definition check and the mined tail's veto — and both spend this budget,
+// because a line of «dark of the moon :: нет» is a line of «recall :: да»
+// whatever question produced it. Sharing it is also the point: the veto's reply
+// is deliberately defUser's format so that parseVerdicts reads both, and a
+// budget of its own would be the first thing to drift away from that.
 const defBudget = (n: number): number => Math.min(900, 120 + n * 45);
 // One line: «ДА :: <spelling>».
 const DUP_BUDGET = 120;
+// Six lines of prose, one of them two sentences long, in Russian: ~700
+// characters, so ~320 tokens. 700 is double that, because this call happens
+// once per book and a truncated brief poisons every prompt that follows it.
+const PROFILE_BUDGET = 700;
+// Eight to twenty term lines of ≤64 characters: ~600 characters, ~270 tokens.
+const PROPOSE_BUDGET = 500;
 
 // ---- prompts ----------------------------------------------------------------
 //
@@ -295,41 +410,186 @@ const NAMES_RULE = {
 /// underneath when mining found one.
 type PromptItem = { term: string; sample?: string };
 
+/// A decision this run of the translation ladder has already taken. The ladder
+/// shows the last few to the model so the pass has a memory across terms — see
+/// translateTerms for what that costs.
+type DecidedPair = { term: string; tr: string };
+
+/// The prose fields of BookProfile, in the order profileUser asks for them.
+type ProfileField = "subject" | "audience" | "argument" | "topics" | "vocab" | "register";
+
+/// What the profile pass hands its prompt builder. Each field is already
+/// clipped and may be empty, in which case the line is left out entirely
+/// rather than printed with a placeholder the model would try to fill.
+type ProfileInput = {
+  title: string;
+  authors: string;
+  toc: string;
+  front: string;
+  pages: string;
+  excerpts: string;
+};
+
 const PROMPTS: Record<
   Lang,
   {
+    /// The pre-profile brief: the line every prompt below carried before this
+    /// change, and still carries for every glossary that exists today. See
+    /// bookBrief for why the fallback is byte-identical to the old text.
+    domainLine: (domain: string) => string;
+    /// The brief a book that has been READ writes about itself.
+    briefLines: (p: BookProfile) => string;
+    profileSystem: string;
+    profileUser: (a: ProfileInput) => string;
+    /// The six labels profileUser asks for, paired with the field each fills,
+    /// in the order it asks for them. Matched with ё folded onto е — a model
+    /// asked for «О ЧЁМ» answers «О ЧЕМ» often enough that the alternative is
+    /// throwing away good briefs over a diacritic.
+    profileFields: readonly (readonly [string, ProfileField])[];
+    /// Distinctive fragments of profileUser's FORM description, and the reason
+    /// they are not in `echo` below: a recited «ОБЛАСТЬ: дисциплина и предмет
+    /// книги, одна строка» parses perfectly as a profile, so it has to be
+    /// caught by its own prompt's words. replyRejected reads `echo` only.
+    profileEcho: readonly string[];
+    proposeSystem: string;
+    proposeUser: (brief: string, chunk: string) => string;
+    /// The veto over the miner's ranked tail — vetoMinedTail's question, and it
+    /// asks it in defUser's LINE FORMAT on purpose: «термин :: да|нет», so the
+    /// verdict parser both passes read is one parser (parseVerdicts) and one
+    /// budget (defBudget). A yes/no question about a term is a yes/no question
+    /// about a term; giving this one a second format would double the surface
+    /// that has to keep agreeing with itself.
+    ///
+    /// «Термин» and not «строка», and the placeholder is as load-bearing as the
+    /// separator. defUser's template is the one shape of this reply that is
+    /// measured to work; this prompt deviated from it by naming its slot after
+    /// the thing it was asking about, and a model that echoes a placeholder
+    /// literally then answers «строка :: нет» — parseVerdicts looks up
+    /// conceptId("строка"), finds nothing asked about under that id, and drops
+    /// the line. Twelve of those and the whole batch is silently empty while
+    /// hasVerdict still says the reply carried a verdict, so nothing retries.
+    /// The list is still introduced as «строки», because calling the candidates
+    /// «термины» in the very question of whether they are terms would answer it
+    /// in the asking — the same defect as the frequency brief, see profileBrief.
+    /// Only the ANSWER TEMPLATE is shared, and it is shared verbatim.
+    ///
+    /// `items` rather than bare strings: the model is judging whether a string
+    /// is a term of the book or an example in it, and the sentence the miner
+    /// first met it in is the evidence that settles it. Rendered by listItems,
+    /// exactly as enrichUser renders the same shape.
+    tailSystem: string;
+    tailUser: (brief: string, items: readonly PromptItem[]) => string;
     enrichSystem: string;
-    enrichUser: (domain: string, items: readonly PromptItem[]) => string;
+    enrichUser: (brief: string, items: readonly PromptItem[]) => string;
     dupSystem: string;
-    dupUser: (domain: string, forms: readonly string[]) => string;
+    dupUser: (brief: string, forms: readonly string[]) => string;
     defSystem: string;
-    defUser: (domain: string, pairs: readonly { term: string; definition: string }[]) => string;
+    defUser: (brief: string, pairs: readonly { term: string; definition: string }[]) => string;
+    trSystem: string;
+    trUser: (it: PromptItem, brief: string, decided: readonly DecidedPair[]) => string;
     /// Distinctive fragments of the instructions above. A reply containing one
     /// of them is the model reciting the task back instead of doing it.
+    ///
+    /// EVERY ENTRY MUST BE A LITERAL SUBSTRING OF THE PROMPT TEXT IN THIS SAME
+    /// OBJECT. Nothing checks that at compile time and nothing fails at run
+    /// time when it stops being true — the gate simply stops firing and junk
+    /// reaches the reader's file. Re-derive them in the same edit that changes
+    /// a prompt, or do not change the prompt.
     echo: readonly string[];
   }
 > = {
   ru: {
+    domainLine: (domain) => `Тематика книги (ключевые термины): ${domain}`,
+    briefLines: (p) =>
+      `Книга: ${p.subject}\n` +
+      `Для кого: ${p.audience}\n` +
+      `О чём: ${p.argument}\n` +
+      `Темы: ${p.topics.join(", ")}\n` +
+      `Лексика: ${p.vocab}\n` +
+      `Тон: ${p.register}`,
+    profileSystem:
+      "Ты — редактор, который готовит справку о книге для других редакторов. Тебе дают название, " +
+      "оглавление, начало книги и несколько отрывков с разных её страниц. Ты пишешь короткую " +
+      "справку по заданной форме.",
+    profileUser: (a) =>
+      (a.title ? `Название: ${a.title}\n` : "") +
+      (a.authors ? `Авторы: ${a.authors}\n` : "") +
+      (a.toc ? `Оглавление: ${a.toc}\n` : "") +
+      (a.front ? `Начало книги:\n${a.front}\n` : "") +
+      `\nОтрывки со страниц ${a.pages}:\n${a.excerpts}\n\n` +
+      "Ответь ровно шестью строками и ничем больше:\n" +
+      "ОБЛАСТЬ: дисциплина и предмет книги, одна строка\n" +
+      "ЧИТАТЕЛЬ: для кого она написана, одна строка\n" +
+      "О ЧЁМ: что книга утверждает и что разбирает, ровно два предложения\n" +
+      "ТЕМЫ: от пяти до восьми предметных областей через запятую\n" +
+      "ЛЕКСИКА: какого рода лексика в этой книге главная, одна строка\n" +
+      "ТОН: регистр изложения и обращение к читателю, одна строка\n" +
+      "Пиши по-русски. Ничего, кроме этих шести строк, не пиши.",
+    profileFields: [
+      ["ОБЛАСТЬ", "subject"],
+      ["ЧИТАТЕЛЬ", "audience"],
+      ["О ЧЕМ", "argument"],
+      ["ТЕМЫ", "topics"],
+      ["ЛЕКСИКА", "vocab"],
+      ["ТОН", "register"],
+    ],
+    profileEcho: ["одна строка", "ровно два предложения", "предметных областей через запятую"],
+    proposeSystem:
+      "Ты — терминолог. Тебе дают справку о книге и несколько страниц её текста. Ты называешь " +
+      "понятия, на которых эта книга держится, — так, как их называет она сама.",
+    proposeUser: (brief, chunk) =>
+      (brief ? `${brief}\n\n` : "") +
+      "Ниже — отрывки из книги. Выпиши из них термины этой книги: понятия, методы, объекты " +
+      "изучения и имена собственные, без которых текст не читается.\n" +
+      "Правила:\n" +
+      "— пиши термин ровно в том виде, в каком он стоит в тексте, в именительном падеже " +
+      "единственного числа, если такая форма в тексте есть;\n" +
+      "— общеупотребительные слова, которые в этой книге ничего особенного не значат, не выписывай;\n" +
+      "— не выдумывай терминов, которых в отрывках нет;\n" +
+      "— от восьми до двадцати строк, по одному термину в строке, без нумерации и без пояснений.\n\n" +
+      `Отрывки:\n${chunk}`,
+    tailSystem:
+      "Ты редактор словаря терминов. Тебе дают справку о книге и строки, которые машина отобрала " +
+      "из неё по частоте. Ты решаешь про каждую, термин ли это самой книги или просто пример, " +
+      "который в ней встретился. Отвечай только строками заданной формы.",
+    tailUser: (brief, items) =>
+      (brief ? `${brief}\n\n` : "") +
+      "Ниже — строки, отобранные из книги по числу вхождений, и под каждой — предложение, в " +
+      "котором она впервые встретилась. Частота ничего не говорит о том, термин ли это: " +
+      "сквозной пример, образец поискового запроса и слово из листинга повторяются в книге " +
+      "чаще многих настоящих терминов. Смотри на контекст: он показывает, о чём книга говорит, " +
+      "когда она эту строку пишет.\n" +
+      "Про каждую строку реши, входит ли она в терминологию этой книги.\n" +
+      "Да — понятия, методы, модели, метрики и объекты изучения, а также принятые в этой " +
+      "области сокращения и аббревиатуры, даже если ты не знаешь, как они расшифровываются.\n" +
+      "Нет — образцы поисковых запросов и примеры, на которых книга что-то показывает; " +
+      "названия фильмов, книг и песен, взятые как образец; ключевые слова, литералы и имена " +
+      "из листингов; общеупотребительные слова и обрывки фраз.\n" +
+      "Если сомневаешься, отвечай да.\n" +
+      `Ответь по одной строке на каждую строку списка, в том же порядке:\nтермин ${SEP} да\nили\nтермин ${SEP} нет\n` +
+      "Термин переписывай без изменений. Ничего, кроме этих строк, не пиши.\n\n" +
+      `Строки:\n${listItems(items, "Контекст")}`,
     enrichSystem:
-      "Ты терминолог. Тебе дают термины из одной книги; ты определяешь, что каждый из них " +
-      "обозначает, и описываешь его одной строкой. Отвечай только строками заданной формы, " +
-      "без нумерации, без заголовков и без пояснений.",
-    enrichUser: (domain, items) =>
-      (domain ? `Тематика книги (ключевые термины): ${domain}\n\n` : "") +
+      "Ты терминолог. Тебе дают справку о книге и термины из неё; ты объясняешь, что каждый из " +
+      "них значит В ЭТОЙ книге. Отвечай только строками заданной формы, без нумерации, без " +
+      "заголовков и без пояснений.",
+    enrichUser: (brief, items) =>
+      (brief ? `${brief}\n\n` : "") +
       "Для каждого термина из списка выведи одну строку вида\n" +
       `термин ${SEP} тип ${SEP} категория ${SEP} определение\n` +
       "Тип — ровно одно слово из списка: person, org, place, work, topic, term.\n" +
       NAMES_RULE.ru +
       "Категория — родовое понятие в одно-два слова: «метрика», «структура данных», «алгоритм».\n" +
-      "Определение — одно предложение до 15 слов, по-русски.\n" +
+      "Определение — одно предложение до 15 слов, по-русски, о том, чем это понятие является " +
+      "ИМЕННО В ЭТОЙ книге и какую роль в ней играет. Не пересказывай словарное значение слова.\n" +
       "Термин переписывай без изменений. Строк должно быть ровно столько, сколько терминов. " +
       "Ничего, кроме этих строк, не пиши.\n\n" +
       `Термины:\n${listItems(items, "Контекст")}`,
     dupSystem:
       "Ты терминолог. Тебе дают несколько написаний, найденных в одной книге. Ты решаешь, " +
       "обозначают ли они одно и то же понятие. Отвечай ровно одной строкой заданной формы.",
-    dupUser: (domain, forms) =>
-      (domain ? `Тематика книги (ключевые термины): ${domain}\n\n` : "") +
+    dupUser: (brief, forms) =>
+      (brief ? `${brief}\n\n` : "") +
       "Написания, найденные в одной книге:\n" +
       forms.map((f, i) => `${i + 1}) ${f}`).join("\n") +
       "\n\nОбозначают ли они одно и то же понятие?\n" +
@@ -339,43 +599,135 @@ const PROMPTS: Record<
     defSystem:
       "Ты редактор словаря терминов. Тебе дают термины и их определения; ты решаешь, верно ли " +
       "определение описывает свой термин. Отвечай только строками заданной формы.",
-    defUser: (domain, pairs) =>
-      (domain ? `Тематика книги (ключевые термины): ${domain}\n\n` : "") +
+    defUser: (brief, pairs) =>
+      (brief ? `${brief}\n\n` : "") +
       "Для каждой пары ниже реши, описывает ли определение именно этот термин.\n" +
+      "Определение должно описывать термин так, как он используется в этой книге, а не вообще.\n" +
       `Ответь по одной строке на пару, в том же порядке:\nтермин ${SEP} да\nили\nтермин ${SEP} нет\n` +
       "Термин переписывай без изменений. Ничего, кроме этих строк, не пиши.\n\n" +
       "Пары:\n" +
       pairs.map((p, i) => `${i + 1}) ${p.term} ${SEP} ${p.definition}`).join("\n"),
+    trSystem:
+      "Ты — терминолог. Тебе дают справку о книге, термин из неё, предложение-контекст и уже " +
+      "принятые в этой книге соответствия. Ответь ТОЛЬКО тем русским названием, которым этот " +
+      "термин следует называть В ЭТОЙ книге — без пояснений, без кавычек, без точки в конце. " +
+      "Если по конвенции этой области термин не переводится (аббревиатура, имя собственное, " +
+      "название продукта или компании) — верни его без изменений. Если у термина есть " +
+      "устоявшийся русский эквивалент в этой области, бери его; дословный пословный перевод " +
+      "не годится.",
+    trUser: (it, brief, decided) =>
+      (brief ? `${brief}\n` : "") +
+      (decided.length
+        ? `Уже принято в этой книге:\n${decided.map((d) => `${d.term} → ${d.tr}`).join("\n")}\n`
+        : "") +
+      (it.sample ? `Контекст: ${it.sample}\n` : "") +
+      `Термин: ${it.term}`,
     echo: [
       "Термин переписывай без изменений",
       "Ничего, кроме эт",
       "ровно одно слово из списка",
+      "Не пересказывай словарное значение",
       "Обозначают ли они одно и то же понятие",
       "описывает ли определение именно этот термин",
+      "как он используется в этой книге",
+      "Если сомневаешься, отвечай да",
     ],
   },
   en: {
+    domainLine: (domain) => `Subject area of the book (key terms): ${domain}`,
+    briefLines: (p) =>
+      `Book: ${p.subject}\n` +
+      `For whom: ${p.audience}\n` +
+      `About: ${p.argument}\n` +
+      `Topics: ${p.topics.join(", ")}\n` +
+      `Vocabulary: ${p.vocab}\n` +
+      `Register: ${p.register}`,
+    profileSystem:
+      "You are an editor preparing a briefing about a book for other editors. You are given the " +
+      "title, the contents, the opening of the book and several excerpts from different pages of " +
+      "it. You write a short briefing in the given form.",
+    profileUser: (a) =>
+      (a.title ? `Title: ${a.title}\n` : "") +
+      (a.authors ? `Authors: ${a.authors}\n` : "") +
+      (a.toc ? `Contents: ${a.toc}\n` : "") +
+      (a.front ? `The opening of the book:\n${a.front}\n` : "") +
+      `\nExcerpts from pages ${a.pages}:\n${a.excerpts}\n\n` +
+      "Answer with exactly six lines and nothing else:\n" +
+      "FIELD: the discipline and the subject of the book, one line\n" +
+      "READER: whom it is written for, one line\n" +
+      "ABOUT: what the book argues and what it examines, exactly two sentences\n" +
+      "TOPICS: five to eight subject areas, comma-separated\n" +
+      "VOCABULARY: what kind of vocabulary is the main one in this book, one line\n" +
+      "REGISTER: the register of the exposition and how it addresses the reader, one line\n" +
+      "Write in English. Write nothing but those six lines.",
+    profileFields: [
+      ["FIELD", "subject"],
+      ["READER", "audience"],
+      ["ABOUT", "argument"],
+      ["TOPICS", "topics"],
+      ["VOCABULARY", "vocab"],
+      ["REGISTER", "register"],
+    ],
+    profileEcho: ["one line", "exactly two sentences", "subject areas, comma-separated"],
+    proposeSystem:
+      "You are a terminologist. You are given a briefing about a book and several pages of its " +
+      "text. You name the concepts this book rests on — the way the book itself names them.",
+    proposeUser: (brief, chunk) =>
+      (brief ? `${brief}\n\n` : "") +
+      "Below are excerpts from the book. Write out the terms of this book from them: the " +
+      "concepts, methods, objects of study and proper names without which the text cannot be read.\n" +
+      "Rules:\n" +
+      "— write the term exactly as it stands in the text, in the nominative singular if that " +
+      "form occurs in the text;\n" +
+      "— do not write out common words that mean nothing special in this book;\n" +
+      "— do not invent terms that are not in the excerpts;\n" +
+      "— between eight and twenty lines, one term per line, no numbering and no explanations.\n\n" +
+      `Excerpts:\n${chunk}`,
+    tailSystem:
+      "You are the editor of a term glossary. You are given a briefing about a book and lines a " +
+      "machine picked out of it by frequency. You decide, for each of them, whether it is a term " +
+      "of the book itself or merely an example that occurs in it. Answer with the given line " +
+      "format only.",
+    tailUser: (brief, items) =>
+      (brief ? `${brief}\n\n` : "") +
+      "Below are lines picked out of the book by their number of occurrences, and under each of " +
+      "them the sentence it was first met in. Frequency says nothing about whether a line is a " +
+      "term: a running example, a sample search query and a word out of a code listing all recur " +
+      "more often than many of the book's real terms. Look at the context: it shows what the " +
+      "book is talking about when it writes that line.\n" +
+      "For each line, decide whether it belongs to this book's terminology.\n" +
+      "Yes — concepts, methods, models, metrics and objects of study, and the abbreviations and " +
+      "acronyms accepted in this field, even if you do not know what they stand for.\n" +
+      "No — sample search queries and the examples the book demonstrates things on; titles of " +
+      "films, books and songs taken as samples; keywords, literals and identifiers out of code " +
+      "listings; common words and fragments of phrases.\n" +
+      "If you are in doubt, answer yes.\n" +
+      `Answer with one line per line of the list, in the same order:\nterm ${SEP} yes\nor\nterm ${SEP} no\n` +
+      "Rewrite the term unchanged. Write nothing but those lines.\n\n" +
+      `Lines:\n${listItems(items, "Context")}`,
     enrichSystem:
-      "You are a terminologist. You are given terms from one book; you decide what each of them " +
-      "denotes and describe it in one line. Answer with the given line format only — no " +
+      "You are a terminologist. You are given a briefing about a book and terms from it; you " +
+      "explain what each of them means IN THIS book. Answer with the given line format only — no " +
       "numbering, no headings, no explanations.",
-    enrichUser: (domain, items) =>
-      (domain ? `Subject area of the book (key terms): ${domain}\n\n` : "") +
+    enrichUser: (brief, items) =>
+      (brief ? `${brief}\n\n` : "") +
       "For each term in the list, output one line of the form\n" +
       `term ${SEP} type ${SEP} category ${SEP} definition\n` +
       "The type is exactly one word from this list: person, org, place, work, topic, term.\n" +
       NAMES_RULE.en +
       "The category is a one- or two-word genus: «metric», «data structure», " +
       "«algorithm».\n" +
-      "The definition is one sentence of up to 15 words, in English.\n" +
+      "The definition is one sentence of up to 15 words, in English, about what this concept is " +
+      "IN THIS VERY book and what role it plays in it. Do not retell the dictionary meaning of " +
+      "the word.\n" +
       "Rewrite the term unchanged. There must be exactly as many lines as there are terms. " +
       "Write nothing but those lines.\n\n" +
       `Terms:\n${listItems(items, "Context")}`,
     dupSystem:
       "You are a terminologist. You are given several spellings found in one book. You decide " +
       "whether they denote one and the same concept. Answer with exactly one line of the given form.",
-    dupUser: (domain, forms) =>
-      (domain ? `Subject area of the book (key terms): ${domain}\n\n` : "") +
+    dupUser: (brief, forms) =>
+      (brief ? `${brief}\n\n` : "") +
       "Spellings found in one book:\n" +
       forms.map((f, i) => `${i + 1}) ${f}`).join("\n") +
       "\n\nDo they denote one and the same concept?\n" +
@@ -385,19 +737,37 @@ const PROMPTS: Record<
     defSystem:
       "You are the editor of a term glossary. You are given terms and their definitions; you " +
       "decide whether each definition describes its own term. Answer with the given line format only.",
-    defUser: (domain, pairs) =>
-      (domain ? `Subject area of the book (key terms): ${domain}\n\n` : "") +
+    defUser: (brief, pairs) =>
+      (brief ? `${brief}\n\n` : "") +
       "For each pair below, decide whether the definition describes that very term.\n" +
+      "The definition must describe the term as it is used in this book, not in general.\n" +
       `Answer with one line per pair, in the same order:\nterm ${SEP} yes\nor\nterm ${SEP} no\n` +
       "Rewrite the term unchanged. Write nothing but those lines.\n\n" +
       "Pairs:\n" +
       pairs.map((p, i) => `${i + 1}) ${p.term} ${SEP} ${p.definition}`).join("\n"),
+    trSystem:
+      "You are a terminologist. You are given a briefing about a book, a term from it, a sentence " +
+      "of context and the renderings already accepted in this book. Answer with ONLY the English " +
+      "name this term should be called by IN THIS book — no explanation, no quotes, no full stop. " +
+      "If convention in this field leaves the term untranslated (an acronym, a proper name, a " +
+      "product or company name), return it unchanged. If the term has an established English " +
+      "equivalent in this field, take it; a literal word-by-word translation will not do.",
+    trUser: (it, brief, decided) =>
+      (brief ? `${brief}\n` : "") +
+      (decided.length
+        ? `Already accepted in this book:\n${decided.map((d) => `${d.term} → ${d.tr}`).join("\n")}\n`
+        : "") +
+      (it.sample ? `Context: ${it.sample}\n` : "") +
+      `Term: ${it.term}`,
     echo: [
       "Rewrite the term unchanged",
       "Write nothing but",
       "exactly one word from this list",
+      "Do not retell the dictionary meaning",
       "Do they denote one and the same concept",
       "whether the definition describes that very term",
+      "as it is used in this book",
+      "If you are in doubt, answer yes",
     ],
   },
 };
@@ -450,6 +820,23 @@ function sleep(ms: number, signal?: AbortSignal): Promise<void> {
 
 const paraText = (paras: readonly Paragraph[]): string => paras.map((p) => p.text).join("\n");
 
+/// A PDF Info field, or "". graphgen.ts:566 has the same three words.
+const str = (v: unknown): string => (typeof v === "string" ? v.trim() : "");
+
+/// Body prose only — the paragraphs clusterParagraphs typed "prose", dropping
+/// running heads and folios ("furniture"), figure captions and maths and table
+/// cells ("other"). The profile pass wants what the AUTHOR wrote, because the
+/// register and the vocabulary it is asked to name show up nowhere else.
+const prose = (paras: readonly Paragraph[]): Paragraph[] => paras.filter((p) => p.kind === "prose");
+
+/// The longest prose paragraph of a page, flattened and clipped. Empty when the
+/// page has no body prose at all — a plate, a full-page table, a part title.
+function longestProse(paras: readonly Paragraph[], clip: number): string {
+  let best = "";
+  for (const p of prose(paras)) if (p.text.length > best.length) best = p.text;
+  return best ? flat(best).slice(0, clip) : "";
+}
+
 async function pageParagraphs(doc: PDFDocumentProxy, n: number): Promise<Paragraph[]> {
   const page = await doc.getPage(n);
   const content = await page.getTextContent();
@@ -466,9 +853,15 @@ function spreadPages(total: number, want: number): number[] {
   return [...new Set(out)];
 }
 
-/// The only domain signal the aux model needs: the book's own heaviest terms.
-/// No embedded dictionaries anywhere, so this works for any book — it is the
-/// mechanism the first terminologist prompt used and the one thing it got right.
+/// The domain signal the aux model got before there was a book profile: the
+/// book's own heaviest terms. No embedded dictionaries anywhere, so it works for
+/// any book — it is the mechanism the first terminologist prompt used and the
+/// one thing it got right.
+///
+/// It is now the FALLBACK half of bookBrief and nothing calls it directly any
+/// more. It stays private and it stays correct: a bag of frequent strings is a
+/// weak brief, but it is the brief every glossary in existence was built with,
+/// and it is what a book that has not been read still has to offer.
 function domainOf(records: readonly TermRecord[]): string {
   return [...records]
     .sort((a, b) => (b.freq ?? 0) - (a.freq ?? 0))
@@ -635,6 +1028,195 @@ async function writeSidecar(bookPath: string, json: string): Promise<void> {
   }
 }
 
+// ---- the book profile -------------------------------------------------------
+//
+// What pass 1.5 writes and every prompt after it reads: six lines about what
+// this book is. It is a NEW FILE beside the .txt and the sidecar, and each of
+// the three places it could otherwise have gone is closed, permanently:
+//
+//   • a field of the sidecar — no. parseSidecar is an exact-match version gate
+//     (glossary.ts:645): it discards the WHOLE sidecar for any `v` it does not
+//     equal, so bumping SIDECAR_VERSION to make room would destroy every book's
+//     pages, freq, aliases, source, lang and target on the reader's disk. The
+//     profile is worth exactly none of that.
+//   • a header in the .txt — no, and not "not yet": glossary.ts:28 forecloses a
+//     metadata header in that file for ever, and the parser keeps a line it
+//     cannot understand verbatim, so a stray header would sit in the reader's
+//     own glossary until they deleted it by hand.
+//   • a field of TermRecord — no, for the reason «the sample sentence» gives
+//     above: graphgen.ts:645 spreads records wholesale into the Claude payload
+//     (`out.push({ ...rec, term })`), and README's privacy section promises that
+//     what leaves this machine is the metadata and the term list. Page-derived
+//     prose on a TermRecord is one spread away from breaking that.
+//
+// So: <appDataDir>/glossaries/<contentKey>.profile.json, through the same
+// metaDir/atomicWrite pair the sidecar uses, with the same pre-binding path-hash
+// fallback and the same localStorage flavour outside Tauri.
+
+export const PROFILE_VERSION = 1;
+export const PROFILE_EXT = ".profile.json";
+
+/// What one book says about itself, in the reader's language.
+///
+/// `ui` is the interface language the brief was WRITTEN in, and it is a field
+/// rather than an assumption because a reader who switches the interface to
+/// English must not be handed a Russian brief to prompt an English model with.
+/// bookBrief falls back to the old domain line in that case; the panel says so.
+export type BookProfile = {
+  v: 1;
+  /// The book's own language, as pass 1.5 was told or detected it.
+  lang: BookLang;
+  ui: Lang;
+  title?: string;
+  authors?: string;
+  /// The six answers. `subject` and `argument` are the two the pass refuses to
+  /// write a file without; the rest may legitimately come back empty.
+  subject: string;
+  audience: string;
+  argument: string;
+  register: string;
+  vocab: string;
+  topics: string[];
+  /// Date.now() at the write, so a later pass can say how old the brief is.
+  written: number;
+};
+
+const profileLsKey = (bookPath: string): string => `pdfer:glossprofile:${bookPath}`;
+const profileFile = async (bookPath: string, key = bookKey(bookPath) ?? hash(bookPath)): Promise<string> =>
+  joinPath(await metaDir(), `${key}${PROFILE_EXT}`);
+
+/// The sidecar's reader, one file over. Same two-step: the content key first,
+/// then the pre-binding path hash, because a session that ran before the book
+/// was content-bound wrote under the old name.
+async function readProfileText(bookPath: string): Promise<string | null> {
+  if (!IS_TAURI) return localStorage.getItem(profileLsKey(bookPath));
+  try {
+    return new TextDecoder().decode(await readFile(await profileFile(bookPath)));
+  } catch {
+    const key = bookKey(bookPath);
+    if (key === null || key === hash(bookPath)) return null;
+    try {
+      return new TextDecoder().decode(await readFile(await profileFile(bookPath, hash(bookPath))));
+    } catch {
+      return null;
+    }
+  }
+}
+
+async function writeProfileText(bookPath: string, json: string): Promise<void> {
+  if (!IS_TAURI) {
+    try {
+      localStorage.setItem(profileLsKey(bookPath), json);
+    } catch {
+      // quota — a brief is a nicety, and losing it costs one prompt line
+    }
+    return;
+  }
+  try {
+    await mkdir(await metaDir(), { recursive: true }).catch(() => {});
+    await atomicWrite(await profileFile(bookPath), new TextEncoder().encode(json));
+    const key = bookKey(bookPath);
+    if (key !== null && key !== hash(bookPath))
+      await remove(await profileFile(bookPath, hash(bookPath))).catch(() => {});
+  } catch (e) {
+    console.error("book profile save failed", e);
+  }
+}
+
+/// Read a book's profile, or null.
+///
+/// Null for a missing file, a truncated one, a JSON object of the wrong shape
+/// and a `v` that is not PROFILE_VERSION — and null is the ordinary case, not a
+/// failure: every book in the library has no profile until it has been read.
+/// Nothing here throws, so a caller may call it unguarded.
+///
+/// The version test is exact rather than "≥", the same way parseSidecar's is,
+/// and for the opposite reason: there is nothing here worth salvaging from a
+/// shape we do not know, and a wrong brief is worse than no brief because every
+/// prompt of every later pass would carry it.
+export async function loadProfile(bookPath: string): Promise<BookProfile | null> {
+  let raw: string | null;
+  try {
+    raw = await readProfileText(bookPath);
+  } catch {
+    return null;
+  }
+  if (!raw) return null;
+  try {
+    const o = JSON.parse(raw) as Partial<BookProfile>;
+    if (!o || typeof o !== "object" || o.v !== PROFILE_VERSION) return null;
+    const s = (v: unknown): string => (typeof v === "string" ? v : "");
+    if (!s(o.subject) || !s(o.argument)) return null; // the two the writer refuses to omit
+    return {
+      v: PROFILE_VERSION,
+      lang: (typeof o.lang === "string" ? o.lang : UND) as BookLang,
+      ui: o.ui === "en" ? "en" : "ru",
+      ...(s(o.title) ? { title: s(o.title) } : {}),
+      ...(s(o.authors) ? { authors: s(o.authors) } : {}),
+      subject: s(o.subject),
+      audience: s(o.audience),
+      argument: s(o.argument),
+      register: s(o.register),
+      vocab: s(o.vocab),
+      topics: Array.isArray(o.topics) ? o.topics.filter((t): t is string => typeof t === "string") : [],
+      written: typeof o.written === "number" ? o.written : 0,
+    };
+  } catch {
+    return null;
+  }
+}
+
+async function saveProfile(bookPath: string, profile: BookProfile): Promise<void> {
+  await writeProfileText(bookPath, JSON.stringify(profile));
+}
+
+/// The block every model prompt in this file starts with.
+///
+/// With a profile written under the interface language now in force, it is the
+/// six lines the book wrote about itself. Without one — or with one written
+/// while the interface was in the other language, which would put Russian
+/// context in front of an English question — it falls back to EXACTLY the line
+/// this file has always used: «Тематика книги (ключевые термины): …», built
+/// from the book's own heaviest terms.
+///
+/// That fallback is not a courtesy. It is what keeps passes 2 and 3 working
+/// unchanged on every glossary that exists today, which is all of them: nobody
+/// has a profile until they click «Прочитать книгу» once.
+export function bookBrief(profile: BookProfile | null, records: readonly TermRecord[]): string {
+  const lines = profileBrief(profile);
+  if (lines) return lines;
+  const p = prompts();
+  const domain = domainOf(records);
+  return domain ? p.domainLine(domain) : "";
+}
+
+/// The profile half of bookBrief on its own: the six lines the book wrote about
+/// itself, or "" when there is no usable profile. NEVER the frequency line.
+///
+/// This exists for exactly one caller and it is a fix, not a tidy-up. The veto
+/// (vetoMinedTail) asks the model whether a mined string is a term of this book
+/// or an example in it, and it used to be handed bookBrief — whose fallback is
+/// domainOf, the top TEN records BY FREQUENCY. On the reader's own second book
+/// that list is LED by «dark of the moon» at 56 occurrences, so with no profile
+/// on disk the veto prompt opened with «Тематика книги (ключевые термины): dark
+/// of the moon, star wars, …» and then asked, two paragraphs later, whether
+/// «dark of the moon» is a term of this book. The prompt answered its own
+/// question before the model read it, and the one string the whole pass exists
+/// to remove was the one it was told to keep.
+///
+/// The rule this enforces is structural rather than careful: a question about a
+/// list may not be prefaced by a brief BUILT FROM that list. domainOf is the
+/// only such brief in this file, so keeping it out is the whole of it — and the
+/// veto's caller additionally declines to run at all when this answers "",
+/// rather than asking blind (see proposeTerms, `vetoBrief`).
+///
+/// bookBrief keeps the fallback and keeps its meaning: passes 2 and 3 ask about
+/// terms they are simultaneously DESCRIBING, not selecting, so a bag of the
+/// book's heaviest strings is a weak brief there and not a circular one.
+function profileBrief(profile: BookProfile | null): string {
+  return profile && profile.ui === getLang() ? prompts().briefLines(profile) : "";
+}
+
 export type LoadedGlossary = {
   /// The file exactly as it is on disk — what the reader's textarea shows.
   text: string;
@@ -665,11 +1247,18 @@ export type SaveOptions = {
   ///
   /// This is the only way a line leaves the file outside a rebuild, and it is a
   /// parameter rather than a side effect on purpose: mergeRecords guarantees
-  /// every existing line survives byte for byte, so a fold that has to remove
+  /// every existing line survives byte for byte, so a pass that has to remove
   /// one has to say so out loud, at the call site, in a set the reader's
-  /// features can be audited against. Pass exactly what validateTerms folded
-  /// (`foldedKeys`) and nothing else — it already refused to fold anything the
-  /// reader typed.
+  /// features can be audited against.
+  ///
+  /// TWO passes are allowed to fill it, and no others. validateTerms' fold
+  /// (`foldedKeys`) was the first. proposeTerms' veto over the mined tail is
+  /// the second, and it was added when the veto was: the junk the miner ranks
+  /// — `dark of the moon`, `star wars`, `False` — is written by pass 1 before
+  /// any model exists to judge it, so pass 1.7 cannot merely decline to add
+  /// those lines, it has to take them back out. Both sets are built the same
+  /// careful way: only lines mayFold() allows, i.e. never a line the reader
+  /// typed.
   remove?: ReadonlySet<string>;
   /// termKeys whose DEFINITION is to be dropped from their line before the
   /// merge, the line otherwise left where it is.
@@ -831,7 +1420,7 @@ export type MineOptions = {
   fresh?: boolean;
 };
 
-type RawMine = { terms: MinedTerm[]; lang: BookLang; confidence: number };
+type RawMine = { terms: MinedTerm[]; lang: BookLang; confidence: number; lookup: TermLookup };
 
 /// Read the whole book and count. Statistics have no context limit, so unlike
 /// the graph — which samples — the glossary reads every page.
@@ -886,7 +1475,40 @@ async function runMine(doc: PDFDocumentProxy, opts: MineOptions): Promise<RawMin
     onProgress?.(n, total);
     if (n % 20 === 0) await tick();
   }
-  return { terms: miner.finish(), lang, confidence };
+  // The live miner leaves with the result. finish() is pure over the counts —
+  // terms.ts says so — so handing `lookup` out does not disturb the ranked list
+  // this call already produced, and it saves proposeTerms a second whole-book
+  // read. What it costs is the counts staying alive; rememberMiner bounds that.
+  return { terms: miner.finish(), lang, confidence, lookup: (t) => miner.lookup(t) };
+}
+
+// ---- the live miner ---------------------------------------------------------
+//
+// The counts a whole-book mining run built, kept for the length of a click or
+// two so that «Найти термины» followed by «Прочитать книгу» reads the book once
+// instead of twice. On the reader's 838-page book that is a minute saved and
+// 82 000 n-grams at roughly 75 MB held (graphgen.ts:196) — which is why the map
+// holds ONE book and drops the previous one the moment another book's miner is
+// built. The sample store above can afford four books because a sentence is
+// bytes; a miner cannot, because a miner is the book.
+//
+// It is deliberately not a cache in the sense of "answer from it later": the
+// counts describe the file as it stood when the read finished, and nothing
+// invalidates them. proposeTerms is the only reader, it runs in the same
+// sitting, and it treats the answer as evidence rather than as truth (freq 0
+// means unverified — see TermLookup).
+
+const MINER_BOOKS = 1;
+type HeldMiner = { lookup: TermLookup; terms: MinedTerm[] };
+const minersByBook = new Map<string, HeldMiner>();
+
+function rememberMiner(bookPath: string, held: HeldMiner): void {
+  minersByBook.delete(bookPath); // re-insert, so this book is the newest
+  minersByBook.set(bookPath, held);
+  for (const old of minersByBook.keys()) {
+    if (minersByBook.size <= MINER_BOOKS) break;
+    minersByBook.delete(old);
+  }
 }
 
 /// Pass 1. Model-free, always available, and it writes.
@@ -901,7 +1523,8 @@ export async function mineGlossary(
   opts: MineOptions = {},
 ): Promise<MineResult> {
   const fresh = opts.fresh === true;
-  const { terms, lang, confidence } = await runMine(doc, opts);
+  const { terms, lang, confidence, lookup } = await runMine(doc, opts);
+  rememberMiner(bookPath, { lookup, terms });
 
   const prev = fresh ? null : await loadGlossary(bookPath);
   // What counts as "already there", read as late as it can be read: this is the
@@ -956,6 +1579,7 @@ export async function mineGlossary(
     confidence,
     added: saved.added,
     updated: saved.updated,
+    lookup,
   };
 }
 
@@ -1080,8 +1704,43 @@ function cleanDefinition(raw: string, term: string, lang: Lang, sample?: string)
   if (!alphabetOk(g, lang)) return "";
   // The model quoting its context instead of defining the term — this file's
   // own junky() rule, which caught exactly this against a real model.
-  if (sample && sample.toLowerCase().includes(g.toLowerCase())) return "";
+  //
+  // NARROWED, and this reverses half of the original decision on purpose. The
+  // rule was `sample.includes(g)`: any definition that occurred anywhere inside
+  // the sample sentence was thrown away. That is exactly wrong for the pass
+  // this change builds — enrichUser now asks for a definition of what the term
+  // is IN THIS BOOK, and a definition grounded in the book will often reuse the
+  // author's own phrase for it. Rejecting those rejects the outcome we are
+  // after.
+  //
+  // What the rule was written to catch is a model copying its context wholesale
+  // instead of defining anything, so that is now what it tests: a VERBATIM RUN
+  // of ECHO_WORDS words, folded, against the clipped sample the model actually
+  // saw. Clipped, because only listItems' SAMPLE_IN_PROMPT characters ever
+  // reached the prompt (line ~411) while `sample` here is the miner's full
+  // 300-character sentence — comparing against the untruncated one would test
+  // for copying of text the model was never shown.
+  if (sample && copiesSample(g, sample)) return "";
   return g;
+}
+
+/// The length of a verbatim run that means "copied", in words.
+///
+/// Eight is chosen against the shape of the two texts rather than measured: a
+/// definition is capped at DEF_MAX=200 characters and runs 60-100 in practice,
+/// which is ten to fifteen Russian words, so eight consecutive words lifted out
+/// of a 160-character window is most of the answer. Below that the overlap is a
+/// term and its neighbours, which is what a book-grounded definition looks like.
+const ECHO_WORDS = 8;
+
+function copiesSample(definition: string, sample: string): boolean {
+  const seen = outNorm(flat(sample).slice(0, SAMPLE_IN_PROMPT));
+  if (!seen) return false;
+  const w = outNorm(definition).split(" ").filter(Boolean);
+  if (w.length < ECHO_WORDS) return false;
+  for (let i = 0; i + ECHO_WORDS <= w.length; i++)
+    if (seen.includes(w.slice(i, i + ECHO_WORDS).join(" "))) return true;
+  return false;
 }
 
 const CAT_JUNK = /[.!?;]$/;
@@ -1174,6 +1833,817 @@ async function pooled<T>(count: number, run: (k: number) => Promise<T>): Promise
   return out;
 }
 
+// ---- pass 1.5: the book profile ---------------------------------------------
+
+/// Outline headings, flattened to one line. Only the top two levels: a deep
+/// outline is mostly numbered subsections and says less about the subject
+/// matter than the chapter names it buries.
+///
+/// A TWIN of graphgen.ts:1138, copied character for character and NOT imported,
+/// for the reason NAMES_RULE above gives about itself: graphgen imports
+/// loadGlossary/saveGlossary from this module, and an import back would close a
+/// cycle. The duplication is load-bearing — both texts end up in front of the
+/// same model describing the same book — so change both together or neither.
+async function outlineHeadings(doc: PDFDocumentProxy): Promise<string> {
+  type Item = { title?: unknown; items?: Item[] };
+  const items = ((await doc.getOutline().catch(() => null)) ?? []) as Item[];
+  const out: string[] = [];
+  const walk = (list: Item[], depth: number): void => {
+    for (const it of list) {
+      const title = flat(str(it.title));
+      if (title && title.length <= 80) out.push(title);
+      if (out.length >= 40) return;
+      if (depth < 1 && it.items?.length) walk(it.items, depth + 1);
+    }
+  };
+  walk(items, 0);
+  const line = out.join(" · ");
+  return line.length > PROFILE_TOC ? `${line.slice(0, PROFILE_TOC - 1)}…` : line;
+}
+
+/// The six answers, before they become a BookProfile.
+type ParsedProfile = {
+  subject: string;
+  audience: string;
+  argument: string;
+  register: string;
+  vocab: string;
+  topics: string[];
+};
+
+/// How much of each answer is kept. `argument` is asked for as two sentences
+/// and gets room for two; the rest are one line each and one line is what the
+/// brief prints, so a model that writes a paragraph into the ТОН slot loses the
+/// paragraph rather than the brief.
+const PROFILE_FIELD_MAX: Record<ProfileField, number> = {
+  subject: 160,
+  audience: 160,
+  argument: 400,
+  topics: 200,
+  vocab: 160,
+  register: 160,
+};
+const PROFILE_TOPIC_MAX = 48;
+const PROFILE_TOPICS = 10;
+
+/// Read the six labelled lines back, or null.
+///
+/// Null is the model fault, and it is never a throw: the caller writes no file
+/// and the book stays unprofiled, which is the state every book is in until it
+/// has been read once.
+///
+/// Two things make a reply unusable. The FORM recited back — «ОБЛАСТЬ:
+/// дисциплина и предмет книги, одна строка» parses beautifully and says
+/// nothing, which is why profileEcho exists separately from `echo`. And an
+/// empty ОБЛАСТЬ or О ЧЁМ: those two are what every later prompt leans on, and
+/// a brief without them is worse than the frequency line it would replace.
+function parseProfile(raw: string): ParsedProfile | null {
+  const p = prompts();
+  for (const marker of p.profileEcho) if (raw.includes(marker)) return null;
+
+  // ё folds onto е for the LABEL only. A model asked for «О ЧЁМ» answers «О
+  // ЧЕМ» often enough that the alternative is discarding good briefs over a
+  // diacritic — and the reader's own book has adjacent paragraphs that spell it
+  // both ways. The VALUE is never folded: that is the reader's prose.
+  const fold = (s: string): string => s.replace(/ё/g, "е").replace(/Ё/g, "Е");
+  const got = new Map<ProfileField, string>();
+  for (const line of raw.split(/\r?\n/)) {
+    const cleaned = unbullet(line);
+    const colon = cleaned.indexOf(":");
+    if (colon <= 0) continue;
+    // Markdown bold and hashes come off the label; letters and spaces are all a
+    // label may be, and the six of them are a closed list.
+    const head = fold(cleaned.slice(0, colon))
+      .toUpperCase()
+      .replace(/[^\p{L} ]/gu, "")
+      .trim();
+    const hit = p.profileFields.find(([label]) => label === head);
+    if (!hit || got.has(hit[1])) continue;
+    // The other half of a markdown-bold label — «**ОБЛАСТЬ:** …» leaves its
+    // closing asterisks on the front of the value. Same leading-junk strip
+    // cleanDefinition uses, for the same reason.
+    const value = flat(cleaned.slice(colon + 1))
+      .replace(/^[-–—:•*_\s]+/, "")
+      .slice(0, PROFILE_FIELD_MAX[hit[1]]);
+    if (value) got.set(hit[1], value);
+  }
+
+  const subject = got.get("subject") ?? "";
+  const argument = got.get("argument") ?? "";
+  if (!subject || !argument) return null;
+  // The reader's alphabet, field by field. The measured defect this whole
+  // change answers is a model breaking into Chinese mid-sentence, and a brief
+  // that does it would carry the leak into every prompt after it.
+  const lang = getLang();
+  if (!alphabetOk(subject, lang) || !alphabetOk(argument, lang)) return null;
+
+  return {
+    subject,
+    audience: got.get("audience") ?? "",
+    argument,
+    register: got.get("register") ?? "",
+    vocab: got.get("vocab") ?? "",
+    topics: (got.get("topics") ?? "")
+      .split(/[,;]/)
+      .map((t) => flat(t).slice(0, PROFILE_TOPIC_MAX))
+      .filter(Boolean)
+      .slice(0, PROFILE_TOPICS),
+  };
+}
+
+export type ProfileOptions = {
+  /// The book's language. Given, it is believed; absent, it is detected from
+  /// the very pages this pass reads anyway, so the profile costs no extra read.
+  lang?: BookLang;
+  signal?: AbortSignal;
+  /// Counted in PAGES READ — at most PROFILE_FRONT_PAGES + PROFILE_PAGES of
+  /// them, so the bar finishes long before the model answers. The model call is
+  /// one call and has no progress to report; the panel's row goes on saying
+  /// «читаю» until it lands.
+  onProgress?: (done: number, total: number) => void;
+};
+
+/// Pass 1.5. One model call, one small file, and every prompt after it changes.
+///
+/// It reads its OWN sample and assumes no other pass has run: the PDF Info
+/// title and authors, the outline's top two levels, the opening prose of the
+/// first pages, and one excerpt from each of sixteen pages spread through the
+/// book. The excerpt is the LONGEST PROSE paragraph of its page rather than the
+/// first 350 characters, and that is not fussiness: the head of a page is the
+/// running head, the folio and a section heading far more often than it is a
+/// sentence, and a profile built from those describes the typesetting. What the
+/// brief is asked to name — the register, the vocabulary, whom the book is
+/// addressing — is visible in body prose and nowhere else.
+///
+/// It writes the file on success and NOTHING on failure. A dead aux server, a
+/// reply that failed its gate, a book with no prose in it at all: each resolves
+/// with `{ profile: null }`, and the book simply stays unprofiled, which is
+/// what bookBrief's fallback exists for.
+export async function profileBook(
+  doc: PDFDocumentProxy,
+  bookPath: string,
+  opts: ProfileOptions = {},
+): Promise<{ profile: BookProfile | null; aborted: boolean }> {
+  const { signal, onProgress } = opts;
+  try {
+    const total = doc.numPages;
+    const frontPages = Array.from({ length: Math.min(PROFILE_FRONT_PAGES, total) }, (_, i) => i + 1);
+    const excerptPages = spreadPages(total, PROFILE_PAGES);
+    const wantFront = new Set(frontPages);
+    const wantExcerpt = new Set(excerptPages);
+    const wanted = [...new Set([...frontPages, ...excerptPages])].sort((a, b) => a - b);
+
+    const frontParts: string[] = [];
+    const excerpts: string[] = [];
+    const excerptAt: number[] = [];
+    const detect: string[] = [];
+    let read = 0;
+    onProgress?.(0, wanted.length);
+    for (const n of wanted) {
+      if (signal?.aborted) abortErr();
+      const ps = await pageParagraphs(doc, n);
+      if (wantFront.has(n)) frontParts.push(paraText(prose(ps)));
+      if (wantExcerpt.has(n)) {
+        const ex = longestProse(ps, PROFILE_EXCERPT);
+        if (ex) {
+          excerpts.push(`[${n}] ${ex}`);
+          excerptAt.push(n);
+        }
+      }
+      // Detection rides along on pages that are being read regardless — the
+      // spread is exactly what booklang asks for and a title page alone is what
+      // it warns against.
+      if (ps.length && !isCitationPage(ps)) detect.push(paraText(ps));
+      onProgress?.(++read, wanted.length);
+      if (read % 8 === 0) await tick();
+    }
+
+    const info = (await doc
+      .getMetadata()
+      .then((m) => (m?.info ?? {}) as unknown as Record<string, unknown>)
+      .catch(() => ({}) as Record<string, unknown>)) as Record<string, unknown>;
+
+    const input: ProfileInput = {
+      title: flat(str(info.Title)).slice(0, 200),
+      authors: flat(str(info.Author)).slice(0, 200),
+      toc: await outlineHeadings(doc),
+      front: flat(frontParts.join(" ")).slice(0, PROFILE_FRONT),
+      pages: excerptAt.join(", "),
+      excerpts: excerpts.join("\n"),
+    };
+    // Nothing to describe. A book of scanned plates with no text layer reaches
+    // here, and asking a model about an empty prompt would earn an invented
+    // brief — the exact failure this pass exists to end.
+    if (!input.front && !input.excerpts) return { profile: null, aborted: false };
+
+    const p = prompts();
+    const raw = await auxAttempts(
+      [
+        { role: "system", content: p.profileSystem },
+        { role: "user", content: p.profileUser(input) },
+      ],
+      PROFILE_BUDGET,
+      signal,
+      (r) => !replyRejected(r, 6, 220, false, true) && parseProfile(r) !== null,
+    );
+    // Parsed twice on purpose: auxAttempts' `accept` answers a boolean and
+    // nothing else, and threading the parse out through a captured variable
+    // would trade one cheap re-parse for a nullability the compiler cannot
+    // follow into a callback.
+    const fields = raw === null ? null : parseProfile(raw);
+    if (!fields) return { profile: null, aborted: false };
+
+    const profile: BookProfile = {
+      v: PROFILE_VERSION,
+      lang: opts.lang ?? detectBookLang(detect).lang,
+      ui: getLang(),
+      ...(input.title ? { title: input.title } : {}),
+      ...(input.authors ? { authors: input.authors } : {}),
+      subject: fields.subject,
+      audience: fields.audience,
+      argument: fields.argument,
+      register: fields.register,
+      vocab: fields.vocab,
+      topics: fields.topics,
+      written: Date.now(),
+    };
+    await saveProfile(bookPath, profile);
+    return { profile, aborted: false };
+  } catch (e) {
+    // Only an abort changes control flow, and even that becomes a return here
+    // rather than a throw: the caller asked for a profile and gets the honest
+    // answer that there is none, with `aborted` saying whose decision that was.
+    if (isAbortErr(e) || signal?.aborted) return { profile: null, aborted: true };
+    console.error("book profile failed", e);
+    return { profile: null, aborted: false };
+  }
+}
+
+// ---- pass 1.7: terms the model names ----------------------------------------
+
+/// Does this proposal actually occur in the text the model was shown?
+///
+/// The «do not invent» gate. It cannot be a plain substring test, and the
+/// reason is the prompt's own next rule: it asks for the term «в именительном
+/// падеже единственного числа», and for a Russian book that form almost never
+/// occurs verbatim in running text. The page says «инвертированного индекса»,
+/// the model correctly answers «инвертированный индекс», and a literal test
+/// deletes it — while keeping every proposal the model failed to normalise.
+/// The same holds in English for any term the book uses in the plural.
+///
+/// So it folds first, with the project's own primitive (outNorm, as textsim
+/// prescribes for every comparison in this codebase), and then accepts either a
+/// folded substring or every token's first PROPOSE_STEM characters occurring in
+/// order and at word starts. Five characters is a stem in both languages this
+/// app reads; requiring them IN ORDER is what keeps the test from degenerating
+/// into "these letters appear somewhere on the page".
+function occursIn(chunkNorm: string, term: string): boolean {
+  const t = outNorm(term);
+  if (!t || !chunkNorm) return false;
+  if (chunkNorm.includes(t)) return true;
+  let from = 0;
+  for (const token of t.split(" ")) {
+    if (!token) continue;
+    const stem = token.slice(0, PROPOSE_STEM);
+    let at = chunkNorm.indexOf(stem, from);
+    // Word starts only. outNorm leaves exactly one space between tokens, so a
+    // stem matched mid-word belongs to some other word.
+    while (at > 0 && chunkNorm[at - 1] !== " ") at = chunkNorm.indexOf(stem, at + 1);
+    if (at < 0) return false;
+    from = at + stem.length;
+  }
+  return true;
+}
+
+/// One proposal per line, unbulleted, gated. Returns the surviving surface
+/// forms in reply order.
+function parseProposals(raw: string, chunkNorm: string): string[] {
+  const out: string[] = [];
+  const seen = new Set<string>();
+  for (const line of raw.split(/\r?\n/)) {
+    // unbullet knows "-", "*", "•" and "1."; the dash run is here because the
+    // prompt's OWN rules are written with «—» and a model mirrors the bullet it
+    // was shown. Left on, the dash would reach the reader's .txt as part of the
+    // term, and outNorm would hide it from every gate below.
+    const term = unbullet(line)
+      .replace(/^[-–—•*\s]+/, "")
+      .replace(/^[«"“'‘]+|[»"”'’]+$/g, "")
+      .replace(/[.;,:]+$/, "")
+      .trim();
+    if (!term || term.length > PROPOSE_TERM_CHARS) continue;
+    if (term.split(/\s+/).filter(Boolean).length > PROPOSE_TERM_WORDS) continue;
+    if (term.includes(SEP)) continue; // another prompt's line format leaking in
+    if (!/\p{L}/u.test(term)) continue;
+    if (!occursIn(chunkNorm, term)) continue;
+    const k = termKey(term);
+    if (!k || seen.has(k)) continue;
+    seen.add(k);
+    out.push(term);
+  }
+  return out;
+}
+
+// ---- the veto over the mined tail -------------------------------------------
+//
+// The one gate between the C-value miner and the reader's file, and the reason
+// it exists is the list at the top of this module: `dark of the moon` (a sample
+// search query, 56 occurrences, used as a running example), `star wars`, `cat
+// in the hat`, the Python literal `False` and the SQL keyword `SELECT` all
+// clear the miner's floors — MIN_FREQ 5 and minPages 2 — because they honestly
+// are frequent and honestly are spread through the book. Frequency has no
+// opinion about the difference between a term OF a book and an example IN it.
+// Nothing local can have one either: no dictionary ships with this app, and a
+// stoplist that knew those five strings would know nothing about the next
+// book's five. The only thing on this machine that can answer is the model
+// that has just been told what the book is, so it is asked — and "told what
+// the book is" is a precondition, not a figure of speech: the caller runs this
+// only against the book profile's own six lines, never against the frequency
+// line bookBrief falls back to, because that line is a summary of the very
+// list being judged. profileBrief holds the argument and proposeTerms holds
+// the guard.
+//
+// WHY THIS IS A REMOVAL AND NOT A DECISION NOT TO ADD. Pass 1 always runs and
+// always writes (see mineGlossary), and it writes the raw ranked list because
+// that is the honest answer to "no aux model installed". So by the time a model
+// exists to judge those strings they are already lines in the reader's .txt,
+// and declining to re-add them would leave every one of them exactly where it
+// is. The verdict therefore travels to saveGlossary's `remove`, the path
+// validateTerms' fold opened, under the same rule: only a line some pass wrote
+// may go, never one the reader typed. mayFold() answers that, from `source`,
+// and a line with no source at all is the reader's by definition — see
+// FOLDABLE_SOURCE.
+//
+// It is asked about the miner's list and NOT about what the model proposed in
+// this same pass. A proposal has already been judged, by this model, from the
+// page it stood on, under the same brief; asking twice would spend calls to
+// let a second sample of the same distribution overturn the first.
+//
+// IT IS ASKED WITH THE FIRST-OCCURRENCE SENTENCE, not about a bare string, and
+// on the reader's own list that is the difference between a veto and a coin
+// toss in BOTH directions. `False` and `SELECT` are indefensible as words and
+// obvious the moment their sentence shows a code listing around them; `SDBN`
+// and `ANN` are indefensible as words too — the model does not know what they
+// stand for, the prompt says so and tells it to answer «да» anyway — and their
+// sentence is what turns a guess into a reading. The sample is already in hand
+// at the call site (proposeTerms reads `m.sample` for rememberSamples two
+// statements after asking for the veto), so it costs a prompt and no work, and
+// it is rendered by listItems, exactly the way enrichUser renders it.
+//
+// The prompt this buys is still small against the aux slot. Twelve items of a
+// ≤64-character term plus SAMPLE_IN_PROMPT=160 characters of sentence is ~2.7
+// KB, the brief is ~700 characters and the instructions ~1.1 KB: some 4.5 KB,
+// which at Gemma's ~2.2 characters a token for Russian is ~2050 tokens, plus
+// defBudget(12) = 660 for the answer. The aux server is spawned `--parallel 4`
+// over `-c 16384`, and `-c` is the TOTAL that llama-server divides by the slot
+// count (measured: `--parallel 8 -c 24576` prints `n_ctx_slot = 3072`), so a
+// slot holds 4096 cells — `AuxState::CTX_PER_SLOT` in src-tauri/src/lib.rs —
+// and a full batch sits at roughly two thirds of one. That is the arithmetic
+// SAMPLE_IN_PROMPT was chosen against for enrichment and it holds here with a
+// shorter answer; if either number moves, redo it rather than assume it.
+//
+// A model fault costs nothing: auxAttempts answers null, parseVerdicts is not
+// reached, no key enters the set, and the tail lands exactly as it did before
+// this function existed. Same for a term the model simply skipped — an absent
+// verdict is absent, not a "no", which is the same rule the definition check
+// states in parseVerdicts and matters more here, because the thing at stake is
+// a whole line rather than a sentence of prose.
+//
+// WHAT IT DELIBERATELY DOES NOT DO: it does not remember. A «нет» removes the
+// line and nothing writes the refusal down, so a reader who runs pass 1 again
+// gets `dark of the moon` back — the miner still counts it — until pass 1.7
+// runs again and takes it out again. The two durable places a memory could go
+// are both closed: the sidecar is an exact-match version gate (glossary.ts:645,
+// see the note above loadProfile) and a bumped version would destroy every
+// book's bookkeeping on disk, and the .txt may not grow a metadata header
+// (glossary.ts:28). A refused term is also not an alias of anything, so pass
+// 3's `aliases` channel — which is how a FOLD is remembered — says the wrong
+// thing about it. Re-running one pass of a three-pass flow and getting that
+// pass's output is a cost the reader can see and understand; a fourth file
+// beside the .txt to spare them it is not.
+
+/// The termKeys the model refused, for the terms it was asked about. Empty for
+/// every kind of model fault, and never a throw except on abort — which pooled
+/// turns into "resolve with the verdicts that landed", so an interrupted veto
+/// removes what it managed to judge and keeps the rest.
+///
+/// `items` carry the miner's first-occurrence sentence where it has one; a term
+/// without a sample is still asked about, as a bare label, exactly as it was
+/// before. See the note above on why the sentence is the evidence here.
+///
+/// `brief` must be the PROFILE's brief and never bookBrief's fallback — the
+/// caller is required to have checked, and profileBrief says why at length.
+async function vetoMinedTail(
+  items: readonly PromptItem[],
+  brief: string,
+  signal: AbortSignal | undefined,
+  onChunk: () => void,
+): Promise<Set<string>> {
+  const out = new Set<string>();
+  if (!items.length) return out;
+  const p = prompts();
+  const chunks: PromptItem[][] = [];
+  for (let i = 0; i < items.length; i += TAIL_CHUNK) chunks.push(items.slice(i, i + TAIL_CHUNK));
+
+  const judged = await pooled(chunks.length, async (k) => {
+    const chunk = chunks[k];
+    const asked = chunk.map((it) => it.term);
+    const raw = await auxAttempts(
+      [
+        { role: "system", content: p.tailSystem },
+        { role: "user", content: p.tailUser(brief, chunk) },
+      ],
+      // The reply is defUser's, so the budget is defUser's — see defBudget.
+      defBudget(chunk.length),
+      signal,
+      // The definition check's whole-reply gate (see validateTerms): 120
+      // characters a line, the separator required, and NO alphabet requirement
+      // — the terms are in the BOOK's language, so a Russian reader vetoing an
+      // English book's tail gets a reply that is mostly Latin by design.
+      //
+      // 120 a line SURVIVES the context lines going into the prompt, and that
+      // was checked rather than assumed: the sentences went into the QUESTION,
+      // not the answer, and the answer is still «термин :: нет» — a mined term
+      // is counted under a key of at most MAX_KEY_CHARS=64 characters
+      // (terms.ts) and its label is that key's surface form, so a verdict line
+      // is ~72 and 120 is half again as much. Raising it would not help the one
+      // reply the samples make likelier, either: a model that answers «1. dark
+      // of the moon — Контекст: … :: нет» loses on parts[0] in parseVerdicts
+      // whatever length it is allowed, so rejecting it and letting auxAttempts
+      // ask a warmer one is strictly better than parsing it into nothing.
+      //
+      // And that is why the accept test is parseVerdicts and no longer
+      // hasVerdict. hasVerdict answers "some line of this reply carries a
+      // yes-or-no", which a reply of twelve «строка :: нет» lines satisfies
+      // while resolving against nothing — the batch then came back empty with
+      // all three attempts spent on a reply that was accepted on the first.
+      // The gate now asks the question the caller actually has: did any verdict
+      // land on a term we asked about? A no is a retry, and after three of them
+      // auxAttempts answers null and the tail survives, which is this pass's
+      // fail-open contract unchanged. (validateTerms keeps hasVerdict: its
+      // batch is pairs the reader already has definitions for, and re-asking
+      // costs a call to clear a sentence, not to delete a line.)
+      (r) => !replyRejected(r, chunk.length, 120, true, false) && parseVerdicts(r, asked).size > 0,
+    );
+    onChunk();
+    return raw === null ? new Map<string, boolean>() : parseVerdicts(raw, asked);
+  });
+
+  for (const part of judged)
+    if (part) for (const [term, keep] of part) if (!keep) out.add(termKey(term));
+  return out;
+}
+
+export type ProposeOptions = {
+  /// The book's language, for the miner this pass may have to build itself.
+  lang?: BookLang;
+  /// How many terms the file may end up holding after this run. Default
+  /// DEFAULT_CAP, as pass 1's.
+  cap?: number;
+  signal?: AbortSignal;
+  /// Counted in STEPS: a page read is one, a chunk answered is one, a veto call
+  /// is one. The unit is mixed on purpose — reading is what takes the wall
+  /// clock on an 838-page book, and a bar that stood still through forty pages
+  /// and then jumped would be a worse lie than a bar whose last dozen steps are
+  /// slower than its first eight hundred.
+  ///
+  /// The veto's share of `total` is RESERVED at its upper bound and the counter
+  /// is fast-forwarded when the veto ends, so a run whose tail was short
+  /// finishes with one jump. The alternative — announcing the veto's calls once
+  /// they are known — grows `total` mid-run, and a bar that walks backwards is
+  /// the one thing a progress report may never do. The share is zero on a book
+  /// with no profile, where the veto is known in advance not to run at all.
+  onProgress?: (done: number, total: number) => void;
+  /// The counts, from a mining run that already read this book. Absent, this
+  /// pass looks for one this session remembered, and failing that mines the
+  /// whole book itself.
+  lookup?: TermLookup;
+};
+
+/// Pass 1.7. The model names the book's terms; the miner counts them.
+///
+/// This is the half of the answer to «глоссарий получается мусорный» that the
+/// profile alone cannot give. Frequency ranked `dark of the moon` (a sample
+/// search query used 56 times as a running example) above half the real
+/// terminology of that book, and no prompt can repair a list that was chosen
+/// that way — so the model is asked to NAME the terms from the pages
+/// themselves, under the brief, and the miner is demoted to what it is good at:
+/// counting, and filling the tail.
+///
+/// Three rules hold the pass honest:
+///
+///   • A proposal that does not occur in its OWN chunk's page text is dropped.
+///     Folded, not literal — see occursIn — because the nominative singular the
+///     prompt asks for is usually not the form on the page.
+///   • A proposal the miner cannot count is KEPT, with no freq and no pages.
+///     terms.ts:105-113: lookup answers 0 for any phrase over MAX_N=4 tokens or
+///     straddling a clause boundary, which is precisely the good multiword term
+///     the model names and the miner structurally never saw. Rejecting on freq
+///     0 would throw away the class of term this pass exists to find.
+///   • Nothing is written when the model proposed nothing. The miner's own
+///     ranked list is pass 1's to write and it already did; a second writer for
+///     it would make «no aux model» look like a successful run. The veto rides
+///     on the same rule and therefore does not run either: a pass that could
+///     not get one proposal out of the model has no business deleting the
+///     reader's lines on that model's say-so.
+///   • The miner's ranked tail is VETOED before any of it is kept — the model
+///     is shown each candidate with the sentence the miner first met it in and
+///     asked whether it is a term of this book or an example in it. See
+///     vetoMinedTail for why that has to remove lines rather than merely
+///     decline to add them, and `vetoed` below for what the caller gets to say
+///     about it. It runs only when the book has a PROFILE, because the veto's
+///     brief may not be domainOf's frequency line — that line is built from
+///     the very ranking the veto is judging, and it would name `dark of the
+///     moon` as a key term of the book in the prompt that asks whether `dark
+///     of the moon` is one. profileBrief carries the full argument.
+export async function proposeTerms(
+  doc: PDFDocumentProxy,
+  bookPath: string,
+  opts: ProposeOptions = {},
+): Promise<{
+  added: number;
+  proposed: number;
+  /// Lines the model REFUSED off the miner's ranked tail, and this is a number
+  /// a panel should say out loud rather than fold into `added`: a run that
+  /// added eleven terms and threw four of pass 1's out did two different things
+  /// to the reader's file, and only one of them is visible by scrolling it.
+  ///
+  /// 0 also means «the veto did not run», which it does not on a book with no
+  /// profile and on a model fault alike. Both are fail-open by design and the
+  /// panel is right to report the same thing about them: nothing was removed.
+  vetoed: number;
+  records: SampledRecord[];
+  aborted: boolean;
+}> {
+  const { signal, onProgress } = opts;
+  const cap = opts.cap ?? DEFAULT_CAP;
+  const p = prompts();
+  const nothing = { added: 0, proposed: 0, vetoed: 0, records: [] as SampledRecord[] };
+  try {
+    const profile = await loadProfile(bookPath);
+    const prev = await loadGlossary(bookPath);
+    // No profile is not a failure — it is the ordinary state of a book nobody
+    // has read yet, and bookBrief answers it with the frequency line every
+    // prompt in this file carried before pass 1.5 existed.
+    const brief = bookBrief(profile, prev.records);
+    // …but the VETO may not have that fallback, and this is the one place in
+    // the file where the difference decides the outcome. bookBrief's fallback
+    // is domainOf: the ten heaviest records BY FREQUENCY. The veto's question
+    // is «is this frequent string a term of the book or an example in it», and
+    // its candidates are the same frequency ranking — so on the reader's own
+    // book the fallback would open the prompt with «Тематика книги (ключевые
+    // термины): dark of the moon, star wars, …» and then ask, below it,
+    // whether «dark of the moon» is a term. The evidence and the defendant
+    // would be the same list.
+    //
+    // So the veto takes profileBrief, which is the six lines or nothing, and
+    // when it is nothing the veto DOES NOT RUN. Asking blind was the other
+    // option and it is worse than it looks: this prompt's fail-open is «если
+    // сомневаешься, отвечай да», which only helps a model that knows enough to
+    // doubt, and a model told nothing about the book has no way to keep `SDBN`
+    // and `CLIR` — the acronyms it cannot expand — for the right reason. Not
+    // running is this pass's own contract for «the model could not answer»:
+    // the tail lands exactly as it does today, no worse than before the veto
+    // existed, and «Прочитать книгу» once is what turns it on.
+    const vetoBrief = profileBrief(profile);
+
+    const total = doc.numPages;
+    const pages = spreadPages(total, PROPOSE_PAGES);
+    const chunks: number[][] = [];
+    for (let i = 0; i < pages.length; i += PROPOSE_CHUNK_PAGES)
+      chunks.push(pages.slice(i, i + PROPOSE_CHUNK_PAGES));
+
+    const held = minersByBook.get(bookPath);
+    let lookup = opts.lookup ?? held?.lookup;
+    // The miner's ranked list is only available when THIS session mined; a
+    // caller that handed over a bare `lookup` gives us counts and no ranking.
+    // In the panel's flow that list has already been written to the file by
+    // pass 1, so there is nothing left for the tail to ADD — but there is now
+    // something left for it to take away, and without the ranking this pass
+    // cannot: the veto below judges the miner's own list, and an empty one is
+    // an empty veto. A caller that wants pass 1's junk re-examined has to hand
+    // over the miner that produced it (the panel does; `lookup` alone is the
+    // console's shortcut and keeps the console's old behaviour).
+    let ranked: MinedTerm[] = held?.terms ?? [];
+    let lang = opts.lang ?? (profile && profile.lang !== UND ? profile.lang : undefined);
+
+    const mineSteps = lookup ? 0 : total;
+    // The veto's calls are RESERVED rather than counted, because their number is
+    // not known until the model has answered about the pages — and a total that
+    // grows mid-run is a bar that walks backwards, which is a worse lie than a
+    // bar that jumps forward once at the end (see ProposeOptions.onProgress on
+    // the mixed unit). The bound is the whole ranked list, which the miner caps
+    // at `cap`; `done` is fast-forwarded to `steps` when the veto is through.
+    //
+    // Zero when there is no profile, because then the veto does not run at all
+    // (see `vetoBrief`): reserving calls that are already known not to happen
+    // would end every profile-less run with the bar jumping the last tenth,
+    // which is the same lie in the other direction.
+    const tailSteps = vetoBrief ? Math.ceil(cap / TAIL_CHUNK) : 0;
+    const steps = mineSteps + pages.length + chunks.length + tailSteps;
+    let done = 0;
+    onProgress?.(0, steps);
+
+    if (!lookup) {
+      const mined = await runMine(doc, {
+        lang,
+        cap,
+        signal,
+        onProgress: (n) => onProgress?.(n, steps),
+      });
+      lookup = mined.lookup;
+      ranked = mined.terms;
+      lang = mined.lang;
+      rememberMiner(bookPath, { lookup, terms: ranked });
+      done = mineSteps;
+    }
+    const counts = lookup;
+
+    // The excerpts, three pages a call. Furniture is dropped — a running head
+    // repeated on forty pages is the one string a model asked for «terms» will
+    // reliably name, and it is never one.
+    const chunkText: string[] = [];
+    const chunkNorm: string[] = [];
+    for (const group of chunks) {
+      const parts: string[] = [];
+      for (const n of group) {
+        if (signal?.aborted) abortErr();
+        const ps = await pageParagraphs(doc, n);
+        const body = ps.filter((q) => q.kind !== "furniture");
+        const text = flat(paraText(body)).slice(0, PROPOSE_PAGE_CHARS);
+        if (text) parts.push(`[${n}] ${text}`);
+        onProgress?.(++done, steps);
+      }
+      const joined = parts.join("\n");
+      chunkText.push(joined);
+      chunkNorm.push(outNorm(joined));
+      await tick();
+    }
+
+    const replies = await pooled(chunks.length, async (k) => {
+      if (!chunkText[k]) {
+        onProgress?.(++done, steps);
+        return [] as string[];
+      }
+      const raw = await auxAttempts(
+        [
+          { role: "system", content: p.proposeSystem },
+          { role: "user", content: p.proposeUser(brief, chunkText[k]) },
+        ],
+        PROPOSE_BUDGET,
+        signal,
+        // The «do not invent» gate is also the accept test: a reply from which
+        // not one line survives it is a reply about some other book, and a
+        // warmer retry is worth more than parsing it.
+        (r) => !replyRejected(r, 20, 70, false, false) && parseProposals(r, chunkNorm[k]).length > 0,
+      );
+      onProgress?.(++done, steps);
+      return raw === null ? [] : parseProposals(raw, chunkNorm[k]);
+    });
+
+    // Spellings a validation run folded away must not come back — mineGlossary's
+    // guard (see «aliased» there), for exactly its reason: without it pass 3
+    // folds a spelling and this pass proposes it again next run.
+    const aliased = new Set<string>();
+    for (const m of Object.values(prev.meta.terms ?? {}))
+      for (const a of m.aliases ?? []) aliased.add(termKey(a));
+    const have = new Set(parseGlossaryText(prev.text).map((r) => termKey(r.term)));
+
+    const seen = new Set<string>();
+    const proposals: string[] = [];
+    for (const part of replies)
+      if (part)
+        for (const term of part) {
+          const k = termKey(term);
+          if (!k || seen.has(k) || aliased.has(k)) continue;
+          seen.add(k);
+          proposals.push(term);
+        }
+    const kept = proposals.slice(0, PROPOSE_CAP);
+    if (!kept.length) return { ...nothing, records: prev.records, aborted: signal?.aborted === true };
+
+    const samples = new Map<string, string>();
+    const incoming: TermRecord[] = [];
+    for (const term of kept) {
+      const k = termKey(term);
+      const c = counts(term);
+      const rec: TermRecord = { term };
+      // freq 0 is «unverified», so the record simply carries neither number.
+      // Writing freq: 0 would be a claim the miner never made and would rank the
+      // term last in every panel that sorts by frequency.
+      if (c.freq > 0) {
+        rec.freq = c.freq;
+        if (c.pages.length) rec.pages = c.pages;
+      }
+      // The provenance stamp goes on the lines THIS RUN PUTS IN THE FILE and on
+      // no others, exactly as mineGlossary stamps "mined" and for its reason: a
+      // line the reader typed by hand must not have its provenance rewritten
+      // because the model happened to name the same term.
+      //
+      // The stamp is "model" and not a new TermSource. "model" is already what
+      // enrichTerms writes, FOLDABLE_SOURCE already answers for it, and adding
+      // a source would break two exhaustive Record<TermSource, …> tables for a
+      // decision — may a fold delete a proposed line? — that has the same answer
+      // as the one already there.
+      if (!have.has(k)) rec.source = "model";
+      incoming.push(rec);
+    }
+
+    // --- the miner's tail, and the model's veto over it
+    //
+    // The tail is the ranked list minus what the model already named. It is
+    // built in full BEFORE the cap is applied, and that is the difference
+    // between a veto and a decoration: the file already holds pass 1's whole
+    // ranked list, so a veto that only looked at the forty terms this run has
+    // room to add would leave the other eighty — `dark of the moon` among them
+    // if it happens to rank 41st — sitting in the reader's glossary with an
+    // invented definition, which is the defect this exists to end. Judging the
+    // list costs at most `tailSteps` calls of TAIL_CHUNK terms; keeping is
+    // still capped, so nothing about what the file may hold has changed.
+    const tail: MinedTerm[] = [];
+    for (const m of ranked) {
+      const k = termKey(m.term);
+      if (!k || seen.has(k) || aliased.has(k)) continue;
+      seen.add(k);
+      tail.push(m);
+    }
+    // Only lines a fold would be allowed to delete are ASKED about, and the
+    // question is settled by the same mayFold() that governs pass 3's fold:
+    // «нет» about a line the reader typed is an answer nothing may act on, so
+    // spending a model call to get it would be spending it to do nothing. A
+    // term with no line in the file yet is askable — this run is what would put
+    // it there. A line with no `source` at all is the reader's by FOLDABLE_
+    // SOURCE's rule and is left completely alone, which is also what protects
+    // a glossary whose sidecar was lost: no bookkeeping, no removals.
+    const owned = new Map(prev.records.map((r) => [termKey(r.term), r]));
+    const askable = tail.filter((m) => {
+      const own = owned.get(termKey(m.term));
+      return own === undefined || mayFold(own);
+    });
+    // The sentence the miner first met each candidate in travels with it. It
+    // is already here — the loop below reads `m.sample` for rememberSamples —
+    // and it is what lets the model see that `False` sits in a code listing
+    // and that `SDBN` sits in a sentence about click models. Absent for a term
+    // the miner found no clean sentence for, which listItems renders as the
+    // bare label the veto has always asked about.
+    //
+    // No `vetoBrief`, no call: see `vetoBrief` above for why asking blind is
+    // not the fallback, and vetoMinedTail's own header for what an empty set
+    // costs — nothing. The tail below then fills exactly as it did before the
+    // veto existed.
+    const vetoed = vetoBrief
+      ? await vetoMinedTail(
+          askable.map((m) => ({ term: m.term, sample: m.sample })),
+          vetoBrief,
+          signal,
+          // Clamped: `ranked` comes from a miner some other call may have built
+          // with a larger cap than this run's, and a bar that reads 13/10 is
+          // worse than one that pauses at 10/10 for a call or two.
+          () => onProgress?.(Math.min(++done, steps), steps),
+        )
+      : new Set<string>();
+    done = steps;
+    onProgress?.(done, steps);
+
+    // What survived the veto fills the tail, ranked, up to the run's cap.
+    for (const m of tail) {
+      if (incoming.length >= cap) break;
+      const k = termKey(m.term);
+      if (vetoed.has(k)) continue;
+      if (m.sample) samples.set(k, m.sample);
+      incoming.push(
+        have.has(k)
+          ? { term: m.term, pages: m.pages, freq: m.freq }
+          : { term: m.term, pages: m.pages, freq: m.freq, source: "mined" },
+      );
+    }
+    if (samples.size) rememberSamples(bookPath, samples);
+
+    // `lang` is passed only when it is a real answer. saveGlossary reads an
+    // absent one as «keep whatever the sidecar said», and writing UND over a
+    // language pass 1 detected would cost the miner its stoplists next run.
+    //
+    // `remove` carries the veto's «нет»s, and it is the second call site in
+    // this project allowed to fill it — see SaveOptions.remove. The keys that
+    // name no line in the file cost nothing there: stripLines removes the lines
+    // it finds and is silent about the rest.
+    const saved = await saveGlossary(bookPath, incoming, {
+      lang: lang && lang !== UND ? lang : undefined,
+      remove: vetoed,
+    });
+    return {
+      added: saved.added,
+      proposed: kept.length,
+      vetoed: vetoed.size,
+      records: withSamples(bookPath, applyMeta(parseGlossaryText(saved.text), saved.meta)),
+      aborted: signal?.aborted === true,
+    };
+  } catch (e) {
+    if (isAbortErr(e) || signal?.aborted) return { ...nothing, aborted: true };
+    console.error("term proposal failed", e);
+    return { ...nothing, aborted: false };
+  }
+}
+
 // ---- pass 2: enrichment -----------------------------------------------------
 
 type Enriched = { kind?: TermKind; category?: string; definition?: string };
@@ -1238,6 +2708,17 @@ export type EnrichOptions = {
   /// The language translations should be IN. Absent, the translation ladder
   /// does not run at all and no `translation` field is touched.
   target?: BookLang;
+  /// The book brief, ALREADY RENDERED — bookBrief(await loadProfile(path), recs).
+  ///
+  /// A string rather than a BookProfile, and rendered by the caller rather than
+  /// read here, because this pass opens nothing and is meant to go on opening
+  /// nothing (see `bookPath` above). One profile read per panel run serves the
+  /// enrichment, the translation ladder and pass 3 alike.
+  ///
+  /// Absent, the prompts fall back to domainOf over these very records, which
+  /// is byte for byte what they said before the profile existed — so a caller
+  /// that has not been taught about briefs still gets today's behaviour.
+  brief?: string;
   signal?: AbortSignal;
   /// Counted in TERMS covered, across both halves of the pass — a batch of
   /// twelve moves the bar by twelve when its reply lands.
@@ -1281,7 +2762,7 @@ export async function enrichTerms(
   // sentence pass 1 found comes back to them. A caller that never mined in this
   // session simply gets its records unchanged, and the prompts lose a line.
   const records = withSamples(opts.bookPath, input);
-  const domain = domainOf(records);
+  const brief = opts.brief ?? bookBrief(null, records);
 
   const asked = records.filter((r) => !r.kind || !r.category || !r.definition);
   const chunks: SampledRecord[][] = [];
@@ -1303,11 +2784,15 @@ export async function enrichTerms(
     const raw = await auxAttempts(
       [
         { role: "system", content: p.enrichSystem },
-        { role: "user", content: p.enrichUser(domain, items) },
+        { role: "user", content: p.enrichUser(brief, items) },
       ],
       enrichBudget(chunk.length),
       signal,
-      (r) => !replyRejected(r, chunk.length, 320, true, true),
+      // 320 → 360 characters a line: a definition that has to say what the term
+      // is IN THIS book and what role it plays there is longer prose than one
+      // that may recite a dictionary, and this ceiling is a runaway gate, not a
+      // style rule. Truncating a good batch here reads as a refusal.
+      (r) => !replyRejected(r, chunk.length, 360, true, true),
     );
     covered += chunk.length;
     onProgress?.(covered, total);
@@ -1341,6 +2826,7 @@ export async function enrichTerms(
     const need = out.filter((r) => !r.translation);
     const { pairs } = await translateTerms(need, {
       signal,
+      brief,
       useAux: await isAuxUp(),
       onProgress: (done) => onProgress?.(covered + done, total),
     });
@@ -1463,6 +2949,17 @@ function parseVerdicts(raw: string, asked: readonly string[]): Map<string, boole
 }
 
 export type ValidateOptions = {
+  /// The book brief, ALREADY RENDERED, exactly as EnrichOptions takes it and
+  /// for the same reason: this pass is a pure function over records and stays
+  /// one. Absent, both prompts fall back to domainOf over these records, which
+  /// is what they have always said.
+  ///
+  /// It matters more here than it looks: «описывает ли определение именно этот
+  /// термин» is a question about THIS book, and a judge that does not know what
+  /// the book is will confirm a dictionary definition of a term the book uses
+  /// in some other sense — which is how `CLIR :: концептуальный поиск` and
+  /// `ANN :: архитектура нейронной сети` survived a validation pass.
+  brief?: string;
   signal?: AbortSignal;
   /// Counted in MODEL CALLS — one per duplicate cluster plus one per batch of
   /// definitions. There is no term-shaped number here: most terms are in no
@@ -1550,7 +3047,7 @@ export async function validateTerms(
 ): Promise<ValidateResult> {
   const { signal, onProgress } = opts;
   const p = prompts();
-  const domain = domainOf(records);
+  const brief = opts.brief ?? bookBrief(null, records);
 
   const clusters = (await clusterDuplicates(records, signal)).map((g) =>
     // Heaviest spellings first: they are the ones the model has the best chance
@@ -1573,7 +3070,7 @@ export async function validateTerms(
     const raw = await auxAttempts(
       [
         { role: "system", content: p.dupSystem },
-        { role: "user", content: p.dupUser(domain, forms) },
+        { role: "user", content: p.dupUser(brief, forms) },
       ],
       DUP_BUDGET,
       signal,
@@ -1638,7 +3135,7 @@ export async function validateTerms(
     const raw = await auxAttempts(
       [
         { role: "system", content: p.defSystem },
-        { role: "user", content: p.defUser(domain, pairs) },
+        { role: "user", content: p.defUser(brief, pairs) },
       ],
       defBudget(chunk.length),
       signal,
@@ -1740,63 +3237,31 @@ const passesGates = (tr: string, term: string, sample?: string): boolean =>
 // needsTranslation already spares us.
 const keepAsIs = (term: string): boolean => /^[A-Z0-9][A-Z0-9.+/&-]*$/.test(term) && /[A-Z]/.test(term);
 
-// Retry framing for terms the contextual template fails to isolate: when the
-// segment is a short word contained in its own context (recall, IR, QAC…) the
-// model translates the whole sample instead of the term. An explicit English
-// instruction makes it NAME the term's translation; the model usually answers
-// with a restated sentence, so the actual translation is its LAST quoted span.
+// The terminologist's own prompt moved into PROMPTS with the other four — see
+// trSystem/trUser there. It used to be TR_PROMPTS, a second Record<Lang, …>
+// beside the first, and there was never a reason for two: the reason it says
+// what it says is the same reason (a term or a sample containing "Ctrl+" must
+// not be rewritten on macOS on its way into the model), and the brief it now
+// carries is rendered by the same bookBrief every other prompt reads.
 //
-// The target language used to be the literal word "Russian" here while the rest
-// of the pipeline asked for the interface language — a live defect for an
-// English reader, and the one change this file makes to a measured path. For a
-// Russian interface targetLanguage().en IS "Russian", so the measured wording is
-// unchanged; for an English one it stops asking a Russian question.
-const retryPrompt = (term: string, sample: string): string =>
-  `In the sentence "${sample}", translate the term "${term}" into ${targetLanguage().en}. ` +
-  `Output only the ${targetLanguage().en} translation of "${term}", nothing else.`;
-
-function lastQuoted(raw: string): string {
-  let last = "";
-  for (const m of raw.matchAll(/[«"“]([^«»"“”]+)[»"”]/g)) last = m[1];
-  return last.trim() || raw; // no quotes → the model obeyed → answer as-is
-}
-
-/// The aux terminologist's own prompt, which used to live in i18n as
-/// term.system/term.domain/term.context/term.term. It says what it always said,
-/// in both languages; what changed is that a term or a sample containing
-/// "Ctrl+" is no longer rewritten on macOS on its way into the model.
-const TR_PROMPTS: Record<Lang, { system: string; user: (t: PromptItem, domain: string) => string }> = {
-  ru: {
-    system:
-      "Ты — терминолог. Тебе дают термин из книги, тематику книги и предложение-контекст. " +
-      "Ответь ТОЛЬКО устоявшимся русским эквивалентом этого термина — без пояснений, без кавычек, " +
-      "без точки в конце. Если термин по общепринятой конвенции не переводится (аббревиатура, " +
-      "имя собственное, название продукта или компании) — верни его без изменений.",
-    user: (it, domain) =>
-      (domain ? `Тематика книги (ключевые термины): ${domain}\n` : "") +
-      (it.sample ? `Контекст: ${it.sample}\n` : "") +
-      `Термин: ${it.term}`,
-  },
-  en: {
-    system:
-      "You are a terminologist. You are given a term from a book, the book's subject area, and a " +
-      "sentence of context. Answer with ONLY the established English equivalent of that term — no " +
-      "explanation, no quotes, no full stop. If convention leaves the term untranslated (an " +
-      "acronym, a proper name, a product or company name), return it unchanged.",
-    user: (it, domain) =>
-      (domain ? `Subject area of the book (key terms): ${domain}\n` : "") +
-      (it.sample ? `Context: ${it.sample}\n` : "") +
-      `Term: ${it.term}`,
-  },
-};
-
-const auxMessages = (term: string, sample: string | undefined, domain: string): ChatMessage[] => {
-  const p = TR_PROMPTS[getLang()];
-  return [
-    { role: "system", content: p.system },
-    { role: "user", content: p.user({ term, sample }, domain) },
-  ];
-};
+// WHAT WENT WITH IT, and this reverses a measured decision, so it is worth
+// naming: retryPrompt and lastQuoted are gone, and the fallback ladder is one
+// attempt rather than two.
+//
+// retryPrompt was an ENGLISH INSTRUCTION — «In the sentence "…", translate the
+// term "…" into Russian. Output only the …» — sent through completeRaw to the
+// draft translation server, and lastQuoted then dug the answer out of whatever
+// prose came back. That worked against HY-MT1.5, an instruction-tuned model
+// that happened to translate. The draft server now runs TranslateGemma-12B,
+// which is a pure translation model: handed an English instruction it does the
+// only thing it knows how to do and TRANSLATES the instruction, so attempt 1
+// would return a Russian rendering of the sentence «In the sentence …, translate
+// the term …», which lastQuoted would then hand to the gates as a term. Two
+// attempts where the second is guaranteed junk is worse than one.
+//
+// What is left is the contextual call — translate(term, [], { context: sample })
+// — which is what attempt 0 always was and is exactly what a translation model
+// is for.
 
 // ---- the compatibility surface ----------------------------------------------
 //
@@ -1842,12 +3307,12 @@ export async function extractTerms(
 /// Translate mined terms, one per call, on the measured ladder. Route per term:
 ///   keep-as-is: acronym/symbol terms never hit a model — "BM25 = BM25" pins the
 ///     surface form so the translator leaves it alone.
-///   terminologist (useAux): one aux chat call per term (system role + domain
-///     line from the top mined terms + sample sentence). Attempt 1 retries
-///     warmer, because 0.2 is near-deterministic. The HY-MT ladder remains the
-///     last resort per term.
-///   fallback (no aux): the HY-MT ladder — attempt 0 the model-card contextual
-///     template, attempt 1 the instruction framing via retryPrompt.
+///   terminologist (useAux): one aux chat call per term (system role + the book
+///     brief + the terms already decided in this run + the sample sentence).
+///     Attempt 1 retries warmer, because 0.2 is near-deterministic. The draft
+///     model's contextual call remains the last resort per term.
+///   fallback (no aux): the draft model, contextual, once — see the note above
+///     for why the second rung of that ladder is gone.
 /// Every answer passes the same gates. Failed after everything → DROPPED and
 /// counted in `skipped`, never written as a "term = ?" line. On abort it
 /// resolves with whatever finished — callers merge the partial result.
@@ -1855,49 +3320,69 @@ export async function extractTerms(
 /// This is per-term on purpose and is the one pass that was NOT batched: a
 /// translation is one short answer whose quality depends on its own context
 /// sentence, and the ladder's fallbacks are per-term decisions.
+///
+/// THE PASS NOW HAS A MEMORY, and it costs something worth stating. `decided`
+/// grows as terms resolve and the last twelve pairs go into every later prompt,
+/// so a book that has already settled on «информационный поиск» does not render
+/// the next occurrence as «информационное извлечение». The cost is that the
+/// result depends on the order the three workers happened to finish in: the
+/// same list translated twice can differ. That is a real loss of
+/// reproducibility and it is accepted deliberately — a term list that
+/// contradicts itself is a defect the reader sees on every page, and a term
+/// list that differs between two runs is one nobody can see at all.
 export async function translateTerms(
   terms: readonly { term: string; sample?: string }[],
   opts: {
     onProgress?: (done: number, total: number) => void;
     signal?: AbortSignal;
+    /// The book brief, ALREADY RENDERED — see EnrichOptions.brief. Absent, the
+    /// prompt falls back to the domain line built from the first ten terms of
+    /// this very list, which is what this pass built for itself before there
+    /// were profiles.
+    brief?: string;
     // aux terminologist server confirmed up — use it as the primary path
     useAux?: boolean;
   } = {},
 ): Promise<{ pairs: TermPair[]; skipped: number }> {
   const { onProgress, signal, useAux } = opts;
+  const p = prompts();
   const domain = terms
     .slice(0, 10)
     .map((it) => it.term)
     .join(", ");
+  const brief = opts.brief ?? (domain ? p.domainLine(domain) : "");
   const out: (TermPair | null)[] = terms.map(() => null);
+  // What this run has already settled on, oldest first, shown to the model so
+  // the pass is internally consistent. Bounded at DECIDED_IN_PROMPT in the
+  // prompt; the array itself is bounded by the term list.
+  const decided: DecidedPair[] = [];
   let next = 0;
   let done = 0;
 
-  const hymtLadder = async (term: string, sample?: string): Promise<TermPair | null> => {
-    for (let attempt = 0; attempt < 2; attempt++) {
-      try {
-        const raw =
-          attempt === 1 && sample
-            ? lastQuoted(await completeRaw(retryPrompt(term, sample), signal))
-            : await translate(term, [], {
-                context: sample || undefined,
-                signal,
-              });
-        const tr = cleanTr(raw, term);
-        if (passesGates(tr, term, sample)) return { term, tr };
-      } catch {
-        if (signal?.aborted) return null;
-      }
+  const draftLadder = async (term: string, sample?: string): Promise<TermPair | null> => {
+    try {
+      const raw = await translate(term, [], { context: sample || undefined, signal });
+      const tr = cleanTr(raw, term);
+      if (passesGates(tr, term, sample)) return { term, tr };
+    } catch {
+      // A model fault is not a throw here either; the term simply goes
+      // untranslated and is counted in `skipped`.
     }
     return null;
   };
 
   const auxPath = async (term: string, sample?: string): Promise<TermPair | null> => {
+    const seenSoFar = decided.slice(-DECIDED_IN_PROMPT);
     for (let attempt = 0; attempt < 2; attempt++) {
       try {
-        const raw = await auxComplete(auxMessages(term, sample, domain), signal, {
-          temperature: attempt === 0 ? 0.2 : 0.7,
-        });
+        const raw = await auxComplete(
+          [
+            { role: "system", content: p.trSystem },
+            { role: "user", content: p.trUser({ term, sample }, brief, seenSoFar) },
+          ],
+          signal,
+          { temperature: attempt === 0 ? 0.2 : 0.7 },
+        );
         const tr = cleanTr(raw, term);
         if (passesGates(tr, term, sample)) return { term, tr };
       } catch {
@@ -1905,7 +3390,7 @@ export async function translateTerms(
         break; // aux server unreachable mid-run — no point in attempt 2
       }
     }
-    return hymtLadder(term, sample); // last resort for this term
+    return draftLadder(term, sample); // last resort for this term
   };
 
   const worker = async (): Promise<void> => {
@@ -1914,11 +3399,15 @@ export async function translateTerms(
       const k = next++;
       if (k >= terms.length) return;
       const { term, sample } = terms[k];
-      out[k] = keepAsIs(term)
+      const pair = keepAsIs(term)
         ? { term, tr: term }
         : useAux
           ? await auxPath(term, sample)
-          : await hymtLadder(term, sample);
+          : await draftLadder(term, sample);
+      out[k] = pair;
+      // A keep-as-is pin is not a decision the model made and teaching it
+      // «BM25 → BM25» wastes a line of every later prompt on nothing.
+      if (pair && pair.tr !== pair.term) decided.push(pair);
       done++;
       onProgress?.(done, terms.length);
     }

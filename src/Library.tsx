@@ -78,6 +78,13 @@ const hash = (s: string) => {
 };
 
 const collator = new Intl.Collator(getLang());
+
+/// Процент прогона — одной формулой на обе поверхности карточки (чип на
+/// обложке и строка состояния под ней). Считается от чисел САМОГО прогона, а
+/// не от переведённых страниц: правка стиля идёт по книге, у которой страницы
+/// уже все, и её знаменатель приносит она сама (booktranslate.ts:1694).
+const runPct = (run: RunInfo): number => (run.total ? Math.floor((100 * run.done) / run.total) : 0);
+
 const labelOf = (b: Book) => b.title || b.name;
 const isReading = (b: Book) => (b.progress ?? 0) > 0.005 && (b.progress ?? 0) < 0.995;
 
@@ -535,10 +542,15 @@ export default function Library({
   /// книгу не открывали.
   const cardState = (b: Book, run?: RunInfo): { text: string; cls: string } => {
     if (run) {
-      const pct = run.total ? Math.floor((100 * run.done) / run.total) : 0;
+      const pct = runPct(run);
+      // Проходов по книге два, а строка чисел на карточке одна — как и в
+      // карточке вкладки «Перевод», фазу называет существительное, а не второй
+      // индикатор. «правка 40%» вместо «перевод 40%»: без этого слова читатель
+      // видел бы, как процент у дочитанной, переведённой книги начинается
+      // заново, и решил бы, что перевод сбросился.
       return run.stalled
         ? { text: t("lib.stalled"), cls: "text-amber-700 dark:text-amber-500" }
-        : { text: t("lib.trPct", { pct }), cls: "text-accent" };
+        : { text: run.mode === "style" ? t("lib.stylePct", { pct }) : t("lib.trPct", { pct }), cls: "text-accent" };
     }
     const quiet = "text-neutral-400 dark:text-neutral-400";
     if (b.lastOpened == null && (b.progress ?? 0) <= 0.005) return { text: t("lib.notOpened"), cls: quiet };
@@ -911,14 +923,23 @@ export default function Library({
                     )}
                     {run && (
                       // the book is translating in the background — the run's live
-                      // percentage; amber = model unavailable, the engine waits and resumes
+                      // percentage; amber = model unavailable, the engine waits and resumes.
+                      // Второй проход отличается только подсказкой: чип — это
+                      // число, а какая работа за ним, говорит слово под ним
+                      // (cardState) и та же подсказка при наведении.
                       <div
                         className={`absolute top-2 right-2 rounded-full px-1.5 py-px text-[10px] font-medium tabular-nums text-white select-none ${
                           run.stalled ? "bg-amber-500" : "bg-accent"
                         }`}
-                        title={run.stalled ? t("lib.stalled") : t("lib.translating", { pct: run.total ? Math.floor((100 * run.done) / run.total) : 0 })}
+                        title={
+                          run.stalled
+                            ? t("lib.stalled")
+                            : run.mode === "style"
+                              ? t("lib.styling", { pct: runPct(run) })
+                              : t("lib.translating", { pct: runPct(run) })
+                        }
                       >
-                        {run.total ? Math.floor((100 * run.done) / run.total) : 0}%
+                        {runPct(run)}%
                       </div>
                     )}
                     {dead && (

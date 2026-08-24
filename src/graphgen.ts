@@ -40,7 +40,7 @@
 // article may be handed to Claude Code. Neither model reads the book: both are
 // shown the title, the authors, the tags and the mined term list, and both
 // answer with one line per term. That is what keeps a whole library's build
-// affordable, and it is also what keeps the local path honest — a 4B model can
+// affordable, and it is also what keeps the local path honest — a model can
 // type a term it is shown, and cannot summarise a book it is not.
 //
 // The two payloads are NOT the same, and the difference is a promise this
@@ -53,14 +53,63 @@
 // where the boundary is actually drawn.
 //
 // Two rules are load-bearing and easy to "fix" by accident. First, the aux
-// model is started for the deep pass and stopped in a `finally`, always:
-// two resident llama-servers plus page rasters do not fit comfortably in 16 GB,
-// and a background graph build must never sit on the GPU while the reader is
-// translating a book. Second, nothing here throws for a model problem — a
-// missing model, a dead server, a reply that failed every gate all return the
-// shard we already have, so the seed survives and a later run can try again.
-// Only an abort propagates, untouched, because a cancelled build must stop
-// rather than quietly write a half-shard.
+// model is started for the deep pass and RELEASED, always — but no longer at
+// the end of the book that took it: the lease now spans the whole QUEUE and is
+// given back when the queue drains (holdAux/releaseAuxWhenIdle below, and the
+// arithmetic that forced it). A background graph build must never sit on the
+// GPU once there is nothing left for it to build. Released, not stopped — that
+// word changed and the reason is below. Second, nothing here throws for a
+// model problem — a missing model, a dead server, a reply that failed every
+// gate all return the shard we already have, so the seed survives and a later
+// run can try again. Only an abort propagates, untouched, because a cancelled
+// build must stop rather than quietly write a half-shard.
+//
+// WHO ELSE IS ON PORT 11545. Until the Gemma swap the aux server was a 2,7 GB
+// Qwen3.5-4B that this module and the glossary panel each held for seconds at a
+// time, so `finally { aux_model_stop }` could be unconditional and the race it
+// lost was rare enough to live with. It is now one 14,2 GB Gemma-4-26B-A4B
+// shared by three consumers: this deep pass, every glossary pass in
+// GlossaryPanel, and the translation's style-editing pass, which holds it for
+// HOURS on a long book.
+// An unconditional stop would kill the model out from under whichever of them
+// was mid-generation, so the two commands take an owner name and the server
+// dies only when the last lease is released (src-tauri/src/lib.rs,
+// aux_model_start). Ours is "graph".
+//
+// The price of that sharing is throughput, and it is stated here rather than
+// discovered: auxComplete draws from ONE pool of at most three concurrent
+// requests (translate.ts, auxPool), so a style run and this queue interleave on
+// the same weights, and each roughly halves the other. graphrun keeps building
+// while a book is open — deliberately, and documented there — and nothing
+// pauses it for a style run, so on a book being style-edited the graph queue
+// will appear to stall for as long as that takes. It is not stuck; it is
+// sharing. Pausing graphrun's queue behind the style lease is the fix if that
+// ever becomes intolerable, and it belongs in graphrun's run manager, not here.
+//
+// The sentence that used to end that paragraph — «with the expert tensors in
+// system RAM» — described a spawn that no longer happens. `--cpu-moe` was the
+// default while both llama-servers were assumed to stay resident and the aux
+// model had ~4 GB of card to live in; the two passes are sequential now, so
+// the MoE model gets the whole card and moe_plan (lib.rs) answers «no MoE flag
+// at all» on this hardware — it keeps the flag only for a card that genuinely
+// cannot hold the experts, which this one can. Nothing
+// about the interleaving above changed — one server, one pool — only the
+// reason it is not slower still.
+//
+// WHAT A LEASE COSTS NOW, and it is why the lease outlives one book. Taking it
+// does not merely allocate: lib.rs's swap_out STOPS the draft translation
+// server so these weights can have the card, and the last release starts it
+// again (restore_after_handover). Per book that is two model loads — 14,2 GB in
+// and 7,3 GB back — for a queue that is going to want the same weights again in
+// a minute or two, so a library scan of N books paid 2N of them. The draft
+// server is always evictable (TranslationState leaves LlamaSrv::in_use at its
+// default `false`), which makes the thrash certain rather than likely. So the
+// lease is taken by the first book that needs it and released when graphrun's
+// listing empties, and the honest cost of that choice is stated where it is
+// paid: while the queue holds the lease the reader cannot translate, because
+// the draft server is parked in "swapping" for as long as the hold lasts. That
+// is the same trade the per-book lease made — it just stops making it forty
+// times over.
 
 import { invoke } from "@tauri-apps/api/core";
 import type { PDFDocumentProxy } from "pdfjs-dist";
@@ -78,14 +127,17 @@ import {
   type Provenance,
   type Shard,
 } from "./graphstore";
-// The Claude-pass switch is read from the queue module that owns it. The
-// import is a cycle — graphrun imports seedShard/deepen/canDeepen from here —
-// and it is safe because neither side calls across it while the modules are
-// evaluating: claudeDeepen is a hoisted function declaration, and nothing in
-// either module body invokes the other's exports at load time. Reading the
-// switch from its owner rather than copying the frozen localStorage key into a
-// second module is what stops the two copies drifting apart.
-import { claudeDeepen } from "./graphrun";
+// The Claude-pass switch is read from the queue module that owns it, and so is
+// the queue's own listing — releaseAuxWhenIdle needs to know when there is no
+// next book. The import is a cycle — graphrun imports seedShard/deepen/canDeepen
+// from here — and it is safe because neither side calls across it while the
+// modules are evaluating: all three of these are hoisted function
+// declarations, and nothing in either module body invokes the other's exports
+// at load time. Reading the switch from its owner rather than copying the
+// frozen localStorage key into a second module is what stops the two copies
+// drifting apart; reading the listing from its owner is the same argument
+// applied to state that only the run manager can know.
+import { claudeDeepen, listGraphRuns, onGraphRunsChange } from "./graphrun";
 import { baseName, claudeStatus, engineStatus } from "./host";
 import { getLang } from "./i18n";
 import { clusterParagraphs, type Paragraph } from "./paragraphs";
@@ -234,12 +286,35 @@ const CONCURRENCY = 3; // worker count; the actual requests share auxPool's budg
 const CO_PAIRS = 200; // co-occurrence edges kept for one book
 const CO_PER_PAGE = 24; // heaviest concepts per page that may form pairs (n² guard)
 const GLOSS_MAX = 160; // characters; a longer answer is an essay, not a gloss
-const AUX_START_MS = 90_000; // model load takes 10-30s; never hang a build on it
+// 90 s was right for the 2,7 GB Qwen that used to serve this port. The weights
+// behind 11545 are now 14,2 GB, and reading 14,2 GB off a cold page cache is
+// minutes, not seconds. (This used to say «with ~13,3 GB of experts faulted
+// into system RAM (--cpu-moe)». That flag is no longer the default: the two
+// servers are sequential now, so the MoE model gets the whole card. The number
+// this constant has to cover did not change — it is dominated by the read, not
+// by where the tensors land afterwards.) The
+// native side owns the real ceiling — AuxState::BOOT_POLLS = 600 half-second
+// polls, i.e. 300 s, after which the status becomes "dead" by itself — so this
+// number is deliberately STRICTLY GREATER than it. Set them equal and a load
+// finishing at 299 s is a coin flip: half the time the build gives up, the
+// `finally` releases the last lease, the server it was waiting for is killed
+// mid-load, and the next scan repeats the whole thing.
+const AUX_START_MS = 360_000; // > AuxState::BOOT_POLLS × 500 ms; never hang a build on it
 const AUX_PROBE_MS = 400; // canDeepen must answer in well under a second
 const AUX_HEALTH_MS = 1500; // one /health probe while waiting for the model to load
 const AUX_POLL_MS = 500; // between those probes
 const AUX_TRIES = 3; // attempts per model call, see auxAttempts
 const AUX_RETRY_MS = 2000; // pause before a retry, so a busy server can finish
+// The backstop on the cross-queue lease (releaseAuxWhenIdle). It is a leak
+// guard and NOT the policy: the lease is meant to be released when graphrun's
+// listing empties, and this timer only answers the case where that event never
+// arrives — a build that neither settles nor fails, a listener that was torn
+// off. Fifteen minutes is chosen, not measured: it has to sit far above the
+// gap between two deep passes, and that gap is a whole seed pass (the next
+// book's PDF read end to end, MINE_PAGES_MAX above), plus this file's own
+// AUX_START_MS ceiling of 360 s. Firing it inside that gap would buy back
+// exactly the thrash the hold exists to remove.
+const AUX_HOLD_MS = 900_000;
 
 // ---- prompts ----------------------------------------------------------------
 //
@@ -273,18 +348,22 @@ type Brief = { title: string; authors: string; tags: string; toc: string; front:
 // day they drift is the day the two engines type one library two ways.
 //
 // It says more than the six glosses it replaced, and the extra sentences are
-// there because of what a 4B model actually did with the short version. Handed
-// a technical book's term list it answered «work» for «recommender systems»,
-// «document», «search engine», «IR systems» and «large language models»,
-// «place» for «Internet» and «eCommerce sites», and «person» for «search engine
-// user» — fifteen spurious «work» nodes out of 117. The glosses were right
-// every time; the model understands the terms and simply cannot hold a six-way
-// closed vocabulary steady. So the rule now states the base rate («almost all
-// of them are term or topic»), says plainly that the other four kinds are for
-// NAMES, and hands over a test the model can apply to the label in front of it
-// — could this be written in lower case mid-sentence? Measured on the reader's
-// own 838-page book, this alone moves the count of proper-noun nodes from 29 to
-// 12 (see guardKind, which is what closes the rest).
+// there because of what a model actually did with the short version. The
+// measurement below was taken on the Qwen3.5-4B that served this port before
+// the Gemma swap; it is kept, with its provenance named, because a measured
+// failure does not stop being evidence when the weights change, and nobody has
+// repeated it on the 26B. Handed a technical book's term list it answered
+// «work» for «recommender systems», «document», «search engine», «IR systems»
+// and «large language models», «place» for «Internet» and «eCommerce sites»,
+// and «person» for «search engine user» — fifteen spurious «work» nodes out of
+// 117. The glosses were right every time; the model understands the terms and
+// simply cannot hold a six-way closed vocabulary steady. So the rule now states
+// the base rate («almost all of them are term or topic»), says plainly that the
+// other four kinds are for NAMES, and hands over a test the model can apply to
+// the label in front of it — could this be written in lower case mid-sentence?
+// Measured on the reader's own 838-page book, this alone moves the count of
+// proper-noun nodes from 29 to 12 (see guardKind, which is what closes the
+// rest).
 const NAMES_RULE = {
   ru:
     "person — имя человека, org — название организации, place — название места, " +
@@ -470,7 +549,7 @@ const STOP = stopLists(UND);
 // anybody, and the label we get to check is the miner's own dominant surface
 // form (see dominantForm), which is the spelling the book used in the middle of
 // its sentences rather than at the start of them. «Meryl Streep» carries the
-// mark. «recommender systems» does not, whatever a 4B model says about it.
+// mark. «recommender systems» does not, whatever the model says about it.
 //
 // The guard therefore OVERRULES the model on the four naming kinds and leaves
 // `topic` and `term` entirely to it — that distinction is a judgement about
@@ -1418,8 +1497,9 @@ export async function seedShard(
   ///
   /// The kind goes through guardKind exactly like a model's answer, and for the
   /// same reason: it CAME from a model — glossarygen's enrichment pass types
-  /// terms with the same 4B model and the same six-word vocabulary — and a 4B
-  /// model cannot hold that vocabulary steady. A glossary line that says
+  /// terms with the SAME weights on the same port and the same six-word
+  /// vocabulary — and the model measured on it could not hold that vocabulary
+  /// steady (see NAMES_RULE for the count). A glossary line that says
   /// «recommender systems :: work» would otherwise put a wrongly coloured node
   /// in a picture the reader is looking at, which is the whole reason the guard
   /// exists.
@@ -1675,15 +1755,96 @@ async function waitHealthy(deadline: number, signal: AbortSignal): Promise<boole
   }
 }
 
-// Bring the on-demand aux server (Qwen3.5-4B on 11545) up. Resolves false when
-// it cannot come up; the caller then keeps the seed shard. Modelled on
-// GlossaryPanel's ensureAux, which is private to that component — the same
-// status vocabulary, the same 90s ceiling so a build never hangs on a load.
+/// This module's name on the shared lease. See «WHO ELSE IS ON PORT 11545» at
+/// the top: the glossary panel holds "glossary" and the style pass holds
+/// "style:<bookPath>" against the same weights, and whoever releases last is
+/// the one who actually stops the server.
+const AUX_OWNER = "graph";
+
+// ---- one lease for the whole queue ------------------------------------------
+//
+// The lease used to be taken and given back once PER BOOK, in deepenLocally's
+// own `finally`, and that was right while a lease meant «14,2 GB stay resident
+// a little longer». It does not mean that any more: taking it stops the draft
+// translation server and the last release starts it again (see «WHAT A LEASE
+// COSTS NOW» at the top), so a queue of N books paid 2N model loads to keep
+// asking the same server the same kind of question.
+//
+// So the release is DEFERRED rather than immediate: deepenLocally arms it, and
+// it fires when graphrun's listing is empty — no book being built, none
+// waiting, none lingering after a failure. The next book's startAux disarms it
+// again, which is what makes the lease span the queue instead of the book.
+//
+// Three properties this has to keep, and each one is a line below:
+//
+//   • The armed release must never fire while a later deep pass is using the
+//     server. Owners are a SET keyed by name (lib.rs, aux_model_start), so a
+//     stale «graph» release would drop the very lease book two is standing on
+//     — hence holdAux() first thing in startAux, before the invoke.
+//   • It must not depend on an event that may never come. It does not, and
+//     the reason is that deepen() has exactly ONE caller — graphrun's
+//     runDeepen — so every deep pass in the app is a queued job with a run
+//     entry behind it. graphrun's build() emits from its own `finally` after
+//     removing that entry, stopAll() emits with the listing cleared, and a
+//     failed run's linger timer emits when it clears. The emit always arrives
+//     after this arming, because deepenLocally's `finally` runs while build()
+//     is still awaiting deepen().
+//   • It must not leak the lease if none of that ever happens. AUX_HOLD_MS is
+//     that backstop and nothing else.
+//
+// Not implemented in graphrun, where the queue lives, for one reason: this
+// module owns the lease. graphrun's own header says so in as many words — the
+// manager never touches the aux model's lifecycle — and a run manager that
+// took a lease it does not know when to spend would be the same mistake in the
+// other direction.
+let auxHold: { disarm: () => void } | null = null;
+
+/// This pass is why the weights are here: cancel any release the previous book
+/// armed. Idempotent and safe to call when nothing is armed.
+function holdAux(): void {
+  const held = auxHold;
+  auxHold = null;
+  held?.disarm();
+}
+
+/// Give the lease back once the queue has nothing left to build.
+function releaseAuxWhenIdle(): void {
+  if (auxHold) return; // already armed by an earlier book; one arming at a time
+  let off: (() => void) | null = null;
+  const stopWatching = (): void => {
+    auxHold = null;
+    off?.();
+    clearTimeout(timer);
+  };
+  const release = (): void => {
+    if (!auxHold) return; // already released, or disarmed by the next book
+    stopWatching();
+    invoke("aux_model_stop", { owner: AUX_OWNER }).catch(() => {});
+  };
+  const timer = setTimeout(release, AUX_HOLD_MS);
+  auxHold = { disarm: stopWatching };
+  // Subscribed rather than asked once: our own run is still in the listing at
+  // this moment — build() removes it after deepen() resolves — so the first
+  // honest answer to «is the queue empty?» can only come from a later event.
+  off = onGraphRunsChange(() => {
+    if (listGraphRuns().length === 0) release();
+  });
+}
+
+// Bring the on-demand aux server (Gemma-4-26B-A4B on 11545) up and take a lease
+// on it. Resolves false when it cannot come up; the caller then keeps the seed
+// shard. Modelled on GlossaryPanel's ensureAux, which is private to that
+// component — the same status vocabulary and the same ceiling, so a build never
+// hangs on a load.
 async function startAux(signal: AbortSignal): Promise<boolean> {
+  // Before anything else, including the failure paths below: a release armed
+  // by the previous book must not fire behind this one's back, and that is
+  // true whether or not the start below succeeds.
+  holdAux();
   const deadline = Date.now() + AUX_START_MS;
   let s: string;
   try {
-    s = await invoke<string>("aux_model_start");
+    s = await invoke<string>("aux_model_start", { owner: AUX_OWNER });
   } catch {
     return waitHealthy(deadline, signal); // plain browser: only the HTTP probe can answer
   }
@@ -1694,9 +1855,17 @@ async function startAux(signal: AbortSignal): Promise<boolean> {
     // probe, and «external» especially so: a server the reader started by hand
     // one second ago is reported «external» while it is still reading weights.
     if (s === "up" || s === "external") return waitHealthy(deadline, signal);
-    if (s === "dead" || s === "none") return false;
+    // Everything that is not «starting» is terminal, tested that way round
+    // rather than by naming the failures. The vocabulary grew with the swap —
+    // «nomem» (the machine has not got the RAM and the spawn was refused rather
+    // than left to thrash) and «crashed» (the process came up and exited on its
+    // own, which is almost always a VRAM refusal) joined «dead», «none» and
+    // «noengine» — and a list written by name would have spun against every one
+    // of them until this deadline, waiting for a server that is never coming.
+    // lib.rs (aux_model_status) asks callers for exactly this in so many words.
+    if (s !== "starting") return false;
     if (Date.now() >= deadline) return false;
-    await sleep(1500, signal); // "starting"
+    await sleep(1500, signal);
     try {
       s = await invoke<string>("aux_model_status");
     } catch {
@@ -1717,10 +1886,21 @@ async function startAux(signal: AbortSignal): Promise<boolean> {
 // through.
 const CJK_RE = /[\u3040-\u30ff\u4e00-\u9fff]/g;
 
-// Did the reply come back in the alphabet the reader reads? Qwen answers in
-// Chinese often enough that this is a real gate and not a formality, and a
-// Russian reader asking for Russian glosses and getting English ones has been
-// failed just as squarely.
+// Did the reply come back in the alphabet the reader reads? Two halves, and
+// after the model swap they rest on different evidence, which is worth saying
+// rather than quietly deleting half a gate.
+//
+// The CJK half was written against Qwen3.5-4B, which answered in Chinese often
+// enough for this to be a real gate rather than a formality. Gemma is not a
+// Chinese-centric model and may well never do it — but the same claim was true
+// of the translator until 10 paragraphs out of 2961 came back with 语言 and
+// 構築 wedged mid-sentence, so a measured gate is not removed on the strength
+// of a model's reputation. It costs one regex over a reply we are reading
+// anyway.
+//
+// The other half never depended on the weights at all: a Russian reader asking
+// for Russian glosses and getting English ones has been failed just as
+// squarely, and every multilingual model does that.
 function alphabetOk(text: string, lang: Lang): boolean {
   if (!text) return false;
   const cjk = text.match(CJK_RE)?.length ?? 0;
@@ -2104,7 +2284,7 @@ function applyDeep(
   asked: number,
 ): Shard {
   // Whom this book is BY. Those nodes are people on the metadata's authority,
-  // which is better evidence than a 4B model reading a term list, so the model
+  // which is better evidence than any model reading a term list, so the model
   // may add a gloss to one but never re-type it. Without the pin, the author
   // whose surname the deep pass now asks about (see deepen) could come back a
   // «work» and change colour in the picture.
@@ -2441,11 +2621,21 @@ async function deepenLocally(
     if (!typed.size && !head.tags.length && !head.summary) return null;
     return applyDeep(shard, head, typed, "local", terms.length);
   } finally {
-    // Always give the VRAM back — finished, cancelled or failed alike. Two
-    // resident models plus page rasters do not fit comfortably in 16 GB, and a
-    // background build must never sit on the GPU while the reader translates.
+    // Always give the lease back — finished, cancelled or failed alike — but
+    // give it back when the QUEUE is done, not when this book is. A background
+    // build must never sit on the GPU with nothing left to build; it also must
+    // not hand the card back to the draft server between two books that are
+    // both going to ask for it again (releaseAuxWhenIdle, and the arithmetic
+    // above it). With nothing else queued this is still immediate: the listing
+    // empties one event later and the release fires then.
+    //
+    // The LEASE, not the server: this call used to kill the child outright, and
+    // with three consumers on one set of weights that would now stop a glossary
+    // pass or an hours-long style edit mid-generation. The VRAM comes back when
+    // the last owner lets go.
+    //
     // (No-op outside Tauri, or when nothing was started; an externally run
     // server is left alone by the Rust side.)
-    invoke("aux_model_stop").catch(() => {});
+    releaseAuxWhenIdle();
   }
 }

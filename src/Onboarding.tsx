@@ -16,7 +16,9 @@ import { ACT, Check, CommandBlock, PRIMARY, QUIET } from "./Depends";
 import { CLAUDE, LLAMA, claudeStatus, engineStatus, type ToolStatus } from "./host";
 import { getLang, setLang, t, type Lang } from "./i18n";
 import {
+  LegacySpaceOffer,
   Progress,
+  TotalNote,
   cancelDownload,
   dlBusy,
   dlErrorLine,
@@ -270,9 +272,23 @@ export function Onboarding({ onDone }: { onDone: () => void }) {
                       {dl.status === "error" && (
                         <div className="text-xs text-red-600 dark:text-red-400">{dlErrorLine(dl.error)}</div>
                       )}
+                      {/* A first run AFTER an upgrade is exactly where the old
+                          weights are still on disk and where the reader has no
+                          reason to go hunting through Settings → Модели: this
+                          checklist is the whole of the app they have seen. The
+                          offer shows itself only when the download stopped for
+                          space, and only when there is really something there. */}
+                      {dl.status === "error" && <LegacySpaceOffer err={dl.error} />}
                       <div className="text-xs leading-relaxed text-neutral-500 dark:text-neutral-400">
                         {t("model.licenseShort")}
                       </div>
+                      {/* The second model is named here, before it is ever
+                          needed, rather than discovered after this download has
+                          already finished. The row above asks for 7,3 ГБ and
+                          nothing on this screen asks for more — the sum is a
+                          statement, and the editing model is offered later with
+                          its own size stated (Settings → Модели). */}
+                      <TotalNote />
                     </>
                   )
                 )}
