@@ -38,7 +38,8 @@ import type { TrParagraph } from "./booktranslate";
 import { hydrateGlossary, loadGlossaryText } from "./translate";
 import * as glossarygen from "./glossarygen";
 import { parseGlossaryLine, parseGlossaryText, termKey } from "./glossary";
-import { ModelSetupModal, fetchModelStatus, restartModel, statusUp, useDownload } from "./ModelSetup";
+import { ModelSetupModal, fetchModelStatus, modelFileReady, restartModel, statusUp, useDownload } from "./ModelSetup";
+import type { ModelStatus } from "./ModelSetup";
 import { AboutModal } from "./About";
 import { SettingsModal, TR_FONT_DEFAULT, TR_FONT_MAX, TR_FONT_MIN } from "./Settings";
 import { exportTranslationPdf, exportTranslationToDownloads, exportTranslationTxt } from "./export";
@@ -137,6 +138,40 @@ function exportReason(e: unknown): string {
   const s = String(e).replace(/^Error:\s*/, "");
   if (/ENOSPC|no space|disk\s*full|not enough space/i.test(s)) return t("err.noDiskSpace");
   return s.slice(0, 80);
+}
+
+// Есть ли что возвращать: хоть один абзац хранит trRaw — черновик, который
+// выдал переводчик и поверх которого правка стиля переписала tr
+// (booktranslate.ts:233). Глагол «Вернуть черновой перевод» показывается
+// только под этот ответ: предлагать снять правку там, где её нет, значит
+// обещать действие без последствий.
+//
+// ОТВЕЧАЮТ АБЗАЦЫ, А НЕ ЗАПИСЬ О МОДЕЛИ. Здесь стоял короткий выход
+// «if (!st?.styleModel) return false;» — обход начинался только у книги, где
+// правка хоть раз что-то написала. Он экономил обход и ломал сам глагол:
+// «Обновить перевод» стирает store.styleModel в прологе, ОДНИМ движением на
+// всю книгу (booktranslate.ts:1236), а trRaw снимает постранично, по мере
+// того как выметает страницы. Прерванное обновление оставляло на диске
+// черновики без записи о модели — и глагол отмены исчезал у книги, которой
+// было что вернуть.
+//
+// Починка выбрана здесь, а не там, и вторую («переносить delete в конец
+// пройденного насквозь обновления») booktranslate.ts:1228 разбирает и
+// отклоняет: она чинит одну сторону и ломает другую. styleModel по своему
+// объявлению (booktranslate.ts:283) — запись о том, ЧЬИ веса правили текст,
+// рядом с model; указателем на то, ГДЕ они правили, он был по случайности.
+// Больше его не читает никто.
+//
+// Обход дешевле, чем выглядит, и это важно — он идёт на КАЖДОЕ перечитывание
+// хранилища, то есть раз на страницу целого прогона. Правленая книга
+// обрывается на первом же найденном абзаце (во время самой правки он лежит на
+// первой же странице), а неправленая проходит все абзацы — это один проход по
+// объектам, уже разобранным из JSON тем же перечитыванием, рядом с которым он
+// стоит.
+function hasStyleDrafts(st: booktranslate.BookTranslation | null): boolean {
+  if (!st) return false;
+  for (const paras of Object.values(st.pages)) for (const p of paras) if (p.trRaw !== undefined) return true;
+  return false;
 }
 
 // for 1-2 word selections: pull the containing sentence out of the surrounding
@@ -1031,6 +1066,16 @@ export default function App() {
   // a run somewhere (any book) is waiting out a model outage: янтарная точка
   // на ярлыке вкладки «Перевод» здесь и строка на карточке в библиотеке (WP-N)
   const [anyStall, setAnyStall] = useState(false);
+  // Хранит ли книга черновики под правкой стиля — считается один раз на каждое
+  // перечитывание хранилища (hasStyleDrafts выше), а не на рендер: обход по
+  // абзацам в теле render шёл бы на каждое нажатие клавиши.
+  const [styleDrafts, setStyleDrafts] = useState(false);
+  // Лежит ли на диске модель правки (те же 14,2 ГБ, что и модель терминов).
+  // null — ещё не спрашивали или спросить не у кого (обычный браузер). Строку
+  // «модель правки не установлена» печатает сама карточка, а не строка модели
+  // внизу вкладки: та говорит про ЧЕРНОВОЙ сервер, и подменять её сообщением
+  // про вторую модель значило бы обвинить в простое не ту.
+  const [auxReady, setAuxReady] = useState<boolean | null>(null);
   // startTr is waiting for a "starting" model to come up (auto-starts then).
   // Ref, not state: ждать видно по строке модели в карточке «Перевод»
   const trWaitRef = useRef(false);
@@ -1328,6 +1373,16 @@ export default function App() {
               ? prev
               : { done: st.donePages.length, total: st.total },
           );
+          setStyleDrafts(hasStyleDrafts(st));
+          // Правка стиля не двигает ни donePages, ни updatedThrough — это её
+          // третье, независимое число (booktranslate.ts:280), — поэтому её
+          // страницы приходят сюда ровно так же, как страницы обновления:
+          // trInfo стоит на месте, а вся перерисовка держится на этом счётчике.
+          // Отдельного провода ей не понадобилось: подпись страницы (trPageSig)
+          // уже считает хеш по p.tr каждого абзаца, так что переписанный
+          // редактором абзац перерисовывает СВОЮ страницу и не трогает
+          // соседние. Событие на страницу приносит сам прогон — startStyleEdit
+          // зовёт onProgress после каждой записи хранилища.
           setTrVersion((v) => v + 1);
         }
       });
@@ -1351,6 +1406,24 @@ export default function App() {
     return () => {
       cancelled = true;
       window.clearInterval(t);
+    };
+  }, [doc, panelOpen, panelTab]);
+
+  // Модель правки: не опрос, а один вопрос к диску — есть ли файл. Опрашивать
+  // её сервер, как основной, нечем и незачем: он поднимается только по аренде
+  // и только на время прохода (решение об аренде — lib.rs `aux_model_stop`), а вне прохода
+  // «не запущен» — это норма, а не беда. Спрашиваем на открытие книги и на
+  // каждый заход на вкладку «Перевод»: скачивание живёт в соседней вкладке
+  // «Термины» (GlossaryPanel.tsx:494 спрашивает то же самое), и вернувшись оттуда,
+  // читатель обязан увидеть строку уже без отказа.
+  useEffect(() => {
+    if (!doc) return;
+    let cancelled = false;
+    modelFileReady("aux").then((v) => {
+      if (!cancelled) setAuxReady(v);
+    });
+    return () => {
+      cancelled = true;
     };
   }, [doc, panelOpen, panelTab]);
 
@@ -1600,10 +1673,28 @@ export default function App() {
     // опрос кладётся в modelStatus сразу, не дожидаясь фонового поллинга
     let status = await fetchModelStatus();
     setModelStatus(status);
-    if (status === "starting") {
+    // «swapping» ждём наравне с «starting», и это новый статус, а не мелочь.
+    // Два сервера больше не сидят на карте вдвоём: тот, кого попросили,
+    // забирает видеопамять у другого и оставляет ему «swapping»
+    // (src-tauri/src/lib.rs, swap_out). Значит, пока по ДРУГОЙ книге идёт
+    // правка стиля, черновой сервер стоит именно в этом состоянии — и он
+    // вернётся сам, как только аренда отпустится (restore_after_handover).
+    // Без этой строки такой статус проваливался в ветку ниже и открывал
+    // читателю окно загрузки модели, которая лежит на диске: не отказ, а
+    // неправда. Ждать — единственный честный ответ, и ждём ровно столько,
+    // сколько длится заём.
+    //
+    // `as string` здесь БОЛЬШЕ НЕТ. Обход перечисления стоял тут потому, что
+    // ModelStatus не знал про «swapping», хотя Rust его уже возвращал; теперь
+    // знает (ModelSetup.tsx, ModelStatus), и сравнение проходит по типу. Заодно
+    // этот статус получил свои слова на всех трёх поверхностях — строке модели
+    // в панели и обеих ветках ModelSetup, — так что ожидание здесь больше не
+    // молчаливое.
+    const waiting = (s: ModelStatus) => s === "starting" || s === "swapping";
+    if (waiting(status)) {
       trWaitRef.current = true;
       try {
-        while (status === "starting") {
+        while (waiting(status)) {
           await new Promise((r) => setTimeout(r, 2000));
           if (pathRef.current !== path || booktranslate.getRun(path)) return;
           status = await fetchModelStatus();
@@ -1629,12 +1720,56 @@ export default function App() {
     });
   }, [doc, path, openPanel]);
 
+  // «Выправить стиль» — второй проход по уже переведённой книге. Отдельный
+  // глагол, а не флаг у startTr, и ворота у него СВОИ.
+  //
+  // Ворота startTr выше стерегут ЧЕРНОВОЙ сервер (translation_status, порт
+  // 11544) и правы: без него чернового перевода не будет вовсе. Правку ведёт
+  // другая модель на другом порту, которая поднимается по аренде на время
+  // прохода и вне его не запущена никогда, — прогнать её статус через
+  // translation_status значило бы отказать из-за постороннего сервера, а
+  // дождаться «starting» от того, кого никто не просил стартовать, нельзя. У
+  // прохода есть свой опрос (booktranslate ensureAux) и своё честное «модели
+  // нет»: он возвращает хранилище нетронутым, не написав ни байта.
+  //
+  // Отказ здесь ровно один и он не про модель: launchRun отклоняет
+  // несовпадение режима (booktranslate.ts:2118), когда по этой же книге уже
+  // идёт черновой прогон. Печатает его та же строка карточки, что и отказ
+  // запуска перевода, — заводить второй язык для «не начался» незачем.
+  const startStyle = useCallback(() => {
+    if (!path) return;
+    setStartError(false);
+    booktranslate.startStyleRun(path).catch((e) => {
+      console.error("style run start failed", e);
+      if (pathRef.current === path) setStartError(true);
+    });
+  }, [path]);
+
+  // «Вернуть черновой перевод»: правка снимается целиком и разом. Прогон
+  // останавливает сам restoreDrafts (booktranslate.ts:1981) — по той же
+  // причине, по которой это делает retranslate ниже, — а App остаётся
+  // перечитать хранилище: страницы на экране держат уже правленый текст, и
+  // без перечитывания читатель увидел бы отмену только после перезапуска.
+  const restoreDrafts = useCallback(async () => {
+    if (!path) return;
+    await booktranslate.restoreDrafts(path).catch((e) => console.error("restore drafts failed", e));
+    if (pathRef.current !== path) return;
+    const st = await booktranslate.loadBookTranslation(path);
+    if (!st || pathRef.current !== path) return;
+    trStoreRef.current = st;
+    setStyleDrafts(hasStyleDrafts(st));
+    setTrVersion((v) => v + 1);
+  }, [path]);
+
   // «Проверить модель» на паузе (WP-N): спросить состояние заново и, если
   // модель так и не поднялась, открыть тот же вход, что и в отказе запуска
   const checkModel = useCallback(async () => {
     const s = await fetchModelStatus();
     setModelStatus(s);
-    if (s !== "starting" && !statusUp(s)) setSetupOpen(true);
+    // «swapping» — не отказ и не пропажа весов: карту забрала другая локальная
+    // модель, и черновой сервер вернётся сам. То же соображение, что в startTr
+    // выше, и так же без приведения типа: статус теперь есть в ModelStatus.
+    if (s !== "starting" && s !== "swapping" && !statusUp(s)) setSetupOpen(true);
   }, []);
 
   // «Перевести заново» (вкладка «Перевод»): drop the store, restart from page 1
@@ -1645,6 +1780,7 @@ export default function App() {
     if (pathRef.current !== path) return;
     trStoreRef.current = null;
     setTrInfo(null);
+    setStyleDrafts(false); // хранилища нет — снимать нечего, и глагол отмены уходит
     setView("orig");
     setTrVersion((v) => v + 1);
     startTr();
@@ -1722,12 +1858,14 @@ export default function App() {
     setAskSeed(null); // a stale seed must not leak into the next book's panel
     trStoreRef.current = null;
     setTrInfo(null);
+    setStyleDrafts(false);
     setViewMode(localStorage.getItem(`pdfer:view:${key}`) === "tr" ? "tr" : "orig");
     pathRef.current = key; // ahead of render, for the async loads' staleness guards
     booktranslate.loadBookTranslation(key).then((st) => {
       if (st && pathRef.current === key) {
         trStoreRef.current = st;
         setTrInfo({ done: st.donePages.length, total: st.total });
+        setStyleDrafts(hasStyleDrafts(st));
         setTrVersion((v) => v + 1);
       }
     });
@@ -1947,6 +2085,7 @@ export default function App() {
     // translating in the background — the library card shows its chip
     trStoreRef.current = null;
     setTrInfo(null);
+    setStyleDrafts(false);
     setHasText(null);
     hasTextProbeRef.current = null;
     pathRef.current = null;
@@ -2029,6 +2168,7 @@ export default function App() {
     if (p && p !== pathRef.current) return;
     trStoreRef.current = null;
     setTrInfo(null);
+    setStyleDrafts(false);
     setViewMode("orig");
     setTrVersion((v) => v + 1);
   }, []);
@@ -2537,15 +2677,39 @@ export default function App() {
   // trPct is a motionless 100% for its whole duration («прогресс-бар
   // потерялся») — the band must mirror the RUN's swept pages instead
   const runPct = run && run.total > 0 ? Math.floor((100 * run.done) / run.total) : 0;
-  const bandPct = run?.update ? runPct : trPct;
+  // Ловушка над этой строкой — не про обновление, а про ЛЮБОЙ проход по уже
+  // готовому хранилищу, поэтому здесь теперь «всё, кроме чернового». Правка
+  // стиля попадает в неё вернее обновления: она идёт по 100%-книге часами, и
+  // неподвижная сотня стояла бы весь этот срок. Условием было `run?.update`;
+  // флаг стал именем режима (booktranslate RunMode) ровно потому, что «не
+  // обновление» перестало быть полезным знанием, когда проходов стало три.
+  const bandPct = run && run.mode !== "fresh" ? runPct : trPct;
   // interrupted update watermark (store.updatedThrough mid-update): the idle
   // menu row resumes from here — surface the percentage so the click's effect
   // is legible before AND after the run
   const updPct = trInfo && (trStoreRef.current?.updatedThrough ?? 0) > 0
     ? Math.floor((100 * (trStoreRef.current?.updatedThrough ?? 0)) / Math.max(1, trInfo.total))
     : 0;
+  // Прерванная правка стиля (store.styledThrough), тем же правилом и по тому
+  // же знаменателю, что и updPct: доведённая до конца правка знак СНИМАЕТ
+  // (booktranslate.ts:1963), поэтому ноль здесь значит «правка либо не
+  // начиналась, либо пройдена вся», и глагол в карточке читается «Выправить
+  // стиль», а не «Продолжить · 0%».
+  const styledPct = trInfo && (trStoreRef.current?.styledThrough ?? 0) > 0
+    ? Math.floor((100 * (trStoreRef.current?.styledThrough ?? 0)) / Math.max(1, trInfo.total))
+    : 0;
+  // Какой из двух проходов идёт прямо сейчас — единственное, что карточка,
+  // ярлык вкладки и чип библиотеки должны знать о режиме. Считается ЗДЕСЬ и
+  // раздаётся пропсом: каждая поверхность, которая решала бы это сама, была
+  // бы четвёртым местом, где написано, что такое «правка».
+  const trPhase: "draft" | "style" = run?.mode === "style" ? "style" : "draft";
   // (WP-N) одно из четырёх состояний карточки вкладки «Перевод». Живой прогон
   // главнее хранилища: он знает и про паузу по недоступной модели (stalled).
+  // Пятое слово карточки, «Правится стиль», сюда не добавлено намеренно: это
+  // не состояние прогона, а его ФАЗА (trPhase выше). Состояния тут ровно
+  // четыре, и правка проходит через них теми же путями — идёт, встала,
+  // приостановлена, — иначе каждое место, что читает trState, обзавелось бы
+  // пятой веткой, которая ничем не отличается от «running».
   const trState: TrState =
     run !== null
       ? run.stalled
@@ -2609,6 +2773,23 @@ export default function App() {
           run: () => {
             openPanel("translate");
             void startTr();
+          },
+        });
+      // Второй проход — только по книге, переведённой ЦЕЛИКОМ: правка идёт по
+      // donePages, и на половине перевода она выправила бы половину книги, а
+      // потом её же пришлось бы догонять. Прерванная правка называется своим
+      // глаголом с процентом (tr.styleResume), а не cmd.resumeTr: «Продолжить
+      // перевод · 40%» над готовой книгой означало бы, что переведено 40%.
+      // Модель правки здесь не проверяется — ворота startStyle объясняют,
+      // почему; если её нет, проход честно вернётся, ничего не написав.
+      else if (trInfo !== null && trInfo.done >= trInfo.total)
+        paletteCommands.push({
+          id: "trstyle",
+          label: styledPct > 0 ? t("tr.styleResume", { pct: styledPct }) : t("cmd.styleBook"),
+          keywords: "стиль правка согласование опечатки style edit polish grammar",
+          run: () => {
+            openPanel("translate");
+            startStyle();
           },
         });
       if (trInfo !== null && trInfo.done > 0)
@@ -2684,7 +2865,8 @@ export default function App() {
         >
           {/* run progress — 2px band along the pill's bottom edge; the pill's
               composition stays constant so it never resizes mid-run (WP-H).
-              bandPct, not trPct: an update run's store is already 100% done.
+              bandPct, not trPct: an update run's store is already 100% done —
+              and so is a style run's, for its whole (much longer) duration.
               Акцент, пока идёт; янтарь, когда встало (WP-N) */}
           {trInfo && (trRun || trState === "paused") && (
             <span aria-hidden className="pointer-events-none absolute inset-0 overflow-hidden rounded-full">
@@ -2894,7 +3076,10 @@ export default function App() {
             onWidth={setPanelW}
             askCount={askCount}
             glossCount={glossaryTerms}
-            trPct={trInfo ? bandPct : null}
+            trPct={trInfo ? trPct : null}
+            trBandPct={trInfo ? bandPct : null}
+            trPhase={trPhase}
+            trRunning={trRun}
             trAttention={trState === "paused" || anyStall}
             outline={
               <Outline
@@ -2933,9 +3118,41 @@ export default function App() {
                 total={trInfo?.total ?? doc.numPages}
                 pct={bandPct}
                 eta={trState === "running" ? fmtEta(run?.etaMs) : undefined}
-                reason={run?.stalled ? t("tr.modelGone") : undefined}
+                // Причина остановки, а не только сам факт. «swapping» — не
+                // беда: карту забрала другая локальная модель (правка стиля по
+                // ДРУГОЙ книге, вкладка «Термины» или фоновая сборка графа), и
+                // прогон ждёт, потому что черновой сервер вернётся сам. Общее
+                // «модель недоступна» здесь читается как поломка, чинить
+                // которую читателю нечем, — и это была единственная вещь на
+                // экране, объяснявшая часовое ожидание.
+                //
+                // Разделитель дописывается ЗДЕСЬ, потому что у tr.modelGone он
+                // вшит в саму строку (« · модель недоступна»), а model.swapping
+                // живёт ещё и в строке модели, где стоит сам по себе. Одна
+                // фраза на два места — и клей там, где он нужен.
+                reason={
+                  run?.stalled
+                    ? run.stallReason === "swapping"
+                      ? ` · ${t("model.swapping")}`
+                      : t("tr.modelGone")
+                    : undefined
+                }
                 noTextLayer={hasText === false}
                 updPct={updPct}
+                phase={trPhase}
+                // Числа правки — СВОИ, а не done/total выше. Те считают
+                // переведённые страницы (donePages / doc.numPages) и на
+                // готовой книге равны 838 из 838; напечатать их под словом
+                // «выправлены» значило бы объявить книгу выправленной целиком
+                // под полосой, стоящей на 12%. Ран отдаёт свою пару: done —
+                // водяной знак правки, total — страниц в книге (тот же
+                // знаменатель, что у runPct, booktranslate.ts:1694).
+                styledDone={run?.mode === "style" ? run.done : 0}
+                styledTotal={run?.mode === "style" && run.total > 0 ? run.total : (trInfo?.total ?? doc.numPages)}
+                styledKept={run?.mode === "style" ? run.kept ?? 0 : 0}
+                styledPct={styledPct}
+                hasStyleDrafts={styleDrafts}
+                styleModelReady={auxReady}
                 glossaryTerms={glossaryTerms}
                 pdfExport={host().pdfExport}
                 pdfBusy={pdfBusy}
@@ -2947,6 +3164,8 @@ export default function App() {
                 onPause={() => void booktranslate.stopRun(path)}
                 onResume={() => void startTr()}
                 onUpdate={() => void startTr(true)}
+                onStyle={startStyle}
+                onRestoreDrafts={() => void restoreDrafts()}
                 onRetranslate={() => void retranslate()}
                 onCheckModel={checkModel}
                 onGlossary={() => openPanel("glossary")}

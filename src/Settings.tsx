@@ -16,10 +16,16 @@
 // (WP-N) Every row is built by one rule: name on the left, state as a number or
 // a word in the middle, the verb last. There are no explanatory sentences left —
 // the state took their place, and a row that has nothing to report shows nothing.
-// Destructive actions still name their volume («Delete the model: 4.1 GB») and
+// Destructive actions still name their volume («Удалить модель: 14,2 ГБ») and
 // still ask once, in red, right under the row. Model download/delete reuses
 // ModelSetup's machinery (shared download store, resumable .part; delete_model
 // in Rust only ever kills the llama-server WE spawned, never an external one).
+//
+// «Модели» carries three rows now, not two: the draft translator, the editing
+// and terms model, and — only while they are still on disk — the weights the
+// app used to run on. The third is the whole reason this window states a total:
+// two live models cost 21,5 ГБ, and the ~7 ГБ of dead ones beside them are the
+// first place to look for room.
 
 import { useCallback, useEffect, useRef, useState } from "react";
 import { open } from "@tauri-apps/plugin-dialog";
@@ -35,7 +41,9 @@ import {
   fetchDlSnapshot,
   sizeLabel,
   startDownload,
+  totalSize,
   useDownload,
+  useLegacyModels,
 } from "./ModelSetup";
 import type { ModelKey } from "./ModelSetup";
 import { listRuns, onRunsChange } from "./booktranslate";
@@ -72,6 +80,15 @@ const ACT_RED =
   "shrink-0 -mx-1 rounded-md px-1 text-xs text-red-600 dark:text-red-400 transition-colors hover:bg-red-500/10 disabled:pointer-events-none disabled:text-neutral-300 dark:disabled:text-neutral-600";
 // the state itself, when it doubles as the disclosure for a breakdown
 const STATE = "shrink-0 tabular-nums text-xs text-neutral-500 dark:text-neutral-400";
+// The same state, but the one that gives way when the row runs out of width.
+// Every other state in this window is a couple of words or a number; the model
+// rows now carry «Gemma 4 26B-A4B · 14,2 ГБ», which at the panel's narrow end
+// (w-[min(26rem,90vw)] on a small window) is wider than what is left after the
+// label. With STATE's shrink-0 the overflow pushes the row's verb — «Удалить» —
+// past the right edge, and a destructive row whose verb you cannot reach is a
+// worse outcome than a state you cannot read in full. So this variant shrinks
+// and truncates, and the full string stays available as the row's title.
+const STATE_SOFT = "min-w-0 truncate tabular-nums text-xs text-neutral-500 dark:text-neutral-400";
 const STATE_BTN = `${STATE} rounded-md transition-colors hover:text-neutral-700 dark:hover:text-neutral-200`;
 const STEP_BTN =
   "rounded-md px-1.5 transition-colors hover:bg-neutral-900/5 dark:hover:bg-neutral-100/10 disabled:pointer-events-none disabled:text-neutral-300 dark:disabled:text-neutral-600";
@@ -152,8 +169,8 @@ function Hint({ children }: { children: React.ReactNode }) {
 
 // ---- model row --------------------------------------------------------------
 
-/// «Translation model · HY-MT1.5 · 4.1 GB · Delete» — the model's name and what
-/// it costs on disk are one state, the verb is what to do about it.
+/// «Модель перевода · TranslateGemma-12B · 7,3 ГБ · Удалить» — the model's name
+/// and what it costs on disk are one state, the verb is what to do about it.
 function ModelRow({ model, label, desc, confirmNote }: { model: ModelKey; label: string; desc: string; confirmNote: string }) {
   const dl = useDownload(model);
   // undefined = ещё не читали диск; null = plain browser (нет Tauri)
@@ -202,8 +219,13 @@ function ModelRow({ model, label, desc, confirmNote }: { model: ModelKey; label:
         <span className="shrink-0">{label}</span>
         <span className="flex-1" />
         {!busy && (
-          <span className="flex items-center gap-3">
-            <span className={STATE}>{state}</span>
+          // min-w-0 on the group as well as on the state: without it the group's
+          // default min-width:auto floors at its content and the truncate never
+          // fires. The flex-1 spacer above collapses first, then this gives way.
+          <span className="flex min-w-0 items-center gap-3">
+            <span className={STATE_SOFT} title={state}>
+              {state}
+            </span>
             {partial && (
               <button className={ACT_BTN} onClick={() => startDownload(model)}>
                 {t("set.resume")}
@@ -231,6 +253,72 @@ function ModelRow({ model, label, desc, confirmNote }: { model: ModelKey; label:
         <Confirm
           note={confirmNote}
           verb={t("ui.delete")}
+          onYes={() => void doDelete()}
+          onNo={() => setConfirmDel(false)}
+        />
+      )}
+      {err && <div className="mt-1 text-xs text-red-600 dark:text-red-400">{err}</div>}
+    </div>
+  );
+}
+
+/// «Старые модели · HY-MT1.5 и Qwen3.5 больше не используются · 7,4 ГБ ·
+/// Удалить». The weights the app used to run on, which after the model swap no
+/// code path names any more: unreachable bytes in roaming AppData while the two
+/// rows above ask for 21,5 ГБ. They are offered and never taken — those bytes
+/// cost hours of bandwidth and a downgraded build would need them back
+/// (src-tauri/src/lib.rs `delete_model`), so nothing here ever deletes on its own.
+///
+/// The row shows itself only when there is something to delete: legacy_models_scan
+/// reports every table entry, present or not, and useLegacyModels keeps the
+/// present ones. A row promising to free bytes that are not there would be the
+/// one lie this window cannot afford.
+function LegacyModelsRow() {
+  const legacy = useLegacyModels(true);
+  const [confirmDel, setConfirmDel] = useState(false);
+  const [err, setErr] = useState<string | null>(null);
+
+  const doDelete = async () => {
+    setConfirmDel(false);
+    try {
+      await legacy.remove();
+      setErr(null);
+    } catch (e) {
+      // the same two outcomes as the model rows: a live download holding the
+      // .part, or another process holding the file open
+      setErr(String(e).includes("busy") ? t("set.deleteBusy") : t("set.deleteFail"));
+    }
+  };
+
+  if (!legacy.present) return null;
+  const note = t("set.modelsLegacyNote", { size: fmtSize(legacy.bytes) });
+
+  return (
+    <div className="py-1.5">
+      <div className="flex items-center gap-3">
+        <span className="shrink-0">{t("set.modelsLegacy")}</span>
+        <span className="flex-1" />
+        <span className="flex min-w-0 items-center gap-3">
+          <span className={STATE_SOFT} title={note}>
+            {note}
+          </span>
+          {!confirmDel && (
+            <button className={ACT_RED} onClick={() => setConfirmDel(true)}>
+              {t("ui.delete")}
+            </button>
+          )}
+        </span>
+      </div>
+      {/* The one place this row departs from ModelRow, which repeats a bare
+          «Удалить» in its confirmation: two files go at once here, and the last
+          click before an irreversible 7 GB is the right place to spell out what
+          it is deleting. The note keeps the house shape — the verb, a colon,
+          the bytes it frees — so the three model confirmations still read as
+          one family. */}
+      {confirmDel && (
+        <Confirm
+          note={t("set.modelsLegacyConfirm", { size: fmtSize(legacy.bytes) })}
+          verb={t("set.modelsLegacyDelete")}
           onYes={() => void doDelete()}
           onNo={() => setConfirmDel(false)}
         />
@@ -857,6 +945,16 @@ export function SettingsModal({
           desc={t("set.modelTermsDesc")}
           confirmNote={t("set.modelTermsConfirm", { size: sizeLabel("aux") })}
         />
+        {/* (WP-N) two rows of gigabytes want a sum, and this one is worth its
+            line because the number is large: 7,3 + 14,2. It is not a Hint —
+            nothing above it is a switch and nothing here is being explained —
+            it is the state of the pair, printed where the reader who came here
+            asking where the disk went will look. Onboarding states the same sum
+            under its licence line; Settings is where it is checked. */}
+        <div className="pb-1.5 text-xs text-neutral-500 dark:text-neutral-400">
+          {t("set.modelsTotal", { size: totalSize() })}
+        </div>
+        <LegacyModelsRow />
         <DependencyRow
           label={t("set.engine")}
           status={deps.engine}

@@ -289,7 +289,7 @@ export function TranslatePopover({
   // noTranslate mounts with its full text so the one-shot placement below
   // measures the real height (no stream will ever grow it)
   const [out, setOut] = useState(() => (noTranslate ? text : ""));
-  const [phase, setPhase] = useState<"stream" | "done" | "starting" | "nomodel" | "dead" | "error">(
+  const [phase, setPhase] = useState<"stream" | "done" | "starting" | "swapping" | "nomodel" | "dead" | "error">(
     noTranslate ? "done" : "stream",
   );
   const [copied, setCopied] = useState(false);
@@ -312,6 +312,14 @@ export function TranslatePopover({
     if (n < 3) localStorage.setItem(ALT_HINT_KEY, String(n + 1));
   }, [noTranslate]);
 
+  // Один проход, черновой моделью, и второго здесь не будет. Правка стиля —
+  // фоновая работа на часы, а это поверхность с видимыми секундами (footer
+  // печатает, сколько заняло): её 26B-модель пришлось бы поднимать по аренде,
+  // десятки секунд, ради двухсекундного действия; трём выделенным словам не с
+  // чем расходиться — контекста книги у них нет; и ничего отсюда не
+  // сохраняется, так что исправлять постфактум нечего. Если правка когда-нибудь
+  // здесь понадобится, это будет ВТОРОЕ явное действие над готовым текстом, а
+  // не смена пути по умолчанию.
   useEffect(() => {
     if (noTranslate) {
       setOut(text);
@@ -335,7 +343,17 @@ export function TranslatePopover({
           if (ctrl.signal.aborted) return;
           if (statusUp(status)) break;
           if (status === "dead") return setPhase("dead");
-          setPhase(status === "starting" ? "starting" : "nomodel");
+          // Каждое состояние названо по имени, и последняя ветка — не «всё
+          // остальное». Именно так сюда попадал "swapping": он не "starting",
+          // значит «nomodel», значит попап печатал «Для перевода нужна модель ·
+          // Скачать 7,3 ГБ» — про веса, которые лежат на диске, пока карту
+          // минуту держит вторая модель (src-tauri/src/lib.rs:1164, swap_out).
+          // Та же ловушка, из-за которой "swapping" пришлось внести в союз
+          // статусов (ModelSetup.tsx:25). В «nomodel» остаются ровно два
+          // статуса, где переводить и правда нечем: "none" (веса не скачаны) и
+          // "noengine" (нет llama.cpp) — второй ведёт в тот же экран настройки,
+          // а он умеет показать установку движка (ModelSetup.tsx:686).
+          setPhase(status === "swapping" ? "swapping" : status === "starting" ? "starting" : "nomodel");
           await sleep(2500, ctrl.signal);
         }
         setPhase("stream");
@@ -414,6 +432,18 @@ export function TranslatePopover({
         {phase === "starting" ? (
           <span className="flex items-center gap-2 text-neutral-500 dark:text-neutral-400">
             <Spinner /> {t("model.startingShort")}
+          </span>
+        ) : phase === "swapping" ? (
+          // Та же форма, что у «starting» выше, и по той же причине, что на
+          // карточке (ModelSetup.tsx:697): спиннер и причина, без глагола.
+          // Ничего не сломано и нажимать нечего — черновой сервер поднимется
+          // сам, когда аренду отпустят (src-tauri/src/lib.rs:1235,
+          // restore_after_handover), а цикл-ворота выше сам доспросит статус и
+          // переведёт это же выделение. Слово — «Освобождаю видеопамять», а не
+          // «~20 с» из model.startingShort: ждать здесь столько, сколько идёт
+          // чужой проход, и обещать секунды было бы враньём.
+          <span className="flex items-center gap-2 text-neutral-500 dark:text-neutral-400">
+            <Spinner /> {t("model.swappingShort")}
           </span>
         ) : phase === "nomodel" ? (
           dlBusy(dl) ? (

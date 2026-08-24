@@ -103,6 +103,37 @@ const S = {
   "model.title": ["Модель перевода", "Translation model"],
   "model.starting": ["Модель перевода: запускается", "Translation model: starting"],
   "model.startingShort": ["Модель запускается · ~20 с", "Model starting · ~20 s"],
+  // «swapping» — статус чернового сервера, пока видеопамять держит вторая
+  // модель. Обе на карту разом больше не помещаются: та, которую попросили,
+  // забирает память у другой (src-tauri/src/lib.rs, swap_out), а когда заём
+  // кончается, черновой сервер поднимается сам (restore_after_handover). Слово
+  // выбрано не «остановлен» и не «не отвечает»: сервер не умер и чинить его
+  // нечего — читателю нужно знать, что идёт передача и что она кончится.
+  // Читатель ничего не нажимает, поэтому глагола в строке нет.
+  //
+  // ПО ПРИЧИНЕ, А НЕ ПО ФИЧЕ. Строка читала «Видеопамять занята правкой стиля»
+  // — и называла не ту работу в двух случаях из трёх. Аренду на 11545 берут
+  // три владельца: «style:<bookPath>», «glossary» (вкладка «Термины») и
+  // «graph» (фоновая очередь графа, src/graphgen.ts). Причём с включённой по
+  // умолчанию автосборкой графа (graphrun.ts, autoBuild) третий — самый
+  // частый: он берёт аренду сам, без единого действия читателя. Обещать в
+  // такой момент «правку стиля» — врать про то, чего человек не запускал.
+  // Поэтому в строке названо ровно то, что верно всегда: карту держит другая
+  // локальная модель, и это кончится само. Какая именно — вопрос, на который
+  // отвечает та поверхность, где эта работа идёт, а не статус чернового
+  // сервера.
+  "model.swapping": ["Видеопамять занята другой моделью", "Another model is holding the GPU"],
+  "model.swappingShort": ["Освобождаю видеопамять", "Freeing the GPU"],
+  // Тихая вторая строка под model.swapping — там, где у карточки есть место на
+  // неё (тот же приём, что model.noEngine / model.noEngineBody). Нужна ровно
+  // одна вещь: сказать, что нажимать нечего. Статус не терминальный, никакой
+  // модели не не хватает, ждать надо не читателю — черновой сервер поднимется
+  // сам, как только аренду отпустят (lib.rs, restore_after_handover), и
+  // перевод продолжится с того же места.
+  "model.swappingBody": [
+    "Перевод продолжится сам, когда та работа закончится",
+    "Translation resumes by itself once that pass is done",
+  ],
   "model.dead": ["Модель не отвечает", "The model is not responding"],
   "model.deadRestart": ["Модель не отвечает · Перезапустить", "Model not responding · Restart"],
   "model.notInstalled": ["Модель не установлена · Скачать {size}", "Model not installed · Download {size}"],
@@ -125,7 +156,16 @@ const S = {
     "Локальный перевод книг · модель скачивается один раз и остаётся на компьютере",
     "Local book translation · the model downloads once and stays on this computer",
   ],
-  "model.line": ["HY-MT1.5 · {size} · перевод офлайн", "HY-MT1.5 · {size} · offline translation"],
+  // The draft translator is named on every surface that offers to fetch it, and
+  // the name changed with the weights: HY-MT1.5 was a Chinese-centric model
+  // prompted through Chinese-worded templates, and it leaked its own script into
+  // finished Russian paragraphs. TranslateGemma-12B is the model the app pins
+  // now — see translate.ts for the prompt it is fed and why it cannot go through
+  // /v1/chat/completions at all.
+  "model.line": [
+    "TranslateGemma-12B · {size} · перевод офлайн",
+    "TranslateGemma-12B · {size} · offline translation",
+  ],
   "model.downloadCta": ["Скачать модель перевода · {size}", "Download the translation model · {size}"],
   "model.resumeCta": ["Продолжить скачивание · {pct}%", "Resume the download · {pct}%"],
   "model.downloadShort": ["Скачать модель", "Download the model"],
@@ -133,10 +173,11 @@ const S = {
     "Для перевода нужна модель · {size} · один раз, дальше офлайн",
     "Translation needs a model · {size} · once, then offline",
   ],
-  "model.neededShort": [
-    "Для перевода нужна модель · {size}",
-    "Translation needs a model · {size}",
-  ],
+  // model.neededShort stood here — «Для перевода нужна модель · {size}» without
+  // the «один раз, дальше офлайн» tail. It had no call site left, and with the
+  // draft model's size going from 4,6 to 7,3 ГБ every line that quotes a number
+  // had to be re-read anyway; a string nobody renders cannot be re-read against
+  // anything. Deleted rather than carried.
   "model.later": ["Читать без перевода", "Read without translation"],
   "model.verifying": ["Проверяю файл", "Verifying the file"],
   // (WP-N) A failed download is one row: the cause here, the verb beside it —
@@ -147,14 +188,23 @@ const S = {
   "model.checksum": ["Файл повреждён", "The file is damaged"],
   "model.redownload": ["Скачать заново", "Download again"],
   "model.interrupted": ["Скачивание прервалось", "The download stopped"],
+  // Both models the app fetches are Google's now and both ship under the same
+  // Gemma Terms of Use, so this line lost the territorial carve-out it used to
+  // carry: the Hunyuan Community Licence excluded the EU, the UK and South Korea,
+  // the Gemma Terms exclude nobody. Two consequences for the wording. The clause
+  // is gone rather than reworded — there is no region to warn about, and a reader
+  // who saw the old line must not be left wondering whether it still applies. And
+  // the same sentence now covers the terms model as well (gl.auxPitch), which is
+  // why «Apache-2.0» disappeared from there in the same pass: it never described
+  // the file the app actually downloads.
   "model.license": [
-    "Лицензия Hunyuan Community · бесплатно, в том числе коммерчески · не действует в ЕС, Великобритании и Южной Корее",
-    "Hunyuan Community License · free, commercial use included · not valid in the EU, the UK or South Korea",
+    "Условия использования Gemma · бесплатно, в том числе коммерчески",
+    "Gemma Terms of Use · free, commercial use included",
   ],
   "model.licenseTerms": ["Условия", "Terms"],
   "model.bgDownload": ["Скачиваю в фоне · Подробности", "Downloading in the background · Details"],
   // (WP-N) the pieces a status line is assembled from, so no surface writes its own
-  "model.licenseShort": ["Лицензия Hunyuan Community", "Hunyuan Community License"],
+  "model.licenseShort": ["Условия использования Gemma", "Gemma Terms of Use"],
 
   // -- library --
   "lib.title": ["Библиотека", "Library"],
@@ -170,6 +220,10 @@ const S = {
   "lib.reading": ["Читаю", "Reading"],
   "lib.all": ["Все", "All"],
   "lib.translating": ["Перевод · {pct}%", "Translation · {pct}%"],
+  // The second sweep over a finished book, shown in the same slot as the first:
+  // the card has room for one running line, and while the style edit runs it is
+  // the style edit that is running. The draft's own percentage is 100 by then.
+  "lib.styling": ["Правка стиля · {pct}%", "Style edit · {pct}%"],
   "lib.stalled": ["Пауза · модель недоступна", "Paused · model unavailable"],
   // (WP-N) the segmented filter took over from the «Reading» / «All books»
   // headings, and a card says its state in one line of numbers.
@@ -177,6 +231,10 @@ const S = {
   "lib.notOpened": ["не открывали", "not opened yet"],
   "lib.pageOf": ["стр. {page} из {total}", "p. {page} of {total}"],
   "lib.trPct": ["перевод {pct}%", "translated {pct}%"],
+  // Lower case and no bullet of its own: it is appended to the card's line of
+  // numbers beside lib.pageOf and lib.trPct, not a state of its own. A book can
+  // be «перевод 100% · правка 40%» and both halves are true.
+  "lib.stylePct": ["правка {pct}%", "style edit {pct}%"],
 
   // -- toolbar / reader --
   "tb.library": ["Библиотека", "Library"],
@@ -219,6 +277,10 @@ const S = {
   "panel.attention": ["Требует внимания", "Needs attention"],
   "panel.askBadge": ["{n} сообщение|{n} сообщения|{n} сообщений", "{n} message|{n} messages"],
   "panel.trBadge": ["Перевод · {pct}%", "Translation · {pct}%"],
+  // The same badge while the second sweep runs. The tab shows one number and the
+  // reader has to know which sweep it belongs to, so the two never share a
+  // wording: «Перевод · 100%» and «Правка · 12%» are different sentences.
+  "panel.styleBadge": ["Правка · {pct}%", "Style edit · {pct}%"],
   "panel.pageOf": ["{page} из {total} · {pct}%", "{page} of {total} · {pct}%"],
 
   // -- refusals: cause on the left, verb on the right, one line each (WP-N) --
@@ -289,16 +351,77 @@ const S = {
   "tr.etaHour": [" · осталось ~{n} ч", " · ~{n} h left"],
   "tr.untitled": ["перевод", "translation"],
   // (WP-N) One card holds the run: a state, its numbers, and two verbs. These
-  // are the four states it can be in, and the words on those verbs.
+  // are the states it can be in, and the words on those verbs.
+  //
+  // There were four; there are five, because a book that is «переведена» can now
+  // still have a second sweep running over it. tr.stateStyling is not a variant
+  // of tr.stateRunning: the numbers under it count a different watermark
+  // (styledThrough, not donePages), the verb beside it stops a different pass,
+  // and the draft is finished and readable the whole time it is showing. A book
+  // in this state is done in every sense the export gates care about.
   "tr.stateIdle": ["Перевод не начат", "Not started"],
   "tr.stateRunning": ["Идёт", "Running"],
   "tr.statePaused": ["Пауза", "Paused"],
   "tr.stateDone": ["Книга переведена", "The book is translated"],
+  "tr.stateStyling": ["Правится стиль", "Editing the style"],
   // (WP-N) Файл книги не переоткрылся под прогон: причина печатается строкой в
   // карточке, глагол рядом — t("ui.retry"). Тоста для этого больше нет.
   "tr.startFailed": ["Прогон не начался", "The run did not start"],
   "tr.resumeShort": ["Продолжить", "Resume"],
   "tr.checkModel": ["Проверить модель", "Check the model"],
+
+  // -- the second sweep: a style edit of the translation, in the reader's
+  //    language only. Its own row in the same card, never a mode of the first.
+  //
+  // What it is, in the words the reader is owed: the translator wrote Russian
+  // one paragraph at a time and never read it back, so the book carries the
+  // ordinary damage of that — «большого语言 моделя» for «большой языковой
+  // модели», «значительным предвзятостям» where the case is wrong, ё and е
+  // mixed between adjacent paragraphs. The editor is a different model reading
+  // only the Russian, with the glossary and a style guide in front of it and the
+  // English deliberately out of view — which is the one thing that has to be
+  // said out loud (tr.styleTitle), because a reader who thinks the original is
+  // in view will read a missing detail as a lost one.
+  //
+  // The two phase words are the only strings that name «which sweep» inside a
+  // line otherwise made of numbers, so they are lower case and one word: they
+  // are read as a label on a bar, never as a sentence.
+  "tr.phaseDraft": ["черновик", "draft"],
+  "tr.phaseStyle": ["правка", "style edit"],
+  "tr.style": ["Выправить стиль", "Edit the style"],
+  "tr.styleTitle": [
+    "Перечитать русский текст и выправить согласование, опечатки и регистр · оригинал модель не видит",
+    "Read the Russian back and fix agreement, typos and register · the model never sees the original",
+  ],
+  "tr.styleResume": ["Продолжить правку · {pct}%", "Resume the style edit · {pct}%"],
+  "tr.styled": [
+    "{done} из {n} страница выправлена|{done} из {n} страницы выправлены|{done} из {n} страниц выправлены",
+    "{done} of {n} page edited|{done} of {n} pages edited",
+  ],
+  // Appended to tr.styled the way gl.skipped is appended to gl.added: a paragraph
+  // the editor left alone is the ordinary outcome, not a failure — the model was
+  // silent, or its answer failed a guardrail, and the draft stands. Saying it in
+  // numbers is what stops «выправлено 100%» from being a lie. All three Russian
+  // forms carry the leading « · » (the first one used not to, and the separator
+  // jumped with the count: t() substitutes each form verbatim and normalises
+  // nothing — see t() at the end of this file).
+  "tr.styleKept": [
+    " · {n} абзац оставлен как был| · {n} абзаца оставлены как были| · {n} абзацев оставлены как были",
+    " · {n} paragraph left as it was| · {n} paragraphs left as they were",
+  ],
+  // Nobody has the 14,2 ГБ editor by default, so «not installed» is the ordinary
+  // state of this row and not a refusal: it names the size, the way model.needed
+  // does, and the draft translation is untouched and complete beneath it.
+  "tr.styleNoModel": ["Модель правки не установлена · {size}", "The editing model is not installed · {size}"],
+  // The way back. The draft is kept verbatim beside the edit (trRaw), so this is
+  // a real undo and not a re-translation — which is exactly why it may be
+  // offered at all, and why its confirmation says «снять», not «удалить».
+  "tr.styleRestore": ["Вернуть черновой перевод", "Restore the draft translation"],
+  "tr.styleRestoreTitle": [
+    "Снять правку стиля и вернуть текст, который выдал переводчик",
+    "Undo the style edit and restore the translator's own text",
+  ],
+  "tr.styleRestoreConfirm": ["Снять правку", "Undo the edit"],
   // The three things a selection can do, spelled out once in the panel instead
   // of hovering over the library as a hint bar.
   "tr.selectionTitle": ["Что умеет выделение", "What a selection can do"],
@@ -319,7 +442,10 @@ const S = {
   // The popover says what it is doing in its footer and what went wrong in its
   // body — cause on the left, the verb out of it on the right.
   "pop.translating": ["Перевожу…", "Translating…"],
-  "pop.took": ["HY-MT1.5 · {sec} с", "HY-MT1.5 · {sec} s"],
+  // The popover stays single-stage on the draft model: it is a latency surface
+  // with a visible clock, and this line is that clock. The name in it is the
+  // model that actually answered — the editor never touches a selection.
+  "pop.took": ["TranslateGemma · {sec} с", "TranslateGemma · {sec} s"],
   "pop.modelGone": ["Модель недоступна", "Model unavailable"],
   "pop.check": ["Проверить", "Check"],
   "pop.failed": ["Не удалось перевести", "Translation failed"],
@@ -389,9 +515,14 @@ const S = {
   ],
   "gl.retranslate": ["Перевести заново", "Translate again"],
   "gl.auxProgress": ["Модель терминов · {detail}", "Term model · {detail}"],
+  // «Apache-2.0» stood at the end of this line and was never true of the file the
+  // app fetches — it was the licence of the model family, not of these weights.
+  // The row now names the same terms model.license does, because it is now the
+  // same download: the editor, the glossary and the graph all run on one 14,2 ГБ
+  // file under the Gemma Terms of Use.
   "gl.auxPitch": [
-    "Термины точнее с моделью терминов · {size} · Apache-2.0",
-    "Terms are sharper with the term model · {size} · Apache-2.0",
+    "Термины точнее с моделью терминов · {size} · условия Gemma",
+    "Terms are sharper with the term model · {size} · Gemma Terms",
   ],
   "gl.auxResume": ["Продолжить · {pct}%", "Resume · {pct}%"],
 
@@ -456,6 +587,80 @@ const S = {
   // Appended after gl.added, the way gl.skipped is: a merge that filled empty
   // fields on lines that were already there did work the added-count cannot see.
   "gl.updated": [" · дополнено {n}", " · {n} filled in"],
+
+  // -- the reading pass. It stands between the miner and everything the model
+  //    does, and it exists because frequency cannot tell a term from a running
+  //    example. Measured on a reader's own book: the miner's top entries were
+  //    «dark of the moon», «star wars», «cat in the hat» — sample search queries
+  //    the book uses as running examples, 56 occurrences apiece — beside «False»
+  //    and «SELECT». Handed that bag of frequent strings and nothing else, the
+  //    model invented definitions to match («dark of the moon :: метафора для
+  //    обозначения скрытых аспектов»), and where it knew the letters but not the
+  //    book it guessed the wrong expansion: ANN as a neural architecture in a
+  //    book where it is Approximate Nearest Neighbor, CLIR as «концептуальный
+  //    поиск», «Information Retrieval = Информационное извлечение» where the
+  //    established Russian term is «информационный поиск».
+  //
+  //    So the model is made to read the book first and write down what it is
+  //    about, and every later pass is given that page. The verb is «Прочитать
+  //    книгу» and not «Собрать справку» because reading is what the reader is
+  //    waiting for; the справка is the artefact, not the promise.
+  "gl.read": ["Прочитать книгу", "Read the book"],
+  "gl.readTitle": [
+    "Модель прочитает книгу, поймёт, о чём она, и назовёт её термины сама",
+    "The model reads the book, works out what it is about, and names its terms itself",
+  ],
+  "gl.reading": ["Читаю книгу · {done} из {total}", "Reading the book · {done} of {total}"],
+  "gl.readProfiled": ["Справка о книге записана", "The book's profile is written"],
+  "gl.readProposed": [
+    "{n} термин назван моделью|{n} термина названы моделью|{n} терминов названы моделью",
+    "{n} term named by the model|{n} terms named by the model",
+  ],
+  // The one number in this whole panel that reports a LOSS, and it is here
+  // because the pass genuinely deletes: proposeTerms shows the model the tail
+  // of the miner's frequency list and asks, line by line, whether each is a
+  // term OF this book or an example IN it, and the «нет» answers go out of the
+  // .txt through saveGlossary's removal path. That is the only way «dark of
+  // the moon» leaves a file pass 1 already wrote it into — declining to add it
+  // again would change nothing about what is on disk.
+  //
+  // Folding it into gl.added was the alternative and it is the dishonest one:
+  // a run that added eleven lines and took four out did two different things
+  // to a file the reader edits by hand, and one of them is invisible unless
+  // you had memorised the list. Nothing else in the app announces it either —
+  // the glossary is a plain .txt with no history.
+  "gl.readVetoed": [
+    "{n} лишняя строка убрана|{n} лишние строки убраны|{n} лишних строк убрано",
+    "{n} stray line removed|{n} stray lines removed",
+  ],
+  // The quiet line under those numbers. Two facts, and the second is the one
+  // that stops the first from reading as damage: the veto keeps no record, so
+  // re-running «Найти термины» writes every removed line straight back. A
+  // reader who does that and sees «dark of the moon» return must be able to
+  // recognise it as the design rather than as a bug — and a reader who wanted
+  // a line back now knows the verb that brings it.
+  "gl.readVetoedHint": [
+    "Строки частотного прохода, в которых модель узнала примеры, а не термины · «Найти термины» вернёт их",
+    "Mined lines the model recognised as examples rather than terms · «Find the terms» puts them back",
+  ],
+  // Not a refusal and not an error: the file may be full of terms already, put
+  // there by the model-free miner. It is a statement about the QUALITY of what
+  // comes next, with the verb that fixes it named inside the hint — the same
+  // shape as gl.noAux / gl.noAuxHint (WP-N).
+  "gl.noProfile": ["Справки о книге ещё нет", "There is no book profile yet"],
+  "gl.noProfileHint": [
+    "Определения будут словарные, а не про эту книгу · «Прочитать книгу» это чинит",
+    "The definitions will be dictionary ones rather than this book's · «Read the book» fixes that",
+  ],
+  // The profile is prose, and prose has a language: it is written in the
+  // reader's, because every pass that consumes it is prompted in the reader's.
+  // Switching the interface language therefore does not invalidate it — it makes
+  // it foreign, which is a thing to say quietly and not to fix by deleting an
+  // hour of reading behind the reader's back.
+  "gl.profileStale": [
+    "Справка написана на другом языке интерфейса",
+    "The profile was written in the other interface language",
+  ],
 
   // -- pass 2: enrichment. The aux model fills kind, category and definition,
   //    twelve terms a call, and translates only when a translation applies.
@@ -555,6 +760,10 @@ const S = {
   "cmd.originalSel": ["Показать оригинал выделенного", "Show the original of the selection"],
   "cmd.pauseTr": ["Приостановить перевод", "Pause translating"],
   "cmd.translateBook": ["Перевести книгу", "Translate the book"],
+  // A row in a list of twenty is a verb and says what it acts on, so the palette
+  // spells out «стиль перевода» where the panel's own button can be «Выправить
+  // стиль» — there the card around it already says which book and which pass.
+  "cmd.styleBook": ["Выправить стиль перевода", "Edit the translation's style"],
   "cmd.resumeTr": ["Продолжить перевод · {pct}%", "Resume translating · {pct}%"],
   "cmd.zoomIn": ["Крупнее", "Zoom in"],
   "cmd.zoomOut": ["Мельче", "Zoom out"],
@@ -627,14 +836,49 @@ const S = {
   "set.change": ["Сменить", "Change"],
   "set.models": ["Модели", "Models"],
   "set.modelTr": ["Модель перевода", "Translation model"],
-  "set.modelTrDesc": ["HY-MT1.5", "HY-MT1.5"],
+  "set.modelTrDesc": ["TranslateGemma-12B", "TranslateGemma-12B"],
   "set.modelTrConfirm": [
     "Удалить модель: {size} · перевод остановится",
     "Delete the model: {size} · translation stops",
   ],
-  "set.modelTerms": ["Модель терминов", "Term model"],
-  "set.modelTermsDesc": ["Qwen3.5", "Qwen3.5"],
+  // The second row was «Модель терминов» while the glossary and the graph were
+  // all it did. The same weights now also do the style edit of a whole book —
+  // which is the longest-running thing in the app — so the row is named for both
+  // jobs. Editing first: it is the one a reader deletes by accident and misses.
+  "set.modelTerms": ["Модель правки и терминов", "Editing and terms model"],
+  "set.modelTermsDesc": ["Gemma 4 26B-A4B", "Gemma 4 26B-A4B"],
   "set.modelTermsConfirm": ["Удалить модель: {size}", "Delete the model: {size}"],
+  // Two rows of gigabytes want a sum, and this one is worth printing because the
+  // number is large: 7,3 + 14,2. Onboarding deliberately never shows it — the
+  // first run commits to the draft model alone (model.pitch, singular) and the
+  // editor is offered afterwards with its own size stated. This line is for the
+  // reader who came to Settings asking where the disk went.
+  "set.modelsTotal": ["Обе модели · {size}", "Both models · {size}"],
+  // The weights the app used to run on. Nothing in the code names them any more,
+  // so they are 7,2 ГБ of unreachable files in roaming AppData — and the app is
+  // asking for 21,5 ГБ more against a free-space check with a 300 MiB margin.
+  // They are offered for deletion and never deleted for the reader: those bytes
+  // cost hours of bandwidth, and a reader who downgrades needs them back.
+  //
+  // These three lines are the ONLY place in this catalogue where the old names
+  // survive, and they have to: a row offering to delete two files must say which
+  // files, and «Старые модели» alone names nothing on disk. Everywhere else the
+  // old names are gone — that is what the swap's grep is actually checking.
+  "set.modelsLegacy": ["Старые модели", "Old models"],
+  "set.modelsLegacyNote": [
+    "HY-MT1.5 и Qwen3.5 больше не используются · {size}",
+    "HY-MT1.5 and Qwen3.5 are no longer used · {size}",
+  ],
+  "set.modelsLegacyDelete": ["Удалить старые модели", "Delete the old models"],
+  // Not in the plan for this row, and it has to be here: every deletable row in
+  // Settings hands <Confirm> a note (Settings.tsx:230-236), and the two model
+  // rows word theirs the same way — the verb, a colon, the bytes it frees. A row
+  // that deletes two files at once has more to confirm than either of them, not
+  // less. Shaped after set.modelTermsConfirm so the three read as one family.
+  "set.modelsLegacyConfirm": [
+    "Удалить старые модели: {size}",
+    "Delete the old models: {size}",
+  ],
   "set.engine": ["Движок", "Engine"],
   "set.engineReady": ["llama.cpp · найден", "llama.cpp · found"],
   "set.engineMissing": ["llama.cpp · не найден", "llama.cpp · not found"],
@@ -817,12 +1061,18 @@ const S = {
   // -- about --
   "about.title": ["О программе", "About"],
   "about.thirdParty": ["Собрано на", "Built on"],
-  "about.hyLicense": [
-    "Бесплатно, в том числе коммерчески · не действует в ЕС, Великобритании и Южной Корее",
-    "Free, commercial use included · not valid in the EU, the UK or South Korea",
-  ],
-  "about.modelHy": ["Модель HY-MT1.5-7B · Tencent", "HY-MT1.5-7B model · Tencent"],
-  "about.modelQwen": ["Модель Qwen3.5-4B · Alibaba", "Qwen3.5-4B model · Alibaba"],
+  // The two model rows are keyed by ROLE now, not by vendor: about.modelHy and
+  // about.modelQwen had the weights' names baked into the keys themselves, so
+  // swapping the weights left every call site pointing at a key that lied. Draft
+  // and style are what these two do and will keep doing.
+  //
+  // about.hyLicense stood beside them — «не действует в ЕС, Великобритании и
+  // Южной Корее», the Hunyuan Community Licence's territorial carve-out. Both
+  // models are Google's now, under the Gemma Terms of Use, which carve out
+  // nobody, so the note is not reworded but deleted along with the `note` field
+  // of that row (About.tsx). Nothing else in the catalogue carried it.
+  "about.modelDraft": ["Модель TranslateGemma-12B · Google", "TranslateGemma-12B model · Google"],
+  "about.modelStyle": ["Модель Gemma 4 26B-A4B · Google", "Gemma 4 26B-A4B model · Google"],
 
   // -- ask sidebar --
   "ask.appOnlyBadge": ["Доступно только в приложении", "Available only in the app"],
@@ -1143,15 +1393,28 @@ export function fmtMbps(bps: number): string {
 
 // ---- the language books are translated INTO ---------------------------------
 //
-// HY-MT1.5's prompt templates name the target language, in English for the
-// basic template and in Chinese for the terminology/contextual ones (that is
-// how the model card documents them).
+// TranslateGemma's own prompt names the target language twice over: once in
+// English prose («…to Russian…») and once as its BCP-47 code in brackets
+// («(ru)»), because that is the shape its chat template renders and staying
+// close to a translation model's training distribution is most of the quality.
+// Both halves therefore live here, side by side, and translate.ts spends them
+// together.
+//
+// The Chinese spelling that used to be the second field is gone. It was never
+// about the target language as such: HY-MT1.5 was a Chinese-centric model whose
+// model card documented its terminology and contextual templates worded in
+// Chinese, so «俄语» existed only to be pasted into those sentences. With the
+// templates gone the field had no reader — and it is worth recording that this
+// is the same root as the «нечитаемые символы» the reader reported: prompted in
+// Chinese, the model would drop back into Chinese mid-paragraph («использует
+// модель большого语言 моделя»). See the style pass's foreign-script guard, which
+// repairs the paragraphs already on disk.
 
-export const TARGET_LANGUAGE: Record<Lang, { en: string; zh: string }> = {
-  ru: { en: "Russian", zh: "俄语" },
-  en: { en: "English", zh: "英语" },
+export const TARGET_LANGUAGE: Record<Lang, { en: string; code: string }> = {
+  ru: { en: "Russian", code: "ru" },
+  en: { en: "English", code: "en" },
 };
 
-export function targetLanguage(): { en: string; zh: string } {
+export function targetLanguage(): { en: string; code: string } {
   return TARGET_LANGUAGE[current];
 }

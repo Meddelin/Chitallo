@@ -45,16 +45,26 @@ function notices(): Notice[] {
     // (WP-N) both faces ship inside the app now (src/fonts), so both belong here
     { name: "Golos Text", license: "SIL OFL 1.1", url: "https://github.com/ParaType/Golos-Text" },
     { name: "Literata", license: "SIL OFL 1.1", url: "https://github.com/googlefonts/literata" },
+    // Both models the app downloads are Google's now, and both ship under the
+    // same Gemma Terms of Use — one licence, one url, two distinct names. The
+    // names have to stay distinct: the list is keyed by n.name below (:107).
+    //
+    // The first row lost its `note`. It carried about.hyLicense — «не действует
+    // в ЕС, Великобритании и Южной Корее» — which was true of the Hunyuan
+    // Community Licence and is simply not true of the Gemma Terms, which
+    // exclude nobody. Carrying that sentence across to a different licence would
+    // have been an untrue legal claim on the one screen of this app whose whole
+    // job is to be accurate about licences, so the clause is gone rather than
+    // reworded; i18n.ts:159-168 records the same decision for model.license.
     {
-      name: t("about.modelHy"),
-      license: "Hunyuan Community License",
-      url: "https://huggingface.co/tencent/HY-MT1.5-7B-GGUF/blob/main/License.txt",
-      note: t("about.hyLicense"),
+      name: t("about.modelDraft"),
+      license: "Gemma Terms of Use",
+      url: "https://ai.google.dev/gemma/terms",
     },
     {
-      name: t("about.modelQwen"),
-      license: "Apache-2.0",
-      url: "https://huggingface.co/unsloth/Qwen3.5-4B-GGUF",
+      name: t("about.modelStyle"),
+      license: "Gemma Terms of Use",
+      url: "https://ai.google.dev/gemma/terms",
     },
   ];
 }

@@ -74,6 +74,9 @@ function Tabs({
   askCount,
   glossCount,
   trPct,
+  trBandPct,
+  trPhase,
+  trRunning,
   trAttention,
 }: {
   tab: PanelTab;
@@ -81,6 +84,9 @@ function Tabs({
   askCount?: number;
   glossCount?: number;
   trPct?: number | null;
+  trBandPct?: number | null;
+  trPhase?: "draft" | "style";
+  trRunning?: boolean;
   trAttention?: boolean;
 }) {
   // Точка внимания на «Спросить» — это ровно «Claude Code не найден», и панель
@@ -97,7 +103,16 @@ function Tabs({
   // тянет на себя взгляд при каждом чтении. Готовому переводу хватает слова.
   // Сотня и есть «готово»: trPct приходит из floor(100·done/total) и достаёт до
   // ста ровно тогда, когда переведены все страницы.
-  const pct = typeof trPct === "number" && trPct < 100 ? trPct : null;
+  //
+  // Но правило «сотня — значит молчим» держится только БЕЗ прогона. Правка
+  // стиля идёт как раз по книге, где donePages уже сотня, и её собственные
+  // проценты (trBandPct) гасли бы весь проход — единственная поверхность из
+  // четырёх, которая молчала бы про идущую работу. Поэтому условие раздвоено:
+  // прячем, только когда прогона нет И перевод дошёл до конца; печатаем —
+  // всегда то число, что показывает полоса тулбара, чтобы два процента в
+  // одном окне не расходились.
+  const bandPct = typeof trBandPct === "number" ? trBandPct : trPct;
+  const pct = trRunning || (typeof trPct === "number" && trPct < 100) ? bandPct ?? null : null;
 
   const tabs: { id: PanelTab; label: string; badge?: string; attention?: boolean; title: string }[] = [
     { id: "outline", label: t("panel.outline"), title: t("panel.outline") },
@@ -127,11 +142,17 @@ function Tabs({
       label: t("panel.translate"),
       badge: pct === null ? undefined : `${pct}%`,
       attention: trAttention,
+      // Само число фазу назвать не может — «40%» одинаковы у обоих проходов, —
+      // поэтому её называет подсказка: «Правка · 40%» вместо «Перевод · 40%».
+      // Ярлык остаётся одним числом: две вкладки шириной в панель уже посчитаны
+      // в шапке файла, и второму слову в ряду места нет.
       title: trAttention
         ? t("panel.attention")
         : pct === null
           ? t("panel.translate")
-          : t("panel.trBadge", { pct }),
+          : trPhase === "style"
+            ? t("panel.styleBadge", { pct })
+            : t("panel.trBadge", { pct }),
     },
   ];
 
@@ -164,6 +185,9 @@ export function Panel({
   askCount,
   glossCount,
   trPct,
+  trBandPct,
+  trPhase,
+  trRunning,
   trAttention,
   outline,
   ask,
@@ -181,8 +205,14 @@ export function Panel({
   askCount?: number;
   /** терминов в глоссарии книги — только для подсказки вкладки, не для ярлыка */
   glossCount?: number;
-  /** «Перевод 40%» — процент прогона; null, undefined или 100 — без ярлыка */
+  /** переведено страниц, 0–100 — им же решается, молчать ли ярлыку у готовой книги */
   trPct?: number | null;
+  /** «Перевод 40%» — число, которое ярлык ПЕЧАТАЕТ: тот же bandPct, что у полосы тулбара */
+  trBandPct?: number | null;
+  /** который проход идёт — подсказка ярлыка называет его словом */
+  trPhase?: "draft" | "style";
+  /** прогон по этой книге идёт прямо сейчас: у готовой книги только он и оживляет ярлык */
+  trRunning?: boolean;
   /** прогон на паузе или сорвался — вместо числа янтарная точка */
   trAttention?: boolean;
   outline: ReactNode;
@@ -225,7 +255,10 @@ export function Panel({
               onTab={onTab}
               tab={tab}
               trAttention={trAttention}
+              trBandPct={trBandPct}
               trPct={trPct}
+              trPhase={trPhase}
+              trRunning={trRunning}
             />
           )}
         </div>

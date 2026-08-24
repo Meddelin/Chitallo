@@ -10,6 +10,21 @@
 // Своего состояния ровно два, и оба раскрывают текст на месте, без экранов:
 // взвод подтверждения на «Перевести заново» (разрушительное называет объём и
 // ждёт второго клика, §4.6) и одно предложение под отказом по скану.
+//
+// ---- второй проход: правка стиля -------------------------------------------
+//
+// Проходов по книге стало два, а карточка осталась ОДНА: одна точка, одна
+// полоса, одно число процентов. Меняется не количество индикаторов, а
+// существительное под ними — «страниц переведено» или «страниц выправлено», —
+// и это и есть весь замысел. Процент, который посреди работы сбрасывается в
+// ноль, не сменив ни слова рядом, — самое непонятное, что может сделать
+// вторая фаза; вторая полоса под первой была бы не лучше: обе они про одну и
+// ту же книгу, и читатель обязан складывать их в голове.
+//
+// Числа правки приходят СВОЕЙ парой (styledDone/styledTotal), а не берутся из
+// done/total: те считают переведённые страницы и на готовой книге равны «838
+// из 838» — под словом «выправлены» это была бы прямая ложь, да ещё под
+// полосой, стоящей на 12%.
 
 import { useState } from "react";
 import { BookOpenIcon, CodeXmlIcon, FileTextIcon, RotateCcwIcon } from "lucide-react";
@@ -21,10 +36,11 @@ import { t } from "./i18n";
 /** Четыре состояния карточки прогона — ровно те, что в макете Translate. */
 export type TrState = "idle" | "running" | "paused" | "done";
 
+/** Который из двух проходов идёт: черновой перевод или правка стиля. */
+export type TrPhase = "draft" | "style";
+
 /** Отказ, который печатается строкой действия: причина слева, глагол справа. */
 export type TrExportError = { kind: "pdf" | "html"; reason: string };
-
-const MODEL_NAME = "HY-MT1.5";
 
 // строка действия: иконка · подпись · число или клавиша справа
 const ROW =
@@ -120,6 +136,13 @@ export function TranslatePanel({
   reason,
   noTextLayer,
   updPct = 0,
+  phase = "draft",
+  styledDone = 0,
+  styledTotal = 0,
+  styledKept = 0,
+  styledPct = 0,
+  hasStyleDrafts,
+  styleModelReady,
   glossaryTerms,
   pdfExport,
   pdfBusy,
@@ -131,6 +154,8 @@ export function TranslatePanel({
   onPause,
   onResume,
   onUpdate,
+  onStyle,
+  onRestoreDrafts,
   onRetranslate,
   onCheckModel,
   onGlossary,
@@ -161,6 +186,20 @@ export function TranslatePanel({
   noTextLayer?: boolean;
   /** водяной знак прерванного «Обновить перевод», 0 — обновление не начиналось */
   updPct?: number;
+  /** который проход идёт: черновик или правка стиля (App.trPhase) */
+  phase?: TrPhase;
+  /** страниц выправлено — число САМОГО прогона правки, не done выше */
+  styledDone?: number;
+  /** знаменатель к нему: страниц в книге (тот же, по которому считается pct) */
+  styledTotal?: number;
+  /** абзацев, которым правка не понадобилась или не удалась — их черновик стоит */
+  styledKept?: number;
+  /** водяной знак прерванной правки, 0 — правка не начиналась или пройдена вся */
+  styledPct?: number;
+  /** хоть один абзац хранит черновик под правкой — только тогда есть что вернуть */
+  hasStyleDrafts?: boolean;
+  /** лежит ли на диске модель правки; null — не спрашивали (обычный браузер) */
+  styleModelReady?: boolean | null;
   /** терминов в глоссарии книги; undefined — числа справа не будет */
   glossaryTerms?: number;
   /** платформа умеет печатать PDF молча (host().pdfExport) */
@@ -179,6 +218,10 @@ export function TranslatePanel({
   onPause: () => void;
   onResume: () => void;
   onUpdate: () => void;
+  /** «Выправить стиль» / «Продолжить правку» — второй проход по книге */
+  onStyle: () => void;
+  /** вызывается только после подтверждения — карточка взводит его сама */
+  onRestoreDrafts: () => void;
   /** вызывается только после подтверждения — карточка взводит его сама */
   onRetranslate: () => void;
   /** «Проверить модель» на паузе; без него кнопки не будет */
@@ -191,6 +234,8 @@ export function TranslatePanel({
 }) {
   // взвод «Перевести заново»: разрушительное называет объём и ждёт второго клика
   const [confirmRedo, setConfirmRedo] = useState(false);
+  // тот же взвод у «Вернуть черновой перевод»: правка снимается со всей книги
+  const [confirmRestore, setConfirmRestore] = useState(false);
   // «Что это значит» под отказом по скану: раскрыто / свёрнуто
   const [ocrHelp, setOcrHelp] = useState(false);
 
@@ -198,10 +243,16 @@ export function TranslatePanel({
   const paused = state === "paused";
   const finished = state === "done";
   const hasStore = state !== "idle";
+  const styling = phase === "style";
   const dotColor = paused ? "bg-amber-500" : "bg-accent";
   const barColor = paused ? "bg-amber-500" : "bg-accent";
+  // Пятое слово, и оно подменяет только «Идёт»: пауза правки — та же пауза, а
+  // «Книга переведена» остаётся правдой всё время, пока идёт второй проход
+  // (перевод готов и читается, правится его слог). См. i18n «tr.stateStyling».
   const stateWord = running
-    ? t("tr.stateRunning")
+    ? styling
+      ? t("tr.stateStyling")
+      : t("tr.stateRunning")
     : paused
       ? t("tr.statePaused")
       : finished
@@ -230,8 +281,20 @@ export function TranslatePanel({
                 style={{ width: `${Math.min(100, Math.max(0, pct))}%` }}
               />
             </div>
+            {/* Одна строка чисел на одну карточку. Существительное в ней —
+                единственное, что называет фазу, и во время правки оно и
+                отвечает за то, почему процент рядом снова маленький. Хвост
+                «12 абзацев оставлены как были» дописывается тем же приёмом,
+                каким gl.skipped дописывается к gl.added: абзац, которого
+                редактор не тронул, — обычный исход, а не беда, и сказать это
+                числом дешевле, чем промолчать и выдать «выправлено 100%». */}
             <div className="mt-2 flex justify-between gap-3 text-xs tabular-nums text-neutral-500 dark:text-neutral-400">
-              <span className="min-w-0 truncate">{t("tr.pagesKept", { done, n: total })}</span>
+              <span className="min-w-0 truncate">
+                {styling
+                  ? t("tr.styled", { done: styledDone, n: styledTotal }) +
+                    (styledKept > 0 ? t("tr.styleKept", { n: styledKept }) : "")
+                  : t("tr.pagesKept", { done, n: total })}
+              </span>
               <span className="shrink-0">{pct}%</span>
             </div>
           </>
@@ -282,12 +345,70 @@ export function TranslatePanel({
               </>
             )}
             {finished && (
-              <button className={`${BTN_MAIN} tabular-nums`} onClick={onUpdate} title={t("tr.updateTitle")}>
-                {updPct > 0 ? t("tr.updateResume", { pct: updPct }) : t("tr.update")}
-              </button>
+              <>
+                <button className={`${BTN_MAIN} tabular-nums`} onClick={onUpdate} title={t("tr.updateTitle")}>
+                  {updPct > 0 ? t("tr.updateResume", { pct: updPct }) : t("tr.update")}
+                </button>
+                {/* Второй проход стоит РЯДОМ с «Обновить перевод», а не вместо
+                    него: это два разных действия над одной готовой книгой —
+                    одно догоняет движок, другое перечитывает русский текст.
+                    Тихая кнопка, потому что главная здесь одна. Без модели
+                    правки глагола нет вовсе: кнопка, которая честно ничего не
+                    сделает, хуже строки, которая объясняет почему. */}
+                {styleModelReady !== false && (
+                  <button className={`${BTN_QUIET} tabular-nums`} onClick={onStyle} title={t("tr.styleTitle")}>
+                    {styledPct > 0 ? t("tr.styleResume", { pct: styledPct }) : t("tr.style")}
+                  </button>
+                )}
+              </>
             )}
           </div>
         )}
+
+        {/* Модели правки на диске нет — и это ОБЫЧНОЕ состояние строки, а не
+            отказ: её 14,2 ГБ по умолчанию нет ни у кого, а перевод под этой
+            строкой цел и дочитывается до конца. Поэтому тихий текст с весом,
+            как у model.needed, а не янтарная плашка Refusal, и поэтому же
+            строка не живёт в ModelLine внизу вкладки: та говорит про ЧЕРНОВОЙ
+            сервер, и «не установлена» в ней обвинило бы не ту модель. */}
+        {finished && styleModelReady === false && (
+          <div className="mt-2.5 text-xs text-neutral-500 dark:text-neutral-400">
+            {t("tr.styleNoModel", { size: sizeLabel("aux") })}
+          </div>
+        )}
+
+        {/* Дорога назад. Черновик лежит рядом с правкой абзац к абзацу
+            (trRaw), поэтому это настоящая отмена, а не перевод заново, — и
+            именно поэтому её можно предлагать вообще. Взвод тот же, что у
+            «Перевести заново» ниже: разрушительное ждёт второго клика. */}
+        {finished && hasStyleDrafts &&
+          (confirmRestore ? (
+            <div className="mt-2 flex items-center gap-3">
+              <button
+                className={BTN_RED}
+                onClick={() => {
+                  setConfirmRestore(false);
+                  onRestoreDrafts();
+                }}
+              >
+                {t("tr.styleRestoreConfirm")}
+              </button>
+              <button
+                className="-mx-1 rounded-lg px-1 py-1.5 text-[13px] transition-colors hover:bg-neutral-900/5 dark:hover:bg-neutral-100/10"
+                onClick={() => setConfirmRestore(false)}
+              >
+                {t("ui.cancel")}
+              </button>
+            </div>
+          ) : (
+            <button
+              className="mt-2 -mx-1 rounded-lg px-1 py-1 text-left text-xs text-neutral-500 transition-colors hover:text-neutral-700 dark:text-neutral-400 dark:hover:text-neutral-200"
+              onClick={() => setConfirmRestore(true)}
+              title={t("tr.styleRestoreTitle")}
+            >
+              {t("tr.styleRestore")}
+            </button>
+          ))}
 
         {/* (WP-N) Прогон не начался. Глагол повторяет ровно тот, что не сработал —
             состояние карточки его и называет. */}
@@ -426,6 +547,17 @@ export function TranslatePanel({
 // Строка модели внизу вкладки. Пока всё в порядке — имя и вес, и больше
 // ничего: успех молчит (§4.5). Когда модель требует внимания, строка целиком
 // отдаётся причине с глаголом — тем же словарём, что жил в меню «Перевод ▾».
+//
+// Говорит она про ЧЕРНОВОЙ сервер и только про него. Модель правки сюда не
+// добавлена намеренно: у неё нет постоянного сервера, чьё состояние можно
+// опросить (она поднимается по аренде на время прохода), а её «не
+// установлена» стоит выше, в самой строке правки, где рядом с ней глагол.
+//
+// Имя модели здесь БОЛЬШЕ НЕ КОНСТАНТА ФАЙЛА. Тут жило `const MODEL_NAME =
+// "HY-MT1.5"` — последнее имя модели за пределами каталога, и оно оставалось
+// английским литералом даже после переключения языка интерфейса, пока всё
+// вокруг переводилось. Имя приходит из i18n тем же ключом, каким его печатает
+// строка в Настройках: одно имя на одну вещь, в одном месте.
 function ModelLine({
   status,
   dl,
@@ -437,7 +569,7 @@ function ModelLine({
   onSetup: () => void;
   onRestart: () => void;
 }) {
-  const base = `${MODEL_NAME} · ${sizeLabel("main")}`;
+  const base = `${t("set.modelTrDesc")} · ${sizeLabel("main")}`;
   const wrap = "mt-3 border-t border-neutral-200 dark:border-neutral-700 pt-2.5 text-xs";
   const quiet = "text-left text-neutral-500 dark:text-neutral-400 transition-colors hover:text-neutral-700 dark:hover:text-neutral-200";
 
@@ -447,6 +579,34 @@ function ModelLine({
         <button className={`${quiet} tabular-nums`} onClick={onSetup} title={t("model.bgDownload")}>
           {t("model.downloading", { pct: dlPct(dl) })}
         </button>
+      </div>
+    );
+  // Видеопамять забрала вторая модель. Строка стоит ВЫШЕ «запускается»: её
+  // второе условие (`dl.status === "done"`) держится до конца сессии после
+  // удачного скачивания, так что заём сразу после загрузки печатался бы как
+  // «Модель перевода: запускается» — слово про наш сервер, которого сейчас
+  // нет, и срок, которого никто не обещал.
+  //
+  // Глагола нет намеренно, и это не забывчивость: ниже, в ветке «не
+  // отвечает», строка целиком — кнопка «Перезапустить», а на этом состоянии
+  // перезапускать нечего. Rust на такое нажатие отвечает тем же «swapping»
+  // (restart_translation отказывает, пока аренда жива), то есть кнопка была бы
+  // холостой и выглядела бы как починка. Черновой сервер вернётся сам, когда
+  // проход, взявший карту, её отпустит (restore_after_handover). Спиннер
+  // говорит ровно это: идёт работа, ждать не читателю.
+  //
+  // Печатается КОРОТКАЯ строка, а не model.swapping с причиной, и это не
+  // экономия места. Причину в этой же панели говорит карточка прогона выше:
+  // остановленный прогон получает её хвостом состояния (App: run.stallReason →
+  // «Видеопамять занята другой моделью»). Повторить ту же фразу двумя строками
+  // ниже значило бы сказать читателю одно и то же дважды и ни разу — про эту
+  // строку, чьё дело называть состояние НАШЕГО сервера. Соседи по ветке
+  // устроены так же: «Модель перевода: запускается», «Скачиваю модель · 42%» —
+  // все они про действие, а не про его причину.
+  if (status === "swapping")
+    return (
+      <div className={`${wrap} flex items-center gap-1.5 text-neutral-500 dark:text-neutral-400`}>
+        <Spinner /> {t("model.swappingShort")}
       </div>
     );
   if (status === "starting" || (dl.status === "done" && !statusUp(status)))
