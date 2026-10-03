@@ -591,7 +591,7 @@ impl GgufMeta {
     /// K and V head dimensions. Modern GGUFs state them; older ones leave them
     /// implied by embedding_length / head_count.
     fn head_dims(&self) -> (u64, u64) {
-        let implied = if self.n_head > 0 { (self.n_embd / self.n_head) as u64 } else { 128 };
+        let implied = self.n_embd.checked_div(self.n_head).map(|v| v as u64).unwrap_or(128);
         let k = if self.key_length > 0 { self.key_length as u64 } else { implied };
         let v = if self.value_length > 0 { self.value_length as u64 } else { implied };
         (k, v)
@@ -629,7 +629,7 @@ impl GgufMeta {
             0 => 2,
             p => p,
         };
-        let global = (n + p - 1) / p;
+        let global = n.div_ceil(p);
         (global, n - global, self.sliding_window as u64)
     }
 
@@ -743,7 +743,7 @@ impl GgufMeta {
                 .unwrap_or(u32::MAX);
             tensors.push((offset, is_expert, layer));
         }
-        let data_start = (r.pos + alignment - 1) / alignment * alignment;
+        let data_start = r.pos.div_ceil(alignment) * alignment;
         if data_start >= file_bytes {
             return None;
         }
@@ -830,8 +830,8 @@ impl GgufReader {
         match ty {
             0 | 1 | 7 => Some(1),
             2 | 3 => Some(2),
-            4 | 5 | 6 => Some(4),
-            10 | 11 | 12 => Some(8),
+            4..=6 => Some(4),
+            10..=12 => Some(8),
             _ => None,
         }
     }
@@ -902,7 +902,7 @@ fn total_ram_mib() -> Option<u64> {
     // API requires; the call only writes inside it and reports whether it did.
     let mut st: MemoryStatusEx = unsafe { std::mem::zeroed() };
     st.length = std::mem::size_of::<MemoryStatusEx>() as u32;
-    (unsafe { GlobalMemoryStatusEx(&mut st) } != 0).then(|| st.total_phys / MIB)
+    (unsafe { GlobalMemoryStatusEx(&mut st) } != 0).then_some(st.total_phys / MIB)
 }
 
 #[cfg(target_os = "macos")]
@@ -921,7 +921,7 @@ fn total_ram_mib() -> Option<u64> {
             0,
         )
     };
-    (rc == 0 && bytes > 0).then(|| bytes / MIB)
+    (rc == 0 && bytes > 0).then_some(bytes / MIB)
 }
 
 #[cfg(all(unix, not(target_os = "macos")))]
