@@ -1073,6 +1073,7 @@ export function AskSidebar({
           <span className="sr-only">{t("ask.threads")}</span>
         </button>
         <button
+          aria-label={msgs.length === 0 ? t("ask.newThreadEmpty") : t("ask.newThreadTitle")}
           aria-disabled={busy || msgs.length === 0}
           className={`${HDR_BTN} ${HDR_BTN_OFF}`}
           disabled={busy || msgs.length === 0}

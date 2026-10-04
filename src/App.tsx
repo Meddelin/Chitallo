@@ -2959,6 +2959,7 @@ export default function App() {
             className={`${TB_BTN} ml-1 px-1 py-0.5`}
             onClick={toggleDark}
             title={dark ? t("tb.light") : t("tb.dark")}
+            aria-label={dark ? t("tb.light") : t("tb.dark")}
           >
             {dark ? <IconSun /> : <IconMoon />}
           </button>
