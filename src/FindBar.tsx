@@ -392,7 +392,7 @@ export default function FindBar({
         ↓
       </button>
       <span className="mx-1 h-4 w-px bg-neutral-900/15 dark:bg-neutral-100/20" />
-      <button className={`${BAR_BTN} py-0.5`} onClick={onClose} title={t("ui.close")}>
+      <button className={`${BAR_BTN} py-0.5`} onClick={onClose} aria-label={t("ui.close")} title={t("ui.close")}>
         <IconClose />
       </button>
     </div>

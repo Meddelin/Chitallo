@@ -2898,7 +2898,7 @@ export default function App() {
           </button>
           <span className="mx-2 h-4 w-px bg-neutral-900/15 dark:bg-neutral-100/20" />
           {/* the «view» group: zoom · columns · theme */}
-          <button className={`${TB_BTN} px-1.5`} onClick={() => zoomTo(scale - 0.125)} title={t("tb.zoomOut")}>
+          <button className={`${TB_BTN} px-1.5`} onClick={() => zoomTo(scale - 0.125)} aria-label={t("tb.zoomOut")} title={t("tb.zoomOut")}>
             −
           </button>
           <span className="relative" data-zoommenu>
@@ -2939,7 +2939,7 @@ export default function App() {
               </div>
             )}
           </span>
-          <button className={`${TB_BTN} px-1.5`} onClick={() => zoomTo(scale + 0.125)} title={t("tb.zoomIn")}>
+          <button className={`${TB_BTN} px-1.5`} onClick={() => zoomTo(scale + 0.125)} aria-label={t("tb.zoomIn")} title={t("tb.zoomIn")}>
             +
           </button>
           <span className="ml-1 flex items-center gap-1">
@@ -2949,7 +2949,7 @@ export default function App() {
                 key={String(c)}
                 className={`${TB_BTN} px-1.5 py-0.5 ${cols === c ? "text-accent" : "text-neutral-500 dark:text-neutral-400"}`}
                 onClick={() => setColsMode(c)}
-                title={c === 1 ? t("tb.col1") : c === 2 ? t("tb.col2") : t("tb.colAuto")}
+                aria-label={c === 1 ? t("tb.col1") : c === 2 ? t("tb.col2") : t("tb.colAuto")} title={c === 1 ? t("tb.col1") : c === 2 ? t("tb.col2") : t("tb.colAuto")}
               >
                 <IconColumns n={c === "auto" ? 3 : c} />
               </button>
@@ -2958,7 +2958,7 @@ export default function App() {
           <button
             className={`${TB_BTN} ml-1 px-1 py-0.5`}
             onClick={toggleDark}
-            title={dark ? t("tb.light") : t("tb.dark")}
+            aria-label={dark ? t("tb.light") : t("tb.dark")} title={dark ? t("tb.light") : t("tb.dark")}
           >
             {dark ? <IconSun /> : <IconMoon />}
           </button>
