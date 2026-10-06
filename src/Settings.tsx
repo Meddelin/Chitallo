@@ -876,7 +876,7 @@ export function SettingsModal({
           <button
             className="px-0.5 transition-colors hover:text-neutral-800 dark:hover:text-neutral-100"
             onClick={onClose}
-            title={t("ui.close")}
+            aria-label={t("ui.close")} title={t("ui.close")}
           >
             <IconClose />
           </button>
