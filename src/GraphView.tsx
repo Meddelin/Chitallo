@@ -1288,6 +1288,7 @@ export function GraphView(props: {
                   kick();
                 }}
                 title={t("ui.close")}
+                aria-label={t("ui.close")}
               >
                 <IconClose />
               </button>

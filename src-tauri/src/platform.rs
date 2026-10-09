@@ -169,8 +169,10 @@ pub fn free_disk_space(dir: &Path) -> Option<u64> {
     // f_bavail is what an unprivileged process may actually use (f_bfree
     // includes the root reserve). f_frsize is the fragment size the counts
     // are expressed in.
-    let frag = if st.f_frsize > 0 { st.f_frsize as u64 } else { st.f_bsize as u64 };
-    Some((st.f_bavail as u64).saturating_mul(frag))
+    #[allow(clippy::useless_conversion, clippy::unnecessary_cast)]
+    let frag: u64 = if st.f_frsize > 0 { st.f_frsize.try_into().unwrap_or(0) } else { st.f_bsize.try_into().unwrap_or(0) };
+    #[allow(clippy::useless_conversion, clippy::unnecessary_cast, clippy::unnecessary_fallible_conversions)]
+    Some(u64::try_from(st.f_bavail).unwrap_or(0).saturating_mul(frag))
 }
 
 #[cfg(not(any(windows, unix)))]
