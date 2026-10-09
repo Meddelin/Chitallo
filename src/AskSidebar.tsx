@@ -1314,6 +1314,7 @@ export function AskSidebar({
               className="text-neutral-500 dark:text-neutral-400 transition-colors hover:text-neutral-800 dark:hover:text-neutral-100"
               onClick={() => setPending(null)}
               title={t("ask.removeFragment")}
+              aria-label={t("ask.removeFragment")}
             >
               <IconClose />
             </button>
