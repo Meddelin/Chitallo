@@ -629,7 +629,7 @@ impl GgufMeta {
             0 => 2,
             p => p,
         };
-        let global = (n + p - 1) / p;
+        let global = n.div_ceil(p);
         (global, n - global, self.sliding_window as u64)
     }
 
@@ -743,7 +743,7 @@ impl GgufMeta {
                 .unwrap_or(u32::MAX);
             tensors.push((offset, is_expert, layer));
         }
-        let data_start = (r.pos + alignment - 1) / alignment * alignment;
+        let data_start = r.pos.div_ceil(alignment) * alignment;
         if data_start >= file_bytes {
             return None;
         }
@@ -830,8 +830,8 @@ impl GgufReader {
         match ty {
             0 | 1 | 7 => Some(1),
             2 | 3 => Some(2),
-            4 | 5 | 6 => Some(4),
-            10 | 11 | 12 => Some(8),
+            4..=6 => Some(4),
+            10..=12 => Some(8),
             _ => None,
         }
     }
