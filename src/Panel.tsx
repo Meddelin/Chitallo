@@ -266,6 +266,7 @@ export function Panel({
           className="rounded-md p-1 text-neutral-400 transition-colors hover:bg-neutral-900/5 hover:text-neutral-700 dark:hover:bg-neutral-100/10 dark:hover:text-neutral-200"
           onClick={onClose}
           title={t("panel.close")}
+          aria-label={t("panel.close")}
         >
           <IconClose />
         </button>
