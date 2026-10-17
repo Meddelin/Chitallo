@@ -424,7 +424,7 @@ export function TranslatePopover({
             {copied ? t("ui.copied") : t("ui.copy")}
           </button>
         )}
-        <button className={`${LINK_HOVER} px-0.5`} onClick={onClose} title={t("ui.close")}>
+        <button className={`${LINK_HOVER} px-0.5`} onClick={onClose} title={t("ui.close")} aria-label={t("ui.close")}>
           <IconClose />
         </button>
       </div>
