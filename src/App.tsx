@@ -2898,7 +2898,7 @@ export default function App() {
           </button>
           <span className="mx-2 h-4 w-px bg-neutral-900/15 dark:bg-neutral-100/20" />
           {/* the «view» group: zoom · columns · theme */}
-          <button className={`${TB_BTN} px-1.5`} onClick={() => zoomTo(scale - 0.125)} title={t("tb.zoomOut")}>
+          <button aria-label={t("tb.zoomOut")} className={`${TB_BTN} px-1.5`} onClick={() => zoomTo(scale - 0.125)} title={t("tb.zoomOut")}>
             −
           </button>
           <span className="relative" data-zoommenu>
@@ -2939,13 +2939,14 @@ export default function App() {
               </div>
             )}
           </span>
-          <button className={`${TB_BTN} px-1.5`} onClick={() => zoomTo(scale + 0.125)} title={t("tb.zoomIn")}>
+          <button aria-label={t("tb.zoomIn")} className={`${TB_BTN} px-1.5`} onClick={() => zoomTo(scale + 0.125)} title={t("tb.zoomIn")}>
             +
           </button>
           <span className="ml-1 flex items-center gap-1">
             {/* active column mode carries the accent — the app's one active color */}
             {([1, 2, "auto"] as const).map((c) => (
               <button
+                aria-label={c === 1 ? t("tb.col1") : c === 2 ? t("tb.col2") : t("tb.colAuto")}
                 key={String(c)}
                 className={`${TB_BTN} px-1.5 py-0.5 ${cols === c ? "text-accent" : "text-neutral-500 dark:text-neutral-400"}`}
                 onClick={() => setColsMode(c)}
@@ -2956,6 +2957,7 @@ export default function App() {
             ))}
           </span>
           <button
+            aria-label={dark ? t("tb.light") : t("tb.dark")}
             className={`${TB_BTN} ml-1 px-1 py-0.5`}
             onClick={toggleDark}
             title={dark ? t("tb.light") : t("tb.dark")}
@@ -2995,6 +2997,7 @@ export default function App() {
           </button>
           {/* створка панели: акцент, пока она открыта */}
           <button
+            aria-label={t("tb.panel")}
             className={`${TB_BTN} ml-0.5 px-1 py-0.5 ${
               panelOpen ? "text-accent" : "text-neutral-500 dark:text-neutral-400"
             }`}

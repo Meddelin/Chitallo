@@ -1,0 +1,3 @@
+## 2024-05-15 - Add ARIA Labels to Toolbar Icons
+**Learning:** Found multiple icon-only and symbol-only buttons in the main toolbar (`src/App.tsx`) that relied solely on `title` attributes for tooltips, which aren't always picked up correctly by screen readers. Specifically, zoom controls, column selectors, dark mode toggle, and the panel toggle.
+**Action:** Always ensure icon-only and symbol-only buttons have an `aria-label` attribute. When a localized `title` already exists via `t(...)`, mirror it exactly to the `aria-label` attribute to provide consistent accessible names for screen readers.
