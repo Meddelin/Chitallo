@@ -170,7 +170,8 @@ pub fn free_disk_space(dir: &Path) -> Option<u64> {
     // includes the root reserve). f_frsize is the fragment size the counts
     // are expressed in.
     let frag = if st.f_frsize > 0 { st.f_frsize } else { st.f_bsize };
-    Some(st.f_bavail.saturating_mul(frag))
+    #[allow(clippy::unnecessary_cast)]
+    Some((st.f_bavail as u64).saturating_mul(frag as u64))
 }
 
 #[cfg(not(any(windows, unix)))]
