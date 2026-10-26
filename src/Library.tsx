@@ -793,6 +793,7 @@ export default function Library({
                 className="flex items-center justify-center w-7 h-7 rounded-lg text-neutral-500 dark:text-neutral-400 transition-colors hover:bg-neutral-900/5 dark:hover:bg-neutral-100/10"
                 onClick={onSettings}
                 title={t("tb.settingsKey")}
+                aria-label={t("tb.settingsKey")}
               >
                 <IconSliders />
               </button>
