@@ -2898,7 +2898,7 @@ export default function App() {
           </button>
           <span className="mx-2 h-4 w-px bg-neutral-900/15 dark:bg-neutral-100/20" />
           {/* the «view» group: zoom · columns · theme */}
-          <button className={`${TB_BTN} px-1.5`} onClick={() => zoomTo(scale - 0.125)} title={t("tb.zoomOut")}>
+          <button className={`${TB_BTN} px-1.5`} onClick={() => zoomTo(scale - 0.125)} title={t("tb.zoomOut")} aria-label={t("tb.zoomOut")}>
             −
           </button>
           <span className="relative" data-zoommenu>
@@ -2906,6 +2906,7 @@ export default function App() {
               className={`${TB_BTN} tabular-nums text-neutral-600 dark:text-neutral-300 hover:text-neutral-800 dark:hover:text-neutral-100 w-11 text-center`}
               onClick={() => setZoomOpen((o) => !o)}
               title={t("tb.zoomPresets")}
+              aria-label={t("tb.zoomPresets")}
             >
               {Math.round(scale * 100)}%
             </button>
@@ -2939,7 +2940,7 @@ export default function App() {
               </div>
             )}
           </span>
-          <button className={`${TB_BTN} px-1.5`} onClick={() => zoomTo(scale + 0.125)} title={t("tb.zoomIn")}>
+          <button className={`${TB_BTN} px-1.5`} onClick={() => zoomTo(scale + 0.125)} title={t("tb.zoomIn")} aria-label={t("tb.zoomIn")}>
             +
           </button>
           <span className="ml-1 flex items-center gap-1">
@@ -2950,6 +2951,7 @@ export default function App() {
                 className={`${TB_BTN} px-1.5 py-0.5 ${cols === c ? "text-accent" : "text-neutral-500 dark:text-neutral-400"}`}
                 onClick={() => setColsMode(c)}
                 title={c === 1 ? t("tb.col1") : c === 2 ? t("tb.col2") : t("tb.colAuto")}
+                aria-label={c === 1 ? t("tb.col1") : c === 2 ? t("tb.col2") : t("tb.colAuto")}
               >
                 <IconColumns n={c === "auto" ? 3 : c} />
               </button>
@@ -2959,6 +2961,7 @@ export default function App() {
             className={`${TB_BTN} ml-1 px-1 py-0.5`}
             onClick={toggleDark}
             title={dark ? t("tb.light") : t("tb.dark")}
+            aria-label={dark ? t("tb.light") : t("tb.dark")}
           >
             {dark ? <IconSun /> : <IconMoon />}
           </button>
@@ -2990,6 +2993,7 @@ export default function App() {
             className={`${TB_BTN} ml-0.5 rounded-md border border-neutral-200 bg-white px-1.5 py-px font-mono text-[10px] text-neutral-400 dark:border-transparent dark:bg-neutral-100/8 dark:text-neutral-500`}
             onClick={togglePalette}
             title={t("tb.palette")}
+            aria-label={t("tb.palette")}
           >
             {K("Ctrl K")}
           </button>
@@ -3000,6 +3004,7 @@ export default function App() {
             }`}
             onClick={() => setPanel(!panelOpen)}
             title={t("tb.panel")}
+            aria-label={t("tb.panel")}
           >
             <PanelRightIcon aria-hidden className="inline-block size-3.5 align-[-0.125em]" strokeWidth={1.5} />
           </button>
