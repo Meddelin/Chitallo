@@ -1,0 +1,3 @@
+## 2024-11-01 - Added missing aria-labels to buttons
+**Learning:** Found multiple instances where buttons had `title` attributes (which show tooltips and can be read by screen readers on hover or focus), but no `aria-label`. `aria-label` provides a more reliable and standardized way for assistive technologies to identify interactive elements, especially icon-only buttons. The system uses a localization function `t(...)` which I need to make sure to use for all aria-labels.
+**Action:** Always add `aria-label` equal to the `title` attribute for all icon-only buttons, especially when the button contains only a SVG icon like `<IconClose />`.

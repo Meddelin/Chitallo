@@ -2950,6 +2950,7 @@ export default function App() {
                 className={`${TB_BTN} px-1.5 py-0.5 ${cols === c ? "text-accent" : "text-neutral-500 dark:text-neutral-400"}`}
                 onClick={() => setColsMode(c)}
                 title={c === 1 ? t("tb.col1") : c === 2 ? t("tb.col2") : t("tb.colAuto")}
+                aria-label={c === 1 ? t("tb.col1") : c === 2 ? t("tb.col2") : t("tb.colAuto")}
               >
                 <IconColumns n={c === "auto" ? 3 : c} />
               </button>
@@ -2959,6 +2960,7 @@ export default function App() {
             className={`${TB_BTN} ml-1 px-1 py-0.5`}
             onClick={toggleDark}
             title={dark ? t("tb.light") : t("tb.dark")}
+            aria-label={dark ? t("tb.light") : t("tb.dark")}
           >
             {dark ? <IconSun /> : <IconMoon />}
           </button>
@@ -3000,6 +3002,7 @@ export default function App() {
             }`}
             onClick={() => setPanel(!panelOpen)}
             title={t("tb.panel")}
+            aria-label={t("tb.panel")}
           >
             <PanelRightIcon aria-hidden className="inline-block size-3.5 align-[-0.125em]" strokeWidth={1.5} />
           </button>
