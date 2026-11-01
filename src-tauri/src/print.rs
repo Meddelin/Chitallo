@@ -112,8 +112,11 @@ pub async fn print_html_to_pdf(
 /// Paper geometry in millimetres, as the frontend states it.
 #[derive(Clone, Copy)]
 struct Page {
+    #[allow(dead_code)]
     width_mm: f64,
+    #[allow(dead_code)]
     height_mm: f64,
+    #[allow(dead_code)]
     margin_mm: f64,
 }
 
