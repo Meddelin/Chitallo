@@ -140,6 +140,7 @@ pub fn probe_version(exe: &Path) -> Option<String> {
 /// exist). `None` = unknown, and the caller skips its space check rather than
 /// guessing.
 #[cfg(windows)]
+#[allow(clippy::unnecessary_cast)]
 pub fn free_disk_space(dir: &Path) -> Option<u64> {
     use std::os::windows::ffi::OsStrExt;
     let mut wide: Vec<u16> = dir.as_os_str().encode_wide().collect();
@@ -157,6 +158,7 @@ pub fn free_disk_space(dir: &Path) -> Option<u64> {
 }
 
 #[cfg(unix)]
+#[allow(clippy::unnecessary_cast)]
 pub fn free_disk_space(dir: &Path) -> Option<u64> {
     use std::os::unix::ffi::OsStrExt;
     let c_path = std::ffi::CString::new(dir.as_os_str().as_bytes()).ok()?;
