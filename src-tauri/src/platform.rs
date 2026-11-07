@@ -171,6 +171,7 @@ pub fn free_disk_space(dir: &Path) -> Option<u64> {
     // are expressed in.
     let frag = if st.f_frsize > 0 { st.f_frsize } else { st.f_bsize };
     #[allow(clippy::useless_conversion)]
+    #[allow(clippy::unnecessary_fallible_conversions)]
     Some(u64::try_from(st.f_bavail).unwrap_or(0).saturating_mul(u64::try_from(frag).unwrap_or(0)))
 }
 
