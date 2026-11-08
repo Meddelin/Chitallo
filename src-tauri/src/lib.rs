@@ -629,6 +629,7 @@ impl GgufMeta {
             0 => 2,
             p => p,
         };
+        #[allow(clippy::manual_div_ceil)]
         let global = (n + p - 1) / p;
         (global, n - global, self.sliding_window as u64)
     }
@@ -743,6 +744,7 @@ impl GgufMeta {
                 .unwrap_or(u32::MAX);
             tensors.push((offset, is_expert, layer));
         }
+        #[allow(clippy::manual_div_ceil)]
         let data_start = (r.pos + alignment - 1) / alignment * alignment;
         if data_start >= file_bytes {
             return None;
@@ -827,6 +829,7 @@ impl GgufReader {
     /// Byte width of a fixed-size value type, so a long array can be skipped
     /// in one seek instead of element by element.
     fn fixed_size(ty: u32) -> Option<u64> {
+        #[allow(clippy::manual_range_patterns)]
         match ty {
             0 | 1 | 7 => Some(1),
             2 | 3 => Some(2),
